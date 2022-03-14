@@ -10,7 +10,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: make
-      uses: ./.github/actions/build-sqljs
+      uses: ./.github/actions/build
     - uses: actions/setup-node@v1
       with:
         node-version: '16.x'
