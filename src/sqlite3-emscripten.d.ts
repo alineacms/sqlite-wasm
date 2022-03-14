@@ -67,5 +67,5 @@ export interface SQLite3Wasm extends EmscriptenModule {
   tempInt32: number; // A temporary pointer located in stack.
 }
 
-declare const sqlite3Wasm: SQLite3Wasm;
-export default sqlite3Wasm;
+declare const init: EmscriptenModuleFactory<SQLite3Wasm>;
+export default init;

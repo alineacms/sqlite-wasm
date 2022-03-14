@@ -1,11 +1,10 @@
 {
   "compilerOptions": {
-    "target": "ES6",
-    "module": "CommonJS",
+    "target": "ESNext",
+    "module": "ESNext",
     "moduleResolution": "node",
     "lib": ["ESNext", "WebWorker", "DOM"],
-    "rootDir": "src",
-    "outDir": "lib",
+    "outDir": "dist",
     "allowJs": true,
     "downlevelIteration": true,
     "noImplicitAny": true,
@@ -22,16 +21,14 @@
     "noFallthroughCasesInSwitch": true,
     "noUnusedParameters": true,
     "forceConsistentCasingInFileNames": true,
-    "strictFunctionTypes": true
+    "strictFunctionTypes": true,
+    "paths": {
+      "@alinea/sqlite-wasm": ["./dist/index.js"],
+      "@alinea/sqlite-wasm/init": ["./dist/init.js"]
+    }
   },
   "include": [
     "src/**/*.ts",
     "src/**/index.js"
-  ],
-  "exclude": [
-    "lib",
-    "lib-test",
-    "**/__tests__/*",
-    "**/__mocks__/*"
   ]
 }

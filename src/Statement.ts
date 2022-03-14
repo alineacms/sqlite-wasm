@@ -1,4 +1,4 @@
-import { SQLite3Wasm } from './sqlite3-emscripten';
+import { SQLite3Wasm } from './sqlite3-emscripten.js';
 import {
   NumberedArray,
   SQLParameterType,
@@ -8,8 +8,8 @@ import {
   ReturnMap,
   ReturnCode,
   Pointer
-} from './sqlite3-types';
-import type Database from './Database';
+} from './sqlite3-types.js';
+import type {Database} from './Database.js';
 
 /* Represents a prepared statement.
 

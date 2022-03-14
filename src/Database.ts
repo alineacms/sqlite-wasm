@@ -1,4 +1,4 @@
-import { SQLite3Wasm } from './sqlite3-emscripten';
+import type { SQLite3Wasm } from './sqlite3-emscripten.js';
 import {
   ParameterArray,
   ParameterMap,
@@ -6,10 +6,10 @@ import {
   QueryResult,
   ReturnCode,
   Pointer
-} from './sqlite3-types';
-import Statement from './Statement';
+} from './sqlite3-types.js';
+import Statement from './Statement.js';
 
-export default class Database {
+export class Database {
   public readonly wasm: SQLite3Wasm;
   private filename: string;
   private dbPtr: Pointer;

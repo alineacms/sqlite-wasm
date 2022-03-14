@@ -25,7 +25,7 @@ export interface QueryResult {
   values: SQLReturnType[][];
 }
 
-export enum ReturnCode {
+export const enum ReturnCode {
   OK = 0,
   ERROR = 1,
   INTERNAL = 2,
