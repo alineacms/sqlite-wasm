@@ -1,15 +1,21 @@
+import type {
+  BindParams,
+  ParamsObject,
+  SqlValue,
+  Statement as StatementI
+} from 'sql.js'
+import type {Database} from './Database.js'
 import {SQLite3Wasm} from './sqlite3-emscripten.js'
 import {
   NumberedArray,
-  SQLParameterType,
   ParameterArray,
   ParameterMap,
-  SQLReturnType,
-  ReturnMap,
+  Pointer,
   ReturnCode,
-  Pointer
+  ReturnMap,
+  SQLParameterType,
+  SQLReturnType
 } from './sqlite3-types.js'
-import type {Database} from './Database.js'
 
 /* Represents a prepared statement.
 
@@ -25,7 +31,7 @@ closed too and become unusable.
 @see Database.html#prepare-dynamic
 @see https://en.wikipedia.org/wiki/Prepared_statement
   */
-export default class Statement {
+export class Statement implements StatementI {
   private readonly wasm: SQLite3Wasm
   private stmt: Pointer
   private readonly db: Database
@@ -40,43 +46,30 @@ export default class Statement {
     this.allocatedmem = []
   }
 
-  /* Bind values to the parameters, after having reseted the statement
-
-  SQL statements can have parameters, named *'?', '?NNN', ':VVV', '@VVV', '$VVV'*,
-  where NNN is a number and VVV a string.
-  This function binds these parameters to the given values.
-
-  *Warning*: ':', '@', and '$' are included in the parameters names
-
-  ## Binding values to named parameters
-  @example Bind values to named parameters
-      var stmt = db.prepare("UPDATE test SET a=@newval WHERE id BETWEEN $mini AND $maxi");
-      stmt.bind({$mini:10, $maxi:20, '@newval':5});
-  - Create a statement that contains parameters like '$VVV', ':VVV', '@VVV'
-  - Call Statement.bind with an object as parameter
-
-  ## Binding values to parameters
-  @example Bind values to anonymous parameters
-      var stmt = db.prepare("UPDATE test SET a=? WHERE id BETWEEN ? AND ?");
-      stmt.bind([5, 10, 20]);
-    - Create a statement that contains parameters like '?', '?NNN'
-    - Call Statement.bind with an array as parameter
-
-  ## Value types
-  Javascript type   | SQLite type
-  ---               | ---
-  number            | REAL, INTEGER
-  boolean           | INTEGER
-  string            | TEXT
-  Array, Uint8Array | BLOB
-  null              | NULL
-  @see http://www.sqlite.org/datatype3.html
-
-  @see http://www.sqlite.org/lang_expr.html#varparam
-  @param values [Array,Object] The values to bind
-  @throw [String] SQLite Error
-    */
-  public bind(values: ParameterArray | ParameterMap): void {
+  /**
+   * Bind values to the parameters, after having reseted the statement. If
+   * values is null, do nothing and return true.
+   *
+   * SQL statements can have parameters, named '?', '?NNN', ':VVV',
+   * '@VVV', '$VVV', where NNN is a number and VVV a string. This function
+   * binds these parameters to the given values.
+   *
+   * Warning: ':', '@', and '$' are included in the parameters names
+   *
+   * ### Value types
+   *
+   * |Javascript type|SQLite type|
+   * |-|-|
+   * |number|REAL, INTEGER|
+   * |boolean|INTEGER|
+   * |string|TEXT|
+   * |Array, Uint8Array|BLOB|
+   * |null|NULL|
+   * @see [https://sql.js.org/documentation/Statement.html#["bind"]](https://sql.js.org/documentation/Statement.html#%5B%22bind%22%5D)
+   *
+   * @param values The values to bind
+   */
+  bind(values?: BindParams): boolean {
     // eslint-disable-next-line no-shadow
     const bindFromArray = (values: ParameterArray): void => {
       values.forEach((value, i) => {
@@ -100,10 +93,10 @@ export default class Statement {
     this.reset()
     if (Array.isArray(values)) {
       bindFromArray(values)
-    } else {
+    } else if (values) {
       bindFromObject(values)
     }
-    return
+    return true
   }
 
   private bindValue(val: SQLParameterType, pos: number = this.pos++): void {
@@ -168,12 +161,11 @@ export default class Statement {
     return
   }
 
-  /* Execute the statement, fetching the the next line of result,
-  that can be retrieved with [Statement.get()](#get-dynamic) .
-
-  @return [Boolean] true if a row of result available
-  @throw [String] SQLite Error
-    */
+  /**
+   * Execute the statement, fetching the the next line of result, that can
+   * be retrieved with `Statement.get`.
+   * @see [https://sql.js.org/documentation/Statement.html#["step"]](https://sql.js.org/documentation/Statement.html#%5B%22step%22%5D)
+   */
   public step(): boolean {
     if (!this.stmt) {
       throw new Error('Statement closed')
@@ -191,17 +183,15 @@ export default class Statement {
     }
   }
 
-  /* Get one row of results of a statement.
-  If the first parameter is not provided, step must have been called before get.
-  @param [Array,Object] Optional: If set, the values will be bound to the statement, and it will be executed
-  @return [Array<String,Number,Uint8Array,null>] One row of result
-
-  @example Print all the rows of the table test to the console
-
-      var stmt = db.prepare("SELECT * FROM test");
-      while (stmt.step()) console.log(stmt.get());
-    */
-  public get(params?: ParameterArray | ParameterMap): SQLReturnType[] {
+  /**
+   * Get one row of results of a statement. If the first parameter is not
+   * provided, step must have been called before.
+   * @see [https://sql.js.org/documentation/Statement.html#["get"]](https://sql.js.org/documentation/Statement.html#%5B%22get%22%5D)
+   *
+   * @param params If set, the values will be bound to the statement
+   * before it is executed
+   */
+  get(params?: BindParams): SqlValue[] {
     const getNumber = (pos: number = this.pos++): number => {
       return this.wasm.sqlite3_column_double(this.stmt, pos)
     }
@@ -243,15 +233,11 @@ export default class Statement {
     return results
   }
 
-  /* Get the list of column names of a row of result of a statement.
-  @return [Array<String>] The names of the columns
-  @example
-
-      var stmt = db.prepare("SELECT 5 AS nbr, x'616200' AS data, NULL AS null_value;");
-      stmt.step(); // Execute the statement
-      console.log(stmt.getColumnNames()); // Will print ['nbr','data','null_value']
-    */
-  public getColumnNames(): string[] {
+  /**
+   * Get the list of column names of a row of result of a statement.
+   * @see [https://sql.js.org/documentation/Statement.html#["getColumnNames"]](https://sql.js.org/documentation/Statement.html#%5B%22getColumnNames%22%5D)
+   */
+  getColumnNames(): string[] {
     const results: string[] = []
     const colSize = this.wasm.sqlite3_data_count(this.stmt)
     for (let col = 0; col < colSize; col++) {
@@ -260,19 +246,15 @@ export default class Statement {
     return results
   }
 
-  /* Get one row of result as a javascript object, associating column names with
-  their value in the current row.
-  @param [Array,Object] Optional: If set, the values will be bound to the statement, and it will be executed
-  @return [Object] The row of result
-  @see [Statement.get](#get-dynamic)
-
-  @example
-
-      var stmt = db.prepare("SELECT 5 AS nbr, x'616200' AS data, NULL AS null_value;");
-      stmt.step(); // Execute the statement
-      console.log(stmt.getAsObject()); // Will print {nbr:5, data: Uint8Array([1,2,3]), null_value:null}
-    */
-  public getAsObject(params?: ParameterArray | ParameterMap): ReturnMap {
+  /**
+   * Get one row of result as a javascript object, associating column
+   * names with their value in the current row
+   * @see [https://sql.js.org/documentation/Statement.html#["getAsObject"]](https://sql.js.org/documentation/Statement.html#%5B%22getAsObject%22%5D)
+   *
+   * @param params If set, the values will be bound to the statement, and
+   * it will be executed
+   */
+  getAsObject(params?: BindParams): ParamsObject {
     const values = this.get(params)
     const names = this.getColumnNames()
     const rowObject: ReturnMap = {}
@@ -282,22 +264,26 @@ export default class Statement {
     return rowObject
   }
 
-  /* Shorthand for bind + step + reset
-  Bind the values, execute the statement, ignoring the rows it returns, and resets it
-  @param [Array,Object] Value to bind to the statement
-    */
-  public run(values?: ParameterArray | ParameterMap) {
+  /**
+   * Shorthand for bind + step + reset Bind the values, execute the
+   * statement, ignoring the rows it returns, and resets it
+   * @param values Value to bind to the statement
+   */
+  run(values?: BindParams): void {
     if (typeof values !== 'undefined') {
       this.bind(values)
     }
     this.step()
-    return this.reset()
+    this.reset()
   }
 
-  /* Reset a statement, so that it's parameters can be bound to new values
-  It also clears all previous bindings, freeing the memory used by bound parameters.
-    */
-  public reset(): boolean {
+  /**
+   * Reset a statement, so that it's parameters can be bound to new
+   * values. It also clears all previous bindings, freeing the memory used
+   * by bound parameters.
+   * @see [https://sql.js.org/documentation/Statement.html#["reset"]](https://sql.js.org/documentation/Statement.html#%5B%22reset%22%5D)
+   */
+  reset(): boolean {
     this.freemem()
     return (
       this.wasm.sqlite3_clear_bindings(this.stmt) === ReturnCode.OK &&
@@ -305,9 +291,11 @@ export default class Statement {
     )
   }
 
-  /* Free the memory allocated during parameter binding
+  /**
+   * Free the memory allocated during parameter binding
+   * @see [https://sql.js.org/documentation/Statement.html#["freemem"]](https://sql.js.org/documentation/Statement.html#%5B%22freemem%22%5D)
    */
-  private freemem() {
+  freemem() {
     let mem
     while ((mem = this.allocatedmem.pop())) {
       this.wasm._free(mem)
@@ -315,9 +303,10 @@ export default class Statement {
     return null
   }
 
-  /* Free the memory used by the statement
-  @return [Boolean] true in case of success
-    */
+  /**
+   * Free the memory used by the statement
+   * @see [https://sql.js.org/documentation/Statement.html#["free"]](https://sql.js.org/documentation/Statement.html#%5B%22free%22%5D)
+   */
   public free(): boolean {
     this.freemem()
     const res = this.wasm.sqlite3_finalize(this.stmt) === ReturnCode.OK
@@ -325,5 +314,24 @@ export default class Statement {
     delete this.db.statements[this.stmt]
     this.stmt = this.wasm.NULL
     return res
+  }
+
+  /**
+   * Get the SQLite's normalized version of the SQL string used in
+   * preparing this statement. The meaning of "normalized" is not
+   * well-defined: see
+   * [the SQLite documentation](https://sqlite.org/c3ref/expanded_sql.html).
+   * @see [https://sql.js.org/documentation/Statement.html#["getNormalizedSQL"]](https://sql.js.org/documentation/Statement.html#%5B%22getNormalizedSQL%22%5D)
+   */
+  getNormalizedSQL(): string {
+    return this.wasm.sqlite3_normalized_sql(this.stmt)
+  }
+
+  /**
+   * Get the SQL string used in preparing this statement.
+   * @see [https://sql.js.org/documentation/Statement.html#["getSQL"]](https://sql.js.org/documentation/Statement.html#%5B%22getSQL%22%5D)
+   */
+  getSQL(): string {
+    return this.wasm.sqlite3_sql(this.stmt)
   }
 }

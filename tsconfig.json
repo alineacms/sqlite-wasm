@@ -8,9 +8,7 @@
     "allowJs": true,
     "downlevelIteration": true,
     "noImplicitAny": true,
-    "noUnusedLocals": true,
     "skipLibCheck": true,
-    "importHelpers": true,
     "removeComments": true,
     "sourceMap": true,
     "declaration": true,
@@ -19,16 +17,8 @@
     "strictNullChecks": true,
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true,
-    "noUnusedParameters": true,
     "forceConsistentCasingInFileNames": true,
-    "strictFunctionTypes": true,
-    "paths": {
-      "@alinea/sqlite-wasm": ["./dist/index.js"],
-      "@alinea/sqlite-wasm/init": ["./dist/init.js"]
-    }
+    "strictFunctionTypes": true
   },
-  "include": [
-    "src/**/*.ts",
-    "src/**/index.js"
-  ]
+  "include": ["src/**/*.ts"]
 }
