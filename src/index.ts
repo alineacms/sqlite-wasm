@@ -1,2 +1,3 @@
-export * from './Database.js';
-export * from './Statement.js';
+export * from './init.js'
+import {init} from './init.js'
+export default init
