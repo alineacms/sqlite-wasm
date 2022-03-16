@@ -16,7 +16,7 @@
     "test": "node test.js"
   },
   "files": [
-    "dist"
+    "src", "dist"
   ],
   "devDependencies": {
     "@types/emscripten": "^1.39.6",
