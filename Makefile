@@ -19,9 +19,7 @@ EMCC_OPTS = \
 	-s NODEJS_CATCH_EXIT=0 \
 	-s ALLOW_MEMORY_GROWTH=1 \
 	-s EXPORT_NAME="init" \
-	-s MODULARIZE=1 \
-	-s EXPORT_ES6=1 \
-	-s USE_ES6_IMPORT_META=0
+	-s MODULARIZE=1
 	
 
 # See https://www.sqlite.org/compile.html for more about the compile-time options
@@ -96,7 +94,6 @@ build-dist: build
 build-dist:
 	yarn tsc
 	yarn embed
-	yarn prepend
 
 build-debug: EMCC_OPTS += -g4 -s ASSERTIONS=2 -s SAFE_HEAP=1 -s STACK_OVERFLOW_CHECK=1
 ##		[TODO] Fails when enabled. Fix the source in order to make it work.
@@ -116,7 +113,7 @@ WASM_DEPS = \
 	src/exported_functions.json \
 	src/exported_runtime_methods.json
 
-dist/sqlite3-emscripten.js: dist/sqlite.wasm
+dist/sqlite3-emscripten.cjs: dist/sqlite.wasm
 dist/sqlite.wasm: $(WASM_DEPS)
 	emcc \
 		$(EMCC_OPTS) \
@@ -127,7 +124,7 @@ dist/sqlite.wasm: $(WASM_DEPS)
 		-s EXPORTED_FUNCTIONS=@$(word 4, $^) \
 		-s EXTRA_EXPORTED_RUNTIME_METHODS=@$(word 5, $^) \
 		-o $(@:.wasm=.js)
-	mv $(@:.wasm=.js) dist/sqlite3-emscripten.js
+	mv $(@:.wasm=.js) dist/sqlite3-emscripten.cjs
 
 ################################################################################
 # Building SQLite

@@ -5,7 +5,7 @@ import type {
   QueryExecResult,
   StatementIterator
 } from 'sql.js'
-import type {SQLite3Wasm} from './sqlite3-emscripten.js'
+import type {SQLite3Wasm} from './sqlite3-emscripten.cjs'
 import {Pointer, QueryResult, ReturnCode, ReturnMap} from './sqlite3-types.js'
 import {Statement} from './Statement.js'
 

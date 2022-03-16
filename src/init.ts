@@ -1,5 +1,5 @@
 import {decode} from 'base64-arraybuffer'
-import initialize, {SQLite3Wasm} from './sqlite3-emscripten.js'
+import initialize, {SQLite3Wasm} from './sqlite3-emscripten.cjs'
 import {Database as DatabaseImpl} from './Database.js'
 
 const wasmSource = decode('$SRC')
