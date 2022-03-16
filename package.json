@@ -11,7 +11,8 @@
   "scripts": {
     "build": "make build-dist",
     "build:ts": "tsc",
-    "embed": "node embed.js",
+    "embed": "node script/embed.js",
+    "prepend": "node script/prepend.js",
     "clean": "make clean",
     "test": "node test.js"
   },

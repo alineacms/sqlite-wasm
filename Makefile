@@ -96,6 +96,7 @@ build-dist: build
 build-dist:
 	yarn tsc
 	yarn embed
+	yarn prepend
 
 build-debug: EMCC_OPTS += -g4 -s ASSERTIONS=2 -s SAFE_HEAP=1 -s STACK_OVERFLOW_CHECK=1
 ##		[TODO] Fails when enabled. Fix the source in order to make it work.
