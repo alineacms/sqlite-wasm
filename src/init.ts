@@ -1,14 +1,5 @@
-import {decode} from 'base64-arraybuffer'
-import initialize, {SQLite3Wasm} from './sqlite3-emscripten.cjs'
 import {Database as DatabaseImpl} from './Database.js'
-
-const wasmSource = decode('$SRC')
-
-async function instantiateWasm(imports: any, resolve: (instance: any) => void) {
-  const module = await WebAssembly.compile(wasmSource)
-  const instance = await WebAssembly.instantiate(module, imports)
-  resolve(instance)
-}
+import initialize, {SQLite3Wasm} from './sqlite3-emscripten.cjs'
 
 export interface Database {
   new (data?: ArrayBufferView): DatabaseImpl
@@ -17,8 +8,7 @@ export interface Database {
 let promisedModule: Promise<SQLite3Wasm> | undefined
 
 export async function init(): Promise<{wasm: SQLite3Wasm; Database: Database}> {
-  const wasm = await (promisedModule ||
-    (promisedModule = initialize({instantiateWasm: instantiateWasm as any})))
+  const wasm = await (promisedModule || (promisedModule = initialize()))
   return {
     wasm,
     Database: class extends DatabaseImpl {

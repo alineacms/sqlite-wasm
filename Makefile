@@ -19,8 +19,8 @@ EMCC_OPTS = \
 	-s NODEJS_CATCH_EXIT=0 \
 	-s ALLOW_MEMORY_GROWTH=1 \
 	-s EXPORT_NAME="init" \
-	-s MODULARIZE=1
-	
+	-s MODULARIZE=1 \
+	-s SINGLE_FILE=1
 
 # See https://www.sqlite.org/compile.html for more about the compile-time options
 EMCC_SQLITE_FLAGS = \
@@ -79,7 +79,7 @@ SQLITE_OWN_OPTIMIZATIONS = \
 	-DSQLITE_UNTESTABLE
 
 # Top level build targets
-build: dist/sqlite.wasm
+build: dist/sqlite3-emscripten.cjs
 	@$(foreach target, $^, $(call print_size, $(target)))
 
 define print_size
@@ -88,12 +88,11 @@ define print_size
 		$$(gzip -9 < $(1) | wc -c | numfmt --to=iec);
 endef
 
-# [TODO] --closure 1 optimization breaks the code
 build-dist: EMCC_OPTS += -Oz
 build-dist: build
 build-dist:
 	yarn tsc
-	yarn embed
+	yarn snip
 
 build-debug: EMCC_OPTS += -g4 -s ASSERTIONS=2 -s SAFE_HEAP=1 -s STACK_OVERFLOW_CHECK=1
 ##		[TODO] Fails when enabled. Fix the source in order to make it work.
@@ -113,8 +112,7 @@ WASM_DEPS = \
 	src/exported_functions.json \
 	src/exported_runtime_methods.json
 
-dist/sqlite3-emscripten.cjs: dist/sqlite.wasm
-dist/sqlite.wasm: $(WASM_DEPS)
+dist/sqlite3-emscripten.cjs: $(WASM_DEPS)
 	emcc \
 		$(EMCC_OPTS) \
 		$(EMCC_SQLITE_FLAGS) \
@@ -122,9 +120,8 @@ dist/sqlite.wasm: $(WASM_DEPS)
 		--post-js $(word 2, $^) \
 		$(word 3, $^) \
 		-s EXPORTED_FUNCTIONS=@$(word 4, $^) \
-		-s EXTRA_EXPORTED_RUNTIME_METHODS=@$(word 5, $^) \
+		-s EXPORTED_RUNTIME_METHODS=@$(word 5, $^) \
 		-o $(@:.wasm=.js)
-	mv $(@:.wasm=.js) dist/sqlite3-emscripten.cjs
 
 ################################################################################
 # Building SQLite
