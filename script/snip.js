@@ -8,8 +8,5 @@ const endOfNonsense = source.indexOf(end)
 if (startOfNonsense > -1 && endOfNonsense > -1)
   fs.writeFileSync(
     './dist/sqlite3-emscripten.cjs',
-    (
-      source.slice(0, startOfNonsense) +
-      source.slice(endOfNonsense + end.length)
-    ).replace('require', 'global["re"+"quire"]')
+    source.slice(0, startOfNonsense) + source.slice(endOfNonsense + end.length)
   )
