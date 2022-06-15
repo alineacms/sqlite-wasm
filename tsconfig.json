@@ -1,5 +1,7 @@
 {
   "compilerOptions": {
+    "declaration": true,
+    "emitDeclarationOnly": true,
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "node",
@@ -10,9 +12,6 @@
     "noImplicitAny": true,
     "skipLibCheck": true,
     "removeComments": true,
-    "sourceMap": true,
-    "declaration": true,
-    "declarationMap": true,
     "esModuleInterop": true,
     "strictNullChecks": true,
     "noImplicitReturns": true,
@@ -20,5 +19,6 @@
     "forceConsistentCasingInFileNames": true,
     "strictFunctionTypes": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/index.ts"],
+  "exclude": ["cache"]
 }

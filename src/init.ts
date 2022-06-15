@@ -1,5 +1,6 @@
 import {Database as DatabaseImpl} from './Database.js'
-import initialize, {SQLite3Wasm} from './sqlite3-emscripten.cjs'
+import initialize from './sqlite3-emscripten.js'
+import type {SQLite3Wasm} from './sqlite3-emscripten.js'
 
 export interface Database {
   new (data?: ArrayBufferView): DatabaseImpl

@@ -5,7 +5,7 @@ import type {
   Statement as StatementI
 } from 'sql.js'
 import type {Database} from './Database.js'
-import {SQLite3Wasm} from './sqlite3-emscripten.cjs'
+import {SQLite3Wasm} from './sqlite3-emscripten.js'
 import {
   NumberedArray,
   ParameterArray,

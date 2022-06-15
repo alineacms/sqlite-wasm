@@ -20,6 +20,7 @@ EMCC_OPTS = \
 	-s ALLOW_MEMORY_GROWTH=1 \
 	-s EXPORT_NAME="init" \
 	-s MODULARIZE=1 \
+	-s EXPORT_ES6=1 \
 	-s SINGLE_FILE=1
 
 # See https://www.sqlite.org/compile.html for more about the compile-time options
@@ -80,7 +81,7 @@ SQLITE_OWN_OPTIMIZATIONS = \
 	-DSQLITE_UNTESTABLE
 
 # Top level build targets
-build: dist/sqlite3-emscripten.cjs
+build: cache/sqlite3-emscripten.js
 	@$(foreach target, $^, $(call print_size, $(target)))
 
 define print_size
@@ -92,8 +93,9 @@ endef
 build-dist: EMCC_OPTS += -Oz
 build-dist: build
 build-dist:
-	yarn tsc
+	yarn build:ts
 	yarn snip
+	yarn bundle
 
 build-debug: EMCC_OPTS += -g4 -s ASSERTIONS=2 -s SAFE_HEAP=1 -s STACK_OVERFLOW_CHECK=1
 ##		[TODO] Fails when enabled. Fix the source in order to make it work.
@@ -113,7 +115,7 @@ WASM_DEPS = \
 	src/exported_functions.json \
 	src/exported_runtime_methods.json
 
-dist/sqlite3-emscripten.cjs: $(WASM_DEPS)
+cache/sqlite3-emscripten.js: $(WASM_DEPS)
 	emcc \
 		$(EMCC_OPTS) \
 		$(EMCC_SQLITE_FLAGS) \
@@ -142,6 +144,6 @@ cache/$(SQLITE_AMALGAMATION).zip:
 
 clean:
 	rm -rf ./cache
-	rm -rf ./dist
+	rm -rf ./cache
 
-$(shell mkdir -p cache dist)
+$(shell mkdir -p cache)
