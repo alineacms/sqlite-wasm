@@ -1,6 +1,6 @@
 {
   "name": "@alinea/sqlite-wasm",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "license": "MIT",
   "type": "module",
   "types": "./dist/init-base64.d.ts",
@@ -15,8 +15,6 @@
   "scripts": {
     "build": "make build-dist",
     "build:ts": "tsc && cp src/sqlite3-emscripten.d.ts dist/sqlite3-emscripten.d.ts",
-    "bundle": "esbuild --format=esm --external:@alinea/iso --bundle src/load-module.ts --outfile=dist/load-module.js",
-    "snip": "node script/snip.js",
     "clean": "make clean",
     "test": "node test.js"
   },
