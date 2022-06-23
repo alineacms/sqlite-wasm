@@ -101,6 +101,7 @@ build-dist:
 		--define:ENVIRONMENT_IS_NODE=false \
 		--define:WebAssembly.instantiateStreaming=false \
 		--define:XMLHttpRequest=false \
+		--define:import.meta.url=false \
 		--minify \
 		--tree-shaking \
 		src/load-module.ts --outdir=dist
