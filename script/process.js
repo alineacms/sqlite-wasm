@@ -9,9 +9,16 @@ function snipBetween(source, start, end) {
 }
 
 let source = fs.readFileSync('./cache/sqlite3-emscripten.js', 'utf-8')
-source = snipBetween(source, 'var scriptDirectory="";', 'title}}else{}')
 source = source.replace(
-  'else if(ENVIRONMENT_IS_NODE){try{var crypto_module=require("crypto");return function(){return crypto_module["randomBytes"](1)[0]}}catch(e){}}',
+  'var ENVIRONMENT_IS_WEB = typeof window == "object";',
+  ''
+)
+source = source.replace(
+  'var ENVIRONMENT_IS_WORKER = typeof importScripts == "function";',
+  ''
+)
+source = source.replace(
+  'var ENVIRONMENT_IS_NODE = typeof process == "object" && typeof process.versions == "object" && typeof process.versions.node == "string";',
   ''
 )
 source = 'import {crypto} from "@alinea/iso"\n' + source

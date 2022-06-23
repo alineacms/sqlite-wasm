@@ -19,6 +19,5 @@
     "forceConsistentCasingInFileNames": true,
     "strictFunctionTypes": true
   },
-  "include": ["src/index.ts"],
-  "exclude": ["cache"]
+  "include": ["src"]
 }

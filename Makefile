@@ -20,8 +20,7 @@ EMCC_OPTS = \
 	-s ALLOW_MEMORY_GROWTH=1 \
 	-s EXPORT_NAME="init" \
 	-s MODULARIZE=1 \
-	-s EXPORT_ES6=1 \
-	-s SINGLE_FILE=1
+	-s EXPORT_ES6=1
 
 # See https://www.sqlite.org/compile.html for more about the compile-time options
 EMCC_SQLITE_FLAGS = \
@@ -90,12 +89,25 @@ define print_size
 		$$(gzip -9 < $(1) | wc -c | numfmt --to=iec);
 endef
 
-build-dist: EMCC_OPTS += -Oz
+build-dist: EMCC_OPTS += -Oz -g1
 build-dist: build
+
 build-dist:
+	node script/process.js
 	yarn build:ts
-	yarn snip
-	yarn bundle
+	esbuild --format=esm --tree-shaking --external:@alinea/iso --bundle \
+		--define:ENVIRONMENT_IS_WEB=false \
+		--define:ENVIRONMENT_IS_WORKER=false \
+		--define:ENVIRONMENT_IS_NODE=false \
+		--define:WebAssembly.instantiateStreaming=false \
+		--define:XMLHttpRequest=false \
+		--minify \
+		--tree-shaking \
+		src/load-module.ts --outdir=dist
+	esbuild --format=esm --tree-shaking --external:./load-module.js --bundle src/init-base64.ts --outdir=dist
+	esbuild --format=esm --tree-shaking src/init-wasm.ts --outdir=dist
+	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm
+	node script/embed.js
 
 build-debug: EMCC_OPTS += -g4 -s ASSERTIONS=2 -s SAFE_HEAP=1 -s STACK_OVERFLOW_CHECK=1
 ##		[TODO] Fails when enabled. Fix the source in order to make it work.
