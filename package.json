@@ -22,7 +22,7 @@
     "dist"
   ],
   "dependencies": {
-    "@alinea/iso": "^0.1.6"
+    "@alinea/iso": "*"
   },
   "devDependencies": {
     "@types/emscripten": "^1.39.6",

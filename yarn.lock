@@ -2,10 +2,10 @@
 # yarn lockfile v1
 
 
-"@alinea/iso@^0.1.6":
-  version "0.1.6"
-  resolved "https://registry.yarnpkg.com/@alinea/iso/-/iso-0.1.6.tgz#5eb5d02be45870124295aaca30d610add0d66791"
-  integrity sha512-uliXKw2DfwC8GNgMuwTbY2NukA6VJOgMhjyY1DPb5r86TOSVxkDL4AUwT5DrnFbiTui+kozwYgrrShjX90y12w==
+"@alinea/iso@*":
+  version "0.1.21"
+  resolved "https://registry.yarnpkg.com/@alinea/iso/-/iso-0.1.21.tgz#f1d9c3a1115ab6e615e4245cc5fad4724c9f4f2d"
+  integrity sha512-+0P5WcoCZy4GgssBOWkJJrGy/ZFGGaxzTk/bwYhDRn9BXbsVhi3uxYaxO1cSoiBZq+/+5lk24bNCI/SEdAfQhw==
 
 "@types/emscripten@*", "@types/emscripten@^1.39.6":
   version "1.39.6"
