@@ -7,7 +7,7 @@ async function getWasmModule(
 ): Promise<WebAssembly.Instance> {
   if (typeof exports === 'function') return exports(imports)
   if (exports instanceof WebAssembly.Module)
-    return WebAssembly.instantiate(module, imports)
+    return WebAssembly.instantiate(exports, imports)
   throw new Error(`Unable to load wasm module`)
 }
 
