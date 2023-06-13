@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "types": ["bun-types"],
     "declaration": true,
     "emitDeclarationOnly": true,
     "target": "ESNext",

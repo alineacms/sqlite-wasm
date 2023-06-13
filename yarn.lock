@@ -30,6 +30,11 @@ base64-arraybuffer@^1.0.2:
   resolved "https://registry.yarnpkg.com/base64-arraybuffer/-/base64-arraybuffer-1.0.2.tgz#1c37589a7c4b0746e34bd1feb951da2df01c1bdc"
   integrity sha512-I3yl4r9QB5ZRY3XuJVEPfc2XhZO6YweFPI+UovAzn+8/hb3oJ6lnysaFcjVpkCPfVWFUDvoZ8kmVDP7WyRtYtQ==
 
+bun-types@^0.6.9:
+  version "0.6.9"
+  resolved "https://registry.yarnpkg.com/bun-types/-/bun-types-0.6.9.tgz#543d92df6db465c252a609eb3127a7a825fafc4d"
+  integrity sha512-qsxwgWWl6qBrHhj+c8QKte+Qyn8MwQweCp7gR51dfw6G43z+PmNk+ipx3xJj/EIU8i9QPyikriZ/tOeEoYPKyw==
+
 esbuild-android-64@0.14.47:
   version "0.14.47"
   resolved "https://registry.yarnpkg.com/esbuild-android-64/-/esbuild-android-64-0.14.47.tgz#ef95b42c67bcf4268c869153fa3ad1466c4cea6b"
