@@ -3,9 +3,9 @@ all:
 
 # SQLite syntax from : https://github.com/mandel59/sqlite-wasm (MIT License) Credited in LICENSE
 # To use another version of Sqlite, visit https://www.sqlite.org/download.html and copy the appropriate values here:
-SQLITE_AMALGAMATION := sqlite-amalgamation-3380100
-SQLITE_AMALGAMATION_ZIP_URL := https://www.sqlite.org/2022/sqlite-amalgamation-3380100.zip
-SQLITE_AMALGAMATION_ZIP_SHA3 := 907e3e7af9770156976f042f5bcbdb95f2b2857b1a65c93a37e84eb3dbdf52f3
+SQLITE_AMALGAMATION := sqlite-amalgamation-3420000
+SQLITE_AMALGAMATION_ZIP_URL := https://www.sqlite.org/2023/sqlite-amalgamation-3420000.zip
+SQLITE_AMALGAMATION_ZIP_SHA3 := 436747dc8090d015b9869b96f5837f745e852d2ce73fd77410ed76ee51107a1f
 
 # See: https://github.com/emscripten-core/emscripten/blob/incoming/src/settings.js
 EMCC_OPTS = \
