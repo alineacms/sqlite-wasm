@@ -238,12 +238,12 @@ export class Database implements DatabaseI {
    * @see [https://sql.js.org/documentation/Database.html#["export"]](https://sql.js.org/documentation/Database.html#%5B%22export%22%5D)
    */
   public export(): Uint8Array {
-    this._close()
+    // this._close()
     const binaryDb: Uint8Array = this.wasm.FS.readFile(this.filename, {
       encoding: 'binary'
     })
-    this.handleError(this.wasm.sqlite3_open(this.filename, this.wasm.tempInt32))
-    this.dbPtr = this.wasm.getValue(this.wasm.tempInt32, '*')
+    // this.handleError(this.wasm.sqlite3_open(this.filename, this.wasm.tempInt32))
+    // this.dbPtr = this.wasm.getValue(this.wasm.tempInt32, '*')
     return binaryDb
   }
 
