@@ -108,6 +108,7 @@ build-dist:
 		src/load-module.ts --outdir=dist
 	esbuild --format=esm --tree-shaking --external:./load-module.js --bundle src/init-base64.ts --outdir=dist
 	esbuild --format=esm --tree-shaking src/init-wasm.ts --outdir=dist
+	esbuild --format=esm --tree-shaking src/init-edge.ts --outdir=dist
 	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm
 	node script/embed.js
 

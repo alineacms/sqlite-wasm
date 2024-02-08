@@ -6,6 +6,7 @@
   "types": "./dist/init-base64.d.ts",
   "exports": {
     ".": {
+      "edge": "./dist/init-edge.js",
       "worker": "./dist/init-wasm.js",
       "default": "./dist/init-base64.js"
     },
