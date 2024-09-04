@@ -1,6 +1,6 @@
 {
   "name": "@alinea/sqlite-wasm",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "license": "MIT",
   "type": "module",
   "types": "./dist/init-base64.d.ts",
