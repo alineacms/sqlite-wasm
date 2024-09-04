@@ -368,7 +368,7 @@ export class Database implements DatabaseI {
         case 'object':
           if (result === null) {
             this.wasm.sqlite3_result_null(sqlite3ContextPtr)
-          } else if (Array.isArray(result)) {
+          } else if (result.length) {
             const blobPtr = this.wasm.allocate(
               result,
               'i8',
