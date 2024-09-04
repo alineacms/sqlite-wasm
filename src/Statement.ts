@@ -145,7 +145,7 @@ export class Statement implements StatementI {
       case 'object':
         if (val === null) {
           bindNull(pos)
-        } else if (Array.isArray(val)) {
+        } else if (typeof val.length === 'number') {
           bindBlob(val, pos)
         } else {
           throw new Error(
