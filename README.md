@@ -20,7 +20,8 @@ use `db.export()` and `new Database(bytes)` to persist and restore their file
 representation.
 
 This is deliberately a size-oriented SQLite build. Date/time functions, window
-functions, triggers, `ATTACH`, `VACUUM`, `EXPLAIN`, and views are omitted. The
+functions, triggers, `ATTACH`, `VACUUM`, `EXPLAIN`, views, `ALTER TABLE`, and
+`ANALYZE` are omitted. The
 complete compile-time option list is kept in the `SQLITE_OMIT_FLAGS` variable in
 the Makefile.
 

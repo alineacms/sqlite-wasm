@@ -186,7 +186,9 @@ for (const [name, initialize] of [
       ['ATTACH', "attach ':memory:' as extra"],
       ['VACUUM', 'vacuum'],
       ['EXPLAIN', 'explain select 1'],
-      ['views', 'create view item_values as select value from items']
+      ['views', 'create view item_values as select value from items'],
+      ['ALTER TABLE', 'alter table items add column title text'],
+      ['ANALYZE', 'analyze items']
     ])('intentionally omits %s', (_feature, sql) => {
       db.run('create table items (value text)')
       expect(() => db.exec(sql)).toThrow()

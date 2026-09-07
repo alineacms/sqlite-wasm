@@ -43,6 +43,8 @@ EMCC_SQLITE_FLAGS = \
 # These flags affect SQLite's parser and keyword table. They must be used both
 # while generating the amalgamation and while compiling it with Emscripten.
 SQLITE_OMIT_FLAGS = \
+	-DSQLITE_OMIT_ALTERTABLE \
+	-DSQLITE_OMIT_ANALYZE \
 	-DSQLITE_OMIT_ATTACH \
 	-DSQLITE_OMIT_AUTHORIZATION \
 	-DSQLITE_OMIT_AUTOINIT \
