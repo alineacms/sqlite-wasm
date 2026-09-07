@@ -2,3 +2,4 @@ node_modules/
 dist/
 cache/
 /src/sqlite3-emscripten.js
+.DS_Store

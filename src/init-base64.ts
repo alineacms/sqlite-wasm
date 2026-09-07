@@ -1,12 +1,12 @@
 import {Imports, loadModule} from './load-module.js'
-import {decode} from 'base64-arraybuffer'
+import {decode} from 'buffer-to-base64/decode'
 
 const source = '$SRC'
 
-function getModule(imports: Imports) {
-  return WebAssembly.instantiate(decode(source), imports).then(
-    ({instance}) => instance
-  )
+async function getModule(imports: Imports) {
+  const buffer = await decode(source)
+  const {instance} = await WebAssembly.instantiate(buffer, imports)
+  return instance
 }
 
 export function init() {

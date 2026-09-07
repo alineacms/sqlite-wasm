@@ -1,0 +1,114 @@
+--- a/src/attach.c
++++ b/src/attach.c
+@@ -12,6 +12,14 @@
+ */
+ #include "sqliteInt.h"
+ 
++/* This helper is also used by core schema lookup code when ATTACH is omitted. */
++int sqlite3DbIsNamed(sqlite3 *db, int iDb, const char *zName){
++  return (
++      sqlite3StrICmp(db->aDb[iDb].zDbSName, zName)==0
++   || (iDb==0 && sqlite3StrICmp("main", zName)==0)
++  );
++}
++
+ #ifndef SQLITE_OMIT_ATTACH
+ /*
+ ** Resolve an expression that was part of an ATTACH or DETACH statement. This
+@@ -44,17 +52,6 @@
+   return rc;
+ }
+ 
+-/*
+-** Return true if zName points to a name that may be used to refer to
+-** database iDb attached to handle db.
+-*/
+-int sqlite3DbIsNamed(sqlite3 *db, int iDb, const char *zName){
+-  return (
+-      sqlite3StrICmp(db->aDb[iDb].zDbSName, zName)==0
+-   || (iDb==0 && sqlite3StrICmp("main", zName)==0)
+-  );
+-}
+-
+ /*
+ ** An SQL user-function registered to do the work of an ATTACH statement. The
+ ** three arguments to the function come directly from an attach statement:
+--- a/src/pager.c
++++ b/src/pager.c
+@@ -7534,7 +7534,6 @@
+   return &pPager->pBackup;
+ }
+ 
+-#ifndef SQLITE_OMIT_VACUUM
+ /*
+ ** Unless this is an in-memory or temporary database, clear the pager cache.
+ */
+@@ -7542,7 +7541,6 @@
+   assert( MEMDB==0 || pPager->tempFile );
+   if( pPager->tempFile==0 ) pager_reset(pPager);
+ }
+-#endif
+ 
+ 
+ #ifndef SQLITE_OMIT_WAL
+--- a/src/memdb.c
++++ b/src/memdb.c
+@@ -847,8 +847,9 @@
+   unsigned mFlags         /* Zero or more SQLITE_DESERIALIZE_* flags */
+ ){
+   MemFile *p;
+-  char *zSql;
+-  sqlite3_stmt *pStmt = 0;
++  Btree *pNewBt = 0;
++  Db *pNew;
++  sqlite3_vfs *pVfs;
+   int rc;
+   int iDb;
+ 
+@@ -868,22 +869,33 @@
+     rc = SQLITE_ERROR;
+     goto end_deserialize;
+   }
+-  zSql = sqlite3_mprintf("ATTACH x AS %Q", zSchema);
+-  if( zSql==0 ){
+-    rc = SQLITE_NOMEM;
+-  }else{
+-    rc = sqlite3_prepare_v2(db, zSql, -1, &pStmt, 0);
+-    sqlite3_free(zSql);
++  pNew = &db->aDb[iDb];
++  if( sqlite3BtreeTxnState(pNew->pBt)!=SQLITE_TXN_NONE
++   || sqlite3BtreeIsInBackup(pNew->pBt)
++  ){
++    rc = SQLITE_BUSY;
++    goto end_deserialize;
+   }
+-  if( rc ) goto end_deserialize;
+-  db->init.iDb = (u8)iDb;
+-  db->init.reopenMemdb = 1;
+-  sqlite3_step(pStmt);
+-  db->init.reopenMemdb = 0;
+-  rc = sqlite3_finalize(pStmt);
+-  if( rc!=SQLITE_OK ){
++
++  pVfs = sqlite3_vfs_find("memdb");
++  if( pVfs==0 ){
++    rc = SQLITE_ERROR;
+     goto end_deserialize;
+   }
++  rc = sqlite3BtreeOpen(pVfs, "x\0", db, &pNewBt, 0, SQLITE_OPEN_MAIN_DB);
++  if( rc==SQLITE_OK ){
++    Schema *pNewSchema = sqlite3SchemaGet(db, pNewBt);
++    if( pNewSchema ){
++      sqlite3BtreeClose(pNew->pBt);
++      pNew->pBt = pNewBt;
++      pNew->pSchema = pNewSchema;
++    }else{
++      sqlite3BtreeClose(pNewBt);
++      rc = SQLITE_NOMEM;
++    }
++  }
++  if( rc!=SQLITE_OK ) goto end_deserialize;
++
+   p = memdbFromDbSchema(db, zSchema);
+   if( p==0 ){
+     rc = SQLITE_ERROR;

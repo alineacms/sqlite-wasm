@@ -1,9 +1,9 @@
-import {encode} from 'base64-arraybuffer'
-import fs from 'fs'
+import {deflateSync} from 'node:zlib'
 
-let source = fs.readFileSync('./dist/init-base64.js', 'utf-8')
-source = source.replace(
-  '$SRC',
-  encode(fs.readFileSync('./dist/sqlite3-emscripten.wasm'))
+const source = await Bun.file('./dist/init-base64.js').text()
+const wasm = await Bun.file('./dist/sqlite3-emscripten.wasm').arrayBuffer()
+const compressed = deflateSync(new Uint8Array(wasm), {level: 9})
+await Bun.write(
+  './dist/init-base64.js',
+  source.replace('$SRC', compressed.toString('base64'))
 )
-fs.writeFileSync('./dist/init-base64.js', source)

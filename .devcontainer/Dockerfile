@@ -1,74 +1,38 @@
-# We build our DevContainer on MS' Typescript-Node Devcontainer
-# This gives us lots of standard stuff, and lets us layer a few custom things on top, like the Emscripten compiler, Puppeteer
+ARG VARIANT="24-bookworm"
+ARG BUN_VERSION="1.4.2"
+FROM oven/bun:${BUN_VERSION} AS bun
 
-# --------------------------------------------------------------------
-# BEGIN Standard MS Devcontainer for Typescript-Node 
+FROM mcr.microsoft.com/devcontainers/typescript-node:${VARIANT}
 
-# See here for image contents: https://github.com/microsoft/vscode-dev-containers/tree/v0.155.1/containers/typescript-node/.devcontainer/base.Dockerfile
-# [Choice] Node.js version: 14, 12, 10
-ARG VARIANT="14-buster"
-FROM mcr.microsoft.com/vscode/devcontainers/typescript-node:0-${VARIANT}
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 
-# [Optional] Uncomment if you want to install an additional version of node using nvm
-# ARG EXTRA_NODE_VERSION=10
-# RUN su node -c "source /usr/local/share/nvm/nvm.sh && nvm install ${EXTRA_NODE_VERSION}"
+# Keep the SDK checkout and compiler version pinned together. Cloning the
+# moving default branch makes old compiler installations depend on the latest
+# emsdk launcher (which now requires newer versions of Python).
+ARG EMSCRIPTEN_VERSION="6.0.9"
+ENV EMSDK=/emsdk
+ENV EMSCRIPTEN_VERSION=${EMSCRIPTEN_VERSION}
 
-# [Optional] Uncomment if you want to install more global node packages
-# RUN su node -c "npm install -g <your-package-list -here>"
+RUN git clone --depth 1 --branch "${EMSCRIPTEN_VERSION}" \
+        https://github.com/emscripten-core/emsdk.git "${EMSDK}" \
+    && cd "${EMSDK}" \
+    && ./emsdk install "${EMSCRIPTEN_VERSION}" \
+    && ./emsdk activate "${EMSCRIPTEN_VERSION}" \
+    && chmod -R a+rwX "${EMSDK}/upstream/emscripten/cache"
 
-# END Standard MS Devcontainer for Typescript-Node 
-# --------------------------------------------------------------------
+ENV PATH=${EMSDK}:${EMSDK}/upstream/emscripten:${PATH}
 
-# --------------------------------------------------------------------
-# BEGIN EMSDK 
-# Install EMSDK to /emsdk just like the EMSDK Dockerfile: https://github.com/emscripten-core/emsdk/blob/master/docker/Dockerfile
-ENV EMSDK /emsdk
-# We pin EMSDK to 2.0.15 rather than 'latest' so that everyone is using the same compiler version
-ENV EMSCRIPTEN_VERSION 3.1.8
+# Prime Emscripten's cache during the image build and verify the toolchain.
+RUN printf 'int main(void) { return 0; }\n' > /tmp/emsdk-hello.c \
+    && "${EMSDK}/upstream/emscripten/emcc" -c /tmp/emsdk-hello.c -o /tmp/emsdk-hello.o \
+    && rm -f /tmp/emsdk-hello.c /tmp/emsdk-hello.o
 
-RUN git clone https://github.com/emscripten-core/emsdk.git $EMSDK
+RUN printf 'export PATH="/emsdk:/emsdk/upstream/emscripten:$PATH"\nexport EM_CONFIG="/emsdk/.emscripten"\nexport EM_CACHE="/emsdk/upstream/emscripten/cache"\n' \
+        > /etc/profile.d/emsdk.sh \
+    && cat /etc/profile.d/emsdk.sh >> /etc/bash.bashrc
 
-RUN echo "## Install Emscripten" \
-    && cd ${EMSDK} \
-    && ./emsdk install ${EMSCRIPTEN_VERSION} \
-    && echo "## Done"
-
-# Copied directly from https://github.com/emscripten-core/emsdk/blob/master/docker/Dockerfile
-RUN cd ${EMSDK} \
-    && echo "## Generate standard configuration" \
-    && ./emsdk activate ${EMSCRIPTEN_VERSION} \
-    && chmod 777 ${EMSDK}/upstream/emscripten \
-    && chmod -R 777 ${EMSDK}/upstream/emscripten/cache \
-    && echo "int main() { return 0; }" > hello.c \
-    && ${EMSDK}/upstream/emscripten/emcc -c hello.c \
-    && cat ${EMSDK}/upstream/emscripten/cache/sanity.txt \
-    && echo "## Done"
-
-ENV PATH $EMSDK:$EMSDK/upstream/emscripten/:$PATH
-
-# Cleanup Emscripten installation and strip some symbols
-# Copied directly from https://github.com/emscripten-core/emsdk/blob/master/docker/Dockerfile
-RUN echo "## Aggressive optimization: Remove debug symbols" \
-    && cd ${EMSDK} && . ./emsdk_env.sh \
-    # Remove debugging symbols from embedded node (extra 7MB)
-    && strip -s `which node` \
-    # Tests consume ~80MB disc space
-    && rm -fr ${EMSDK}/upstream/emscripten/tests \
-    # Fastcomp is not supported
-    && rm -fr ${EMSDK}/upstream/fastcomp \
-    # strip out symbols from clang (~extra 50MB disc space)
-    && find ${EMSDK}/upstream/bin -type f -exec strip -s {} + || true \
-    && echo "## Done"
-
-RUN echo ". /emsdk/emsdk_env.sh" >> /etc/bash.bashrc
-# We must set the EM_NODE_JS environment variable for a somewhat silly reason
-# We run our build scripts with `npm run`, which sets the NODE environment variable as it runs.
-# The EMSDK picks up on that environment variable and gives a deprecation warning: warning: honoring legacy environment variable `NODE`.  Please switch to using `EM_NODE_JS` instead`
-# So, we are going to put this environment variable here explicitly to avoid the deprecation warning.
-RUN echo 'export EM_NODE_JS="$EMSDK_NODE"' >> /etc/bash.bashrc
-
-# END EMSDK
-# --------------------------------------------------------------------
-
-# Installs the command "sha3sum", which is used check the download integrity of sqlite source.
-RUN apt-get update && apt-get install -y libdigest-sha3-perl
+# Provides sha3sum plus Tcl, which SQLite needs to generate a custom
+# amalgamation from its canonical source tree.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libdigest-sha3-perl tcl \
+    && rm -rf /var/lib/apt/lists/*

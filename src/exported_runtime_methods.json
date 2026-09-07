@@ -1,16 +1,13 @@
 [
   "cwrap",
-  "FS",
-  "allocate",
+  "HEAPU8",
   "stackAlloc",
   "stackSave",
   "stackRestore",
   "getValue",
   "setValue",
-  "intArrayFromString",
-  "allocateUTF8OnStack",
-  "UTF8ToString",
+  "lengthBytesUTF8",
+  "stringToUTF8",
   "addFunction",
-  "removeFunction",
-  "ALLOC_NORMAL"
+  "removeFunction"
 ]

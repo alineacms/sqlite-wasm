@@ -1,49 +1,51 @@
 all:
-	yarn build
+	bun run build
 
 # SQLite syntax from : https://github.com/mandel59/sqlite-wasm (MIT License) Credited in LICENSE
 # To use another version of Sqlite, visit https://www.sqlite.org/download.html and copy the appropriate values here:
-SQLITE_AMALGAMATION := sqlite-amalgamation-3460100
-SQLITE_AMALGAMATION_ZIP_URL := https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip
-SQLITE_AMALGAMATION_ZIP_SHA3 := af6aae8d3eccc608857c63cf56efbadc70da48b5c719446b353ed88dded1e288
+SQLITE_SOURCE := sqlite-src-3530400
+SQLITE_SOURCE_ZIP_URL := https://www.sqlite.org/2026/sqlite-src-3530400.zip
+SQLITE_SOURCE_ZIP_SHA3 := b834d474b9b393d85a9e3ee4cc11f1329e007e9376a424ee740796f5c4bda3a8
+WASM_OPT := $(shell dirname $(shell command -v emcc))/../bin/wasm-opt
 
 # See: https://github.com/emscripten-core/emscripten/blob/incoming/src/settings.js
 EMCC_OPTS = \
-	-s ERROR_ON_UNDEFINED_SYMBOLS=0 \
-	-s MALLOC="emmalloc" \
+	-sMALLOC=emmalloc \
+	--closure 1 \
 	-fno-exceptions \
-	--llvm-opts 3 \
-	--llvm-lto 1 \
-	--memory-init-file 0 \
-	-s RESERVED_FUNCTION_POINTERS=64 \
-	-s NODEJS_CATCH_EXIT=0 \
-	-s ALLOW_MEMORY_GROWTH=1 \
-	-s EXPORT_NAME="init" \
-	-s MODULARIZE=1 \
-	-s EXPORT_ES6=1
+	-flto \
+	-sALLOW_MEMORY_GROWTH=1 \
+	-sALLOW_TABLE_GROWTH=1 \
+	-sDYNAMIC_EXECUTION=0 \
+	-sFILESYSTEM=0 \
+	-sINCOMING_MODULE_JS_API=instantiateWasm \
+	-sEXPORT_NAME=init \
+	-sMODULARIZE=1 \
+	-sEXPORT_ES6=1 \
+	-sENVIRONMENT=web,worker
 
 # See https://www.sqlite.org/compile.html for more about the compile-time options
 EMCC_SQLITE_FLAGS = \
 	-DSQLITE_ENABLE_FTS5 \
-	-DSQLITE_ENABLE_JSON1 \
-	-DSQLITE_OMIT_LOAD_EXTENSION \
 	-DSQLITE_DISABLE_LFS \
 	-DLONGDOUBLE_TYPE=double \
 	-DSQLITE_THREADSAFE=0 \
-	-DSQLITE_DQS=0\
+	-DSQLITE_OS_OTHER=1 \
+	-DSQLITE_DQS=0 \
 	-DSQLITE_DEFAULT_MEMSTATUS=0 \
-	-DSQLITE_OMIT_DEPRECATED \
+	-DSQLITE_TEMP_STORE=3 \
 	-DSQLITE_MAX_EXPR_DEPTH=0 \
 	-DYYSTACKDEPTH=2000 \
-	-DSQLITE_OMIT_SHARED_CACHE \
-	-DSQLITE_OMIT_PROGRESS_CALLBACK \
-	-DSQLITE_OMIT_DECLTYPE \
-	$(SQLITE_OWN_OPTIMIZATIONS)
+	-DSQLITE_USE_ALLOCA \
+	-DSQLITE_UNTESTABLE \
+	$(SQLITE_OMIT_FLAGS)
 
-SQLITE_OWN_OPTIMIZATIONS = \
-	-DSQLITE_OMIT_ALTERTABLE \
-	-DSQLITE_OMIT_ANALYZE \
+# These flags affect SQLite's parser and keyword table. They must be used both
+# while generating the amalgamation and while compiling it with Emscripten.
+SQLITE_OMIT_FLAGS = \
+	-DSQLITE_OMIT_ATTACH \
 	-DSQLITE_OMIT_AUTHORIZATION \
+	-DSQLITE_OMIT_AUTOINIT \
 	-DSQLITE_OMIT_AUTOINCREMENT \
 	-DSQLITE_OMIT_AUTOVACUUM \
 	-DSQLITE_OMIT_BETWEEN_OPTIMIZATION \
@@ -53,6 +55,8 @@ SQLITE_OWN_OPTIMIZATIONS = \
 	-DSQLITE_OMIT_COMPILEOPTION_DIAGS \
 	-DSQLITE_OMIT_COMPLETE \
 	-DSQLITE_OMIT_DECLTYPE \
+	-DSQLITE_OMIT_DEPRECATED \
+	-DSQLITE_OMIT_EXPLAIN \
 	-DSQLITE_OMIT_FLAG_PRAGMAS \
 	-DSQLITE_OMIT_FOREIGN_KEY \
 	-DSQLITE_OMIT_GET_TABLE \
@@ -60,24 +64,26 @@ SQLITE_OWN_OPTIMIZATIONS = \
 	-DSQLITE_OMIT_INTROSPECTION_PRAGMAS \
 	-DSQLITE_OMIT_LIKE_OPTIMIZATION \
 	-DSQLITE_OMIT_LOCALTIME \
-	-DSQLITE_OMIT_MEMORYDB \
-	-DSQLITE_OMIT_PAGER_PRAGMAS \
-	-DSQLITE_OMIT_REINDEX \
+	-DSQLITE_OMIT_LOOKASIDE \
+	-DSQLITE_OMIT_LOAD_EXTENSION \
 	-DSQLITE_OMIT_AUTORESET \
+	-DSQLITE_OMIT_DATETIME_FUNCS \
+	-DSQLITE_OMIT_PROGRESS_CALLBACK \
 	-DSQLITE_OMIT_SCHEMA_PRAGMAS \
 	-DSQLITE_OMIT_SCHEMA_VERSION_PRAGMAS \
+	-DSQLITE_OMIT_SHARED_CACHE \
 	-DSQLITE_OMIT_TCL_VARIABLE \
 	-DSQLITE_OMIT_TEMPDB \
 	-DSQLITE_OMIT_TRACE \
+	-DSQLITE_OMIT_TRIGGER \
 	-DSQLITE_OMIT_UTF16 \
 	-DSQLITE_OMIT_VACUUM \
 	-DSQLITE_OMIT_VIEW \
 	-DSQLITE_OMIT_WAL \
-	-DSQLITE_UNTESTABLE
+	-DSQLITE_OMIT_WINDOWFUNC
 
 # -DSQLITE_OMIT_XFER_OPT \
 # -DSQLITE_OMIT_AUTOMATIC_INDEX \
-# -DSQLITE_OMIT_LOOKASIDE \
 # -DSQLITE_OMIT_EXPLAIN
 
 # Top level build targets
@@ -90,13 +96,13 @@ define print_size
 		$$(gzip -9 < $(1) | wc -c | numfmt --to=iec);
 endef
 
-build-dist: EMCC_OPTS += -Oz -g1
+build-dist: EMCC_OPTS += -Oz
 build-dist: build
 
 build-dist:
-	node script/process.js
-	yarn build:ts
-	esbuild --format=esm --tree-shaking --external:@alinea/iso --bundle \
+	cp cache/sqlite3-emscripten.js src/sqlite3-emscripten.js
+	bun run build:ts
+	bun x esbuild --format=esm --tree-shaking --bundle \
 		--define:ENVIRONMENT_IS_WEB=false \
 		--define:ENVIRONMENT_IS_WORKER=false \
 		--define:ENVIRONMENT_IS_NODE=false \
@@ -106,11 +112,13 @@ build-dist:
 		--minify \
 		--tree-shaking \
 		src/load-module.ts --outdir=dist
-	esbuild --format=esm --tree-shaking --external:./load-module.js --bundle src/init-base64.ts --outdir=dist
-	esbuild --format=esm --tree-shaking src/init-wasm.ts --outdir=dist
-	esbuild --format=esm --tree-shaking src/init-edge.ts --outdir=dist
+	bun x terser dist/load-module.js --compress passes=3 --mangle --module --output dist/load-module.min.js
+	mv dist/load-module.min.js dist/load-module.js
+	bun x esbuild --format=esm --minify --tree-shaking --external:./load-module.js --bundle src/init-base64.ts --outdir=dist
+	bun x esbuild --format=esm --minify --tree-shaking src/init-wasm.ts --outdir=dist
+	bun x esbuild --format=esm --minify --tree-shaking src/init-edge.ts --outdir=dist
 	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm
-	node script/embed.js
+	bun script/embed.js
 
 build-debug: EMCC_OPTS += -g4 -s ASSERTIONS=2 -s SAFE_HEAP=1 -s STACK_OVERFLOW_CHECK=1
 ##		[TODO] Fails when enabled. Fix the source in order to make it work.
@@ -124,33 +132,55 @@ build-debug: build
 
 # These are represented as $(word {line_num}, $^) in the recipe
 WASM_DEPS = \
+	Makefile \
 	src/sqlite3-emscripten-pre-js.js \
 	src/sqlite3-emscripten-post-js.js \
-	cache/$(SQLITE_AMALGAMATION)/sqlite3.c \
+	cache/$(SQLITE_SOURCE)/sqlite3.c \
+	src/sqlite3-bridge.c \
 	src/exported_functions.json \
 	src/exported_runtime_methods.json
 
 cache/sqlite3-emscripten.js: $(WASM_DEPS)
-	emcc \
+	EM_CLOSURE_COMPILER=$(CURDIR)/node_modules/.bin/google-closure-compiler emcc \
 		$(EMCC_OPTS) \
 		$(EMCC_SQLITE_FLAGS) \
-		--pre-js $(word 1, $^) \
-		--post-js $(word 2, $^) \
-		$(word 3, $^) \
-		-s EXPORTED_FUNCTIONS=@$(word 4, $^) \
-		-s EXPORTED_RUNTIME_METHODS=@$(word 5, $^) \
+		--pre-js $(word 2, $^) \
+		--post-js $(word 3, $^) \
+		$(word 4, $^) \
+		$(word 5, $^) \
+		-Icache/$(SQLITE_SOURCE) \
+		-s EXPORTED_FUNCTIONS=@$(word 6, $^) \
+		-s EXPORTED_RUNTIME_METHODS=@$(word 7, $^) \
 		-o $(@:.wasm=.js)
+	$(WASM_OPT) --enable-bulk-memory --enable-nontrapping-float-to-int -Oz --converge $(@:.js=.wasm) -o $(@:.js=.opt.wasm)
+	mv $(@:.js=.opt.wasm) $(@:.js=.wasm)
 
 ################################################################################
 # Building SQLite
 ################################################################################
-cache/$(SQLITE_AMALGAMATION)/sqlite3.c: cache/$(SQLITE_AMALGAMATION).zip
-	echo '$(SQLITE_AMALGAMATION_ZIP_SHA3)  ./cache/$(SQLITE_AMALGAMATION).zip' > cache/sha_$(SQLITE_AMALGAMATION).txt
-	sha3sum -c cache/sha_$(SQLITE_AMALGAMATION).txt
-	unzip -DD 'cache/$(SQLITE_AMALGAMATION).zip' -d cache/
+cache/$(SQLITE_SOURCE)/sqlite3.c: Makefile cache/$(SQLITE_SOURCE)/.configured
+	$(MAKE) -C cache/$(SQLITE_SOURCE) clean
+	$(MAKE) -C cache/$(SQLITE_SOURCE) sqlite3.c OPTS='$(SQLITE_OMIT_FLAGS)'
 
-cache/$(SQLITE_AMALGAMATION).zip:
-	curl -LsSf '$(SQLITE_AMALGAMATION_ZIP_URL)' -o $@
+cache/$(SQLITE_SOURCE)/.configured: cache/$(SQLITE_SOURCE)/.patched Makefile
+	cd cache/$(SQLITE_SOURCE) && ./configure --disable-shared --fts5
+	touch $@
+
+cache/$(SQLITE_SOURCE)/.patched: cache/$(SQLITE_SOURCE)/.extracted script/sqlite-omit-compat.patch
+	patch -d cache/$(SQLITE_SOURCE) -p1 < script/sqlite-omit-compat.patch
+	touch $@
+
+cache/$(SQLITE_SOURCE)/.extracted: cache/$(SQLITE_SOURCE).zip
+	echo '$(SQLITE_SOURCE_ZIP_SHA3)  ./cache/$(SQLITE_SOURCE).zip' > cache/sha_$(SQLITE_SOURCE).txt
+	sha3sum -c cache/sha_$(SQLITE_SOURCE).txt
+	unzip -q -DD 'cache/$(SQLITE_SOURCE).zip' -d cache/
+	touch $@
+
+cache/$(SQLITE_SOURCE).zip: | cache
+	curl -LsSf '$(SQLITE_SOURCE_ZIP_URL)' -o $@
+
+cache:
+	mkdir -p $@
 
 ################################################################################
 # Etc.
@@ -159,6 +189,4 @@ cache/$(SQLITE_AMALGAMATION).zip:
 
 clean:
 	rm -rf ./cache
-	rm -rf ./cache
-
-$(shell mkdir -p cache)
+	rm -rf ./dist

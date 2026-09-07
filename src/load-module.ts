@@ -6,23 +6,20 @@ export interface Database {
   new (data?: ArrayBufferView): DatabaseImpl
 }
 
-export type Imports = {
-  [key: string]: any
-}
+export type Imports = WebAssembly.Imports
 
 type Loader = (imports: Imports) => Promise<WebAssembly.Instance>
 
 async function load(loader: Loader) {
-  let trigger: () => void
-  let load = new Promise(resolve => (trigger = () => resolve(undefined)))
   const wasm = await initialize({
-    instantiateWasm(info: any, receive: (m: WebAssembly.Module) => void): any {
-      loader(info)
-        .then(instance => receive(instance))
-        .finally(trigger)
+    instantiateWasm(
+      info: WebAssembly.Imports,
+      receive: (instance: WebAssembly.Instance) => void
+    ): undefined {
+      loader(info).then(receive)
+      return undefined
     }
   })
-  await load
   return {
     wasm,
     Database: class extends DatabaseImpl {
@@ -33,11 +30,14 @@ async function load(loader: Loader) {
   }
 }
 
-let cached = new WeakMap()
+const cached = new WeakMap<Loader, Promise<ReturnType<typeof load> extends Promise<infer T> ? T : never>>()
 
 export function loadModule(
   loader: Loader
 ): Promise<{wasm: SQLite3Wasm; Database: Database}> {
-  if (!cached.has(loader)) cached.set(loader, load(loader))
-  return cached.get(loader)
+  const existing = cached.get(loader)
+  if (existing) return existing
+  const pending = load(loader)
+  cached.set(loader, pending)
+  return pending
 }

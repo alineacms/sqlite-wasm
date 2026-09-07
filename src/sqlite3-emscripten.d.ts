@@ -7,9 +7,12 @@
 
 export interface SQLite3Wasm extends EmscriptenModule {
   // [TODO] Tye every functions properly
-  sqlite3_open: Function
   sqlite3_exec: Function
   sqlite3_free: Function
+  alinea_malloc: (size: number) => number
+  alinea_open: (db: number) => number
+  alinea_deserialize: (db: number, data: number, size: number) => number
+  alinea_serialize: (db: number, size: number) => number
   sqlite3_errmsg: Function
   sqlite3_changes: Function
   sqlite3_prepare_v2: Function
@@ -35,7 +38,6 @@ export interface SQLite3Wasm extends EmscriptenModule {
   sqlite3_value_bytes: Function
   sqlite3_value_type: Function
   sqlite3_value_text: Function
-  sqlite3_value_int: Function
   sqlite3_value_blob: Function
   sqlite3_value_double: Function
   sqlite3_result_double: Function
@@ -43,26 +45,24 @@ export interface SQLite3Wasm extends EmscriptenModule {
   sqlite3_result_text: Function
   sqlite3_result_blob: Function
   sqlite3_result_int: Function
-  sqlite3_result_int64: Function
   sqlite3_result_error: Function
   sqlite3_sql: Function
   sqlite3_normalized_sql: Function
 
   // Emscripten runtime functions from exported_runtime_methods.json
   cwrap: typeof cwrap
-  FS: FS
-  allocate: typeof allocate
   stackAlloc: typeof stackAlloc
   stackSave: typeof stackSave
   stackRestore: typeof stackRestore
   getValue: typeof getValue
   setValue: typeof setValue
-  intArrayFromString: typeof intArrayFromString
-  allocateUTF8OnStack: typeof allocateUTF8OnStack
-  UTF8ToString: typeof UTF8ToString
+  lengthBytesUTF8: typeof lengthBytesUTF8
+  stringToUTF8: typeof stringToUTF8
   addFunction: typeof addFunction
   removeFunction: typeof removeFunction
-  ALLOC_NORMAL: typeof ALLOC_NORMAL
+  _malloc(size: number): number
+  _free(pointer: number): void
+  HEAPU8: Uint8Array
 
   // Extra fields by -post-js.js
   NULL: number // 0

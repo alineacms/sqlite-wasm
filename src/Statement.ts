@@ -103,16 +103,19 @@ export class Statement implements StatementI {
     // Nested functions
     /* eslint-disable no-shadow */
     const bindString = (str: string, pos: number = this.pos++): void => {
-      const bytes = this.wasm.intArrayFromString(str)
-      const strPtr = this.wasm.allocate(bytes, 'i8', this.wasm.ALLOC_NORMAL)
+      const bytes = new TextEncoder().encode(str)
+      const strPtr = this.wasm._malloc(bytes.length + 1)
+      this.wasm.HEAPU8.set(bytes, strPtr)
+      this.wasm.HEAPU8[strPtr + bytes.length] = 0
       this.allocatedmem.push(strPtr)
       this.db.handleError(
-        this.wasm.sqlite3_bind_text(this.stmt, pos, strPtr, bytes.length - 1, 0)
+        this.wasm.sqlite3_bind_text(this.stmt, pos, strPtr, bytes.length, 0)
       )
     }
 
     const bindBlob = (array: NumberedArray, pos: number = this.pos++): void => {
-      const blobPtr = this.wasm.allocate(array, 'i8', this.wasm.ALLOC_NORMAL)
+      const blobPtr = this.wasm._malloc(array.length)
+      this.wasm.HEAPU8.set(array, blobPtr)
       this.allocatedmem.push(blobPtr)
       this.db.handleError(
         this.wasm.sqlite3_bind_blob(this.stmt, pos, blobPtr, array.length, 0)

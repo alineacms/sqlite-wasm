@@ -1,6 +1,5 @@
 import type {
   BindParams,
-  Database as DatabaseI,
   ParamsCallback,
   QueryExecResult,
   StatementIterator
@@ -9,10 +8,9 @@ import type {SQLite3Wasm} from './sqlite3-emscripten'
 import {Pointer, QueryResult, ReturnCode, ReturnMap} from './sqlite3-types.js'
 import {Statement} from './Statement.js'
 
-export class Database implements DatabaseI {
+export class Database {
   /** @internal */ public statements: Record<number, Statement>
   /** @internal */ public readonly wasm: SQLite3Wasm
-  /** @internal */ private filename: string
   /** @internal */ private dbPtr: Pointer
   /** @internal */ private functions: Record<string, Pointer>
 
@@ -24,15 +22,30 @@ export class Database implements DatabaseI {
    */
   constructor(wasm: SQLite3Wasm, data?: ArrayBufferView) {
     this.wasm = wasm
-    // eslint-disable-next-line no-bitwise
-    this.filename = `dbfile_${(0xffffffff * Math.random()) >>> 0}`
-    if (typeof data !== 'undefined') {
-      this.wasm.FS.createDataFile('/', this.filename, data, true, true)
-    }
-    this.handleError(
-      this.wasm.sqlite3_open(`${this.filename}`, this.wasm.tempInt32)
-    )
+    const openResult = this.wasm.alinea_open(this.wasm.tempInt32)
     this.dbPtr = this.wasm.getValue(this.wasm.tempInt32, '*')
+    this.handleError(openResult)
+    if (typeof data !== 'undefined' && data.byteLength > 0) {
+      const dataPtr = this.wasm.alinea_malloc(data.byteLength)
+      if (dataPtr === this.wasm.NULL) {
+        throw new Error('Unable to allocate memory for the database')
+      }
+      this.wasm.HEAPU8.set(
+        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+        dataPtr
+      )
+      const result = this.wasm.alinea_deserialize(
+        this.dbPtr,
+        dataPtr,
+        data.byteLength
+      )
+      if (result !== ReturnCode.OK) {
+        const message = this.wasm.sqlite3_errmsg(this.dbPtr)
+        this.wasm.sqlite3_close_v2(this.dbPtr)
+        this.dbPtr = this.wasm.NULL
+        throw new Error(message)
+      }
+    }
     // [TODO] Look into RegisterExtensionFunctions(this.db);
     this.statements = {}
     this.functions = {}
@@ -89,7 +102,9 @@ export class Database implements DatabaseI {
     }
     const stack = this.wasm.stackSave()
     try {
-      let nextSqlPtr = this.wasm.allocateUTF8OnStack(sql)
+      const sqlLength = this.wasm.lengthBytesUTF8(sql) + 1
+      let nextSqlPtr = this.wasm.stackAlloc(sqlLength)
+      this.wasm.stringToUTF8(sql, nextSqlPtr, sqlLength)
       const pzTail = this.wasm.stackAlloc(4)
       const results: QueryResult[] = []
       while (this.wasm.getValue(nextSqlPtr, 'i8') !== this.wasm.NULL) {
@@ -156,8 +171,8 @@ export class Database implements DatabaseI {
     params: BindParams,
     callback: ParamsCallback,
     done: () => void
-  ): DatabaseI
-  each(sql: string, callback: ParamsCallback, done: () => void): DatabaseI
+  ): Database
+  each(sql: string, callback: ParamsCallback, done: () => void): Database
   each(sql: string, ...args: any[]) {
     let stmt: Statement
     let doneCallback: () => any
@@ -238,13 +253,19 @@ export class Database implements DatabaseI {
    * @see [https://sql.js.org/documentation/Database.html#["export"]](https://sql.js.org/documentation/Database.html#%5B%22export%22%5D)
    */
   public export(): Uint8Array {
-    // this._close()
-    const binaryDb: Uint8Array = this.wasm.FS.readFile(this.filename, {
-      encoding: 'binary'
-    })
-    // this.handleError(this.wasm.sqlite3_open(this.filename, this.wasm.tempInt32))
-    // this.dbPtr = this.wasm.getValue(this.wasm.tempInt32, '*')
-    return binaryDb
+    if (!this.dbPtr) {
+      throw new Error('Database closed')
+    }
+    const dataPtr = this.wasm.alinea_serialize(this.dbPtr, this.wasm.tempInt32)
+    if (dataPtr === this.wasm.NULL) {
+      throw new Error('Unable to serialize the database')
+    }
+    const byteLength = this.wasm.getValue(this.wasm.tempInt32, 'i32')
+    try {
+      return this.wasm.HEAPU8.slice(dataPtr, dataPtr + byteLength)
+    } finally {
+      this.wasm.sqlite3_free(dataPtr)
+    }
   }
 
   /**
@@ -261,8 +282,6 @@ export class Database implements DatabaseI {
    */
   public close() {
     this._close()
-    this.wasm.FS.unlink(`/${this.filename}`)
-    this.filename = ''
     this.dbPtr = this.wasm.NULL
   }
 
@@ -329,19 +348,19 @@ export class Database implements DatabaseI {
             case valueType !== 3:
               return this.wasm.sqlite3_value_text
             case valueType !== 4:
-              return function (ptr: Pointer) {
+              return (ptr: Pointer) => {
                 const size = this.wasm.sqlite3_value_bytes(ptr)
                 const blobPtr = this.wasm.sqlite3_value_blob(ptr)
                 const blobArg = new Uint8Array(size)
                 for (let j = 0; j < size; j++) {
                   // [TODO] Remove this ESLint disable
                   // eslint-disable-next-line @typescript-eslint/restrict-plus-operands
-                  blobArg[j] = this.wasm.HEAP8[blobPtr + j]
+                  blobArg[j] = this.wasm.HEAPU8[blobPtr + j]
                 }
                 return blobArg
               }
             default:
-              return function (_: Pointer) {
+              return (_: Pointer) => {
                 return null
               }
           }
@@ -369,11 +388,8 @@ export class Database implements DatabaseI {
           if (result === null) {
             this.wasm.sqlite3_result_null(sqlite3ContextPtr)
           } else if (typeof result.length === 'number') {
-            const blobPtr = this.wasm.allocate(
-              result,
-              'i8',
-              this.wasm.ALLOC_NORMAL
-            )
+            const blobPtr = this.wasm._malloc(result.length)
+            this.wasm.HEAPU8.set(result, blobPtr)
             this.wasm.sqlite3_result_blob(
               sqlite3ContextPtr,
               blobPtr,

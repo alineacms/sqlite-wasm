@@ -1,7 +1,10 @@
 [
   "_malloc",
   "_free",
-  "_sqlite3_open",
+  "_alinea_malloc",
+  "_alinea_open",
+  "_alinea_deserialize",
+  "_alinea_serialize",
   "_sqlite3_exec",
   "_sqlite3_free",
   "_sqlite3_errmsg",
@@ -28,7 +31,6 @@
   "_sqlite3_value_bytes",
   "_sqlite3_value_type",
   "_sqlite3_value_text",
-  "_sqlite3_value_int",
   "_sqlite3_value_blob",
   "_sqlite3_value_double",
   "_sqlite3_result_double",
@@ -36,6 +38,5 @@
   "_sqlite3_result_text",
   "_sqlite3_result_blob",
   "_sqlite3_result_int",
-  "_sqlite3_result_int64",
   "_sqlite3_result_error"
 ]

@@ -5,3 +5,10 @@ declare module '*.wasm' {
   const wasmExports: WasmExport
   export default wasmExports
 }
+
+declare module 'buffer-to-base64/decode' {
+  export function decode(
+    base64: string,
+    format?: CompressionFormat | ''
+  ): Promise<ArrayBuffer>
+}
