@@ -11,6 +11,7 @@ export interface SQLite3Wasm extends EmscriptenModule {
   sqlite3_free: Function
   alinea_malloc: (size: number) => number
   alinea_open: (db: number) => number
+  alinea_init_extensions: (db: number) => number
   alinea_deserialize: (db: number, data: number, size: number) => number
   alinea_serialize: (db: number, size: number) => number
   sqlite3_errmsg: Function

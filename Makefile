@@ -6,6 +6,10 @@ all:
 SQLITE_SOURCE := sqlite-src-3530400
 SQLITE_SOURCE_ZIP_URL := https://www.sqlite.org/2026/sqlite-src-3530400.zip
 SQLITE_SOURCE_ZIP_SHA3 := b834d474b9b393d85a9e3ee4cc11f1329e007e9376a424ee740796f5c4bda3a8
+VECTOR_VERSION := 0.1.9
+VECTOR_SOURCE := sqlite-vec-$(VECTOR_VERSION)
+VECTOR_SOURCE_SHA256 := 3acd67cb4aff080c7050926fd3cf8227905fe5b7ee3829d8ee5024ab1283cf61
+VECTOR_DIR := cache/$(VECTOR_SOURCE)
 WASM_OPT := $(shell dirname $(shell command -v emcc))/../bin/wasm-opt
 
 # See: https://github.com/emscripten-core/emscripten/blob/incoming/src/settings.js
@@ -48,7 +52,6 @@ SQLITE_OMIT_FLAGS = \
 	-DSQLITE_OMIT_ATTACH \
 	-DSQLITE_OMIT_AUTHORIZATION \
 	-DSQLITE_OMIT_AUTOINIT \
-	-DSQLITE_OMIT_AUTOINCREMENT \
 	-DSQLITE_OMIT_AUTOVACUUM \
 	-DSQLITE_OMIT_BETWEEN_OPTIMIZATION \
 	-DSQLITE_OMIT_BLOB_LITERAL \
@@ -120,6 +123,7 @@ build-dist:
 	bun x esbuild --format=esm --minify --tree-shaking src/init-wasm.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/init-edge.ts --outdir=dist
 	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm
+	cp licenses/sqlite-vec-MIT.txt dist/sqlite-vec-LICENSE.txt
 	bun script/embed.js
 
 build-debug: EMCC_OPTS += -g4 -s ASSERTIONS=2 -s SAFE_HEAP=1 -s STACK_OVERFLOW_CHECK=1
@@ -140,17 +144,21 @@ WASM_DEPS = \
 	cache/$(SQLITE_SOURCE)/sqlite3.c \
 	src/sqlite3-bridge.c \
 	src/exported_functions.json \
-	src/exported_runtime_methods.json
+	src/exported_runtime_methods.json \
+	$(VECTOR_DIR)/.extracted
 
 cache/sqlite3-emscripten.js: $(WASM_DEPS)
 	EM_CLOSURE_COMPILER=$(CURDIR)/node_modules/.bin/google-closure-compiler emcc \
 		$(EMCC_OPTS) \
 		$(EMCC_SQLITE_FLAGS) \
+		-DSQLITE_CORE -DSQLITE_VEC_STATIC -DSQLITE_VEC_OMIT_FS -DNDEBUG \
 		--pre-js $(word 2, $^) \
 		--post-js $(word 3, $^) \
 		$(word 4, $^) \
 		$(word 5, $^) \
+		$(VECTOR_DIR)/sqlite-vec.c \
 		-Icache/$(SQLITE_SOURCE) \
+		-I$(VECTOR_DIR) \
 		-s EXPORTED_FUNCTIONS=@$(word 6, $^) \
 		-s EXPORTED_RUNTIME_METHODS=@$(word 7, $^) \
 		-o $(@:.wasm=.js)
@@ -183,6 +191,16 @@ cache/$(SQLITE_SOURCE).zip: | cache
 
 cache:
 	mkdir -p $@
+
+# Pin and verify the released sqlite-vec amalgamation.
+$(VECTOR_DIR)/.extracted: cache/$(VECTOR_SOURCE).tar.gz
+	echo '$(VECTOR_SOURCE_SHA256)  $<' | sha256sum -c -
+	mkdir -p $(VECTOR_DIR)
+	tar -xzf $< -C $(VECTOR_DIR)
+	touch $@
+
+cache/$(VECTOR_SOURCE).tar.gz: | cache
+	curl -LsSf 'https://github.com/asg017/sqlite-vec/releases/download/v$(VECTOR_VERSION)/sqlite-vec-$(VECTOR_VERSION)-amalgamation.tar.gz' -o $@
 
 ################################################################################
 # Etc.

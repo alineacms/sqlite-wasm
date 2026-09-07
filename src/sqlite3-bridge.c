@@ -1,4 +1,5 @@
 #include "sqlite3.h"
+#include "sqlite-vec.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -137,6 +138,10 @@ int alinea_open(sqlite3 **db) {
     SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MEMORY,
     "alinea-memory"
   );
+}
+
+int alinea_init_extensions(sqlite3 *db) {
+  return sqlite3_vec_init(db, 0, 0);
 }
 
 unsigned char *alinea_malloc(int size) {

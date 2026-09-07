@@ -20,6 +20,7 @@ Module['tempInt32'] = stackAlloc(4);
   Module['sqlite3_free'] = cwrap('sqlite3_free', null, ['number']);
   Module['alinea_malloc'] = cwrap('alinea_malloc', 'number', ['number']);
   Module['alinea_open'] = cwrap('alinea_open', 'number', ['number']);
+  Module['alinea_init_extensions'] = cwrap('alinea_init_extensions', 'number', ['number']);
   Module['alinea_deserialize'] = cwrap('alinea_deserialize', 'number', ['number', 'number', 'number']);
   Module['alinea_serialize'] = cwrap('alinea_serialize', 'number', ['number', 'number']);
   Module['sqlite3_changes'] = cwrap('sqlite3_changes', 'number', ['number']);

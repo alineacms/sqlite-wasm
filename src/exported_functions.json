@@ -3,6 +3,7 @@
   "_free",
   "_alinea_malloc",
   "_alinea_open",
+  "_alinea_init_extensions",
   "_alinea_deserialize",
   "_alinea_serialize",
   "_sqlite3_exec",

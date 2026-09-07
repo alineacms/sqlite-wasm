@@ -113,6 +113,73 @@ for (const [name, initialize] of [
         .toEqual([['SQLite']])
     })
 
+    test('registers sqlite-vec on every database', () => {
+      expect(db.exec('select vec_version()')[0].values).toEqual([['v0.1.9']])
+      expect(db.exec("select vec_distance_l2('[0,0]', '[3,4]')")[0].values)
+        .toEqual([[5]])
+    })
+
+    test('searches supplied text and image vectors with cosine distance', () => {
+      db.run(`create virtual table embeddings using vec0(
+        embedding float[3] distance_metric=cosine,
+        +kind text
+      )`)
+      for (const [id, values, kind] of [
+        [1, [1, 0, 0], 'text'],
+        [2, [0.8, 0.6, 0], 'image'],
+        [3, [0, 1, 0], 'image']
+      ]) {
+        const bytes = new Uint8Array(new Float32Array(values).buffer)
+        db.run('insert into embeddings(rowid, embedding, kind) values (?, ?, ?)',
+          [id, bytes, kind])
+      }
+      const rows = db.exec(`
+        select rowid, kind, distance from embeddings
+        where embedding match ? and k = 2 order by distance
+      `, ['[1,0,0]'])[0].values
+      expect(rows.map(row => row.slice(0, 2))).toEqual([[1, 'text'], [2, 'image']])
+      expect(rows[0][2]).toBeCloseTo(0)
+      expect(rows[1][2]).toBeCloseTo(0.2)
+    })
+
+    test('persists vector search through export/import and supports updates', () => {
+      db.run('create virtual table embeddings using vec0(embedding float[2])')
+      db.run("insert into embeddings(rowid, embedding) values (1, '[0,0]'), (2, '[3,4]')")
+      const restored = new Database(db.export())
+      const search = database => database.exec(`
+        select rowid, distance from embeddings
+        where embedding match '[0,0]' and k = 2 order by distance
+      `)[0].values
+      try {
+        expect(search(restored)).toEqual([[1, 0], [2, 5]])
+        restored.run("update embeddings set embedding = '[0,2]' where rowid = 2")
+        restored.run('delete from embeddings where rowid = 1')
+        expect(search(restored)).toEqual([[2, 2]])
+        expect(search(db)).toEqual([[1, 0], [2, 5]])
+      } finally {
+        restored.close()
+      }
+    })
+
+    test('rolls back vector writes and rejects incorrect dimensions', () => {
+      db.run('create virtual table embeddings using vec0(embedding float[2])')
+      db.run('begin')
+      db.run("insert into embeddings(rowid, embedding) values (1, '[0,0]')")
+      db.run('rollback')
+      expect(db.exec('select count(*) from embeddings')[0].values).toEqual([[0]])
+      expect(() => db.run("insert into embeddings(embedding) values ('[1,2,3]')"))
+        .toThrow(/dimension/i)
+      db.run("insert into embeddings(embedding) values ('[1,2]')")
+      expect(db.exec('select count(*) from embeddings')[0].values).toEqual([[1]])
+    })
+
+    test('supports binary quantization and Hamming distance', () => {
+      expect(db.exec(`select vec_distance_hamming(
+        vec_quantize_binary('[1,1,1,1,-1,-1,-1,-1]'),
+        vec_quantize_binary('[1,1,1,-1,-1,-1,-1,-1]')
+      )`)[0].values).toEqual([[1]])
+    })
+
     test('commits and rolls back transactions', () => {
       db.run('create table items (value text)')
       db.run('begin').run("insert into items values ('kept')").run('commit')

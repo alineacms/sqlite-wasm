@@ -46,7 +46,14 @@ export class Database {
         throw new Error(message)
       }
     }
-    // [TODO] Look into RegisterExtensionFunctions(this.db);
+    // Register vector functions and virtual tables on every connection.
+    try {
+      this.handleError(this.wasm.alinea_init_extensions(this.dbPtr))
+    } catch (error) {
+      this.wasm.sqlite3_close_v2(this.dbPtr)
+      this.dbPtr = this.wasm.NULL
+      throw error
+    }
     this.statements = {}
     this.functions = {}
   }
