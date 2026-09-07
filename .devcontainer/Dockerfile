@@ -32,7 +32,7 @@ RUN printf 'export PATH="/emsdk:/emsdk/upstream/emscripten:$PATH"\nexport EM_CON
     && cat /etc/profile.d/emsdk.sh >> /etc/bash.bashrc
 
 # Provides sha3sum plus Tcl, which SQLite needs to generate a custom
-# amalgamation from its canonical source tree.
+# amalgamation from its canonical source tree, and Zopfli for the embedded Wasm.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libdigest-sha3-perl tcl \
+    && apt-get install -y --no-install-recommends libdigest-sha3-perl tcl zopfli \
     && rm -rf /var/lib/apt/lists/*
