@@ -18,8 +18,7 @@
   "scripts": {
     "build": "make build-dist",
     "build:ts": "tsc && cp src/sqlite3-emscripten.d.ts dist/sqlite3-emscripten.d.ts",
-    "clean": "make clean",
-    "test": "bun test.js"
+    "clean": "make clean"
   },
   "files": [
     "dist"

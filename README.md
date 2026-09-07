@@ -31,7 +31,7 @@ Open the repository in its VS Code devcontainer, then run:
 ```sh
 bun install --frozen-lockfile
 bun run build
-bun run test
+bun test
 ```
 
 The toolchain is pinned in the devcontainer and package manifest. The build
