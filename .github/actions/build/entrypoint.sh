@@ -1,7 +1,8 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 
-cd /github/workspace/
-yarn
-yarn build
+cd "${GITHUB_WORKSPACE:-/github/workspace}"
+bun install --frozen-lockfile
+bun run build
+bun test

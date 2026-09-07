@@ -1,7 +1,17 @@
-# action.yml
-name: 'Build SQL.js'
-description: 'Builds sql.js using the .devcontainer/Dockerfile as its environment'
+name: Build and test SQLite Wasm
+description: Builds and tests the package with the pinned devcontainer toolchain
 runs:
-  using: 'docker'
-  image: '../../../.devcontainer/Dockerfile'
-  entrypoint: "/github/workspace/.github/actions/build/entrypoint.sh"
+  using: composite
+  steps:
+    - name: Build toolchain image
+      shell: bash
+      run: docker build --tag sqlite-wasm-ci .devcontainer
+    - name: Install dependencies, build, and test
+      shell: bash
+      run: |
+        docker run --rm \
+          --volume "$GITHUB_WORKSPACE:/github/workspace" \
+          --workdir /github/workspace \
+          --env GITHUB_WORKSPACE=/github/workspace \
+          --env CI=true \
+          sqlite-wasm-ci bash -lc 'bash .github/actions/build/entrypoint.sh'
