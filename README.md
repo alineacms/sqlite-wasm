@@ -15,16 +15,15 @@ console.log(db.exec('select * from messages'))
 db.close()
 ```
 
-The build includes SQLite JSON functions, FTS5, views, temporary tables,
-`VACUUM`, and `ATTACH` for additional in-memory databases. Databases live in
-memory;
+The build includes SQLite JSON functions, FTS5, views, triggers, window
+functions, temporary tables, `VACUUM`, and `ATTACH` for additional in-memory
+databases. Databases live in memory;
 use `db.export()` and `new Database(bytes)` to persist and restore their file
 representation.
 
-This is deliberately a size-oriented SQLite build. Date/time functions, window
-functions, triggers, `EXPLAIN`, `ALTER TABLE`, and `ANALYZE` are omitted. The
-complete compile-time option list is kept in the `SQLITE_OMIT_FLAGS` variable in
-the Makefile.
+This is deliberately a size-oriented SQLite build. Date/time functions,
+`EXPLAIN`, `ALTER TABLE`, and `ANALYZE` are omitted. The complete compile-time
+option list is kept in the `SQLITE_OMIT_FLAGS` variable in the Makefile.
 
 ## Development
 

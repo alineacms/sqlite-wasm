@@ -222,6 +222,48 @@ for (const [name, initialize] of [
       expect(sizeAfterVacuum).toBeLessThan(sizeBeforeVacuum)
     })
 
+    test('supports window functions', () => {
+      db.run('create table scores (value integer)')
+      db.run('insert into scores values (30), (10), (20)')
+      expect(db.exec(`
+        select
+          value,
+          row_number() over (order by value),
+          sum(value) over (
+            order by value
+            rows between unbounded preceding and current row
+          )
+        from scores
+        order by value
+      `)[0].values).toEqual([
+        [10, 1, 10],
+        [20, 2, 30],
+        [30, 3, 60]
+      ])
+    })
+
+    test('executes triggers after exporting and reopening a database', () => {
+      db.run('create table items (value text)')
+      db.run('create table item_log (value text)')
+      db.run(`
+        create trigger log_item after insert on items begin
+          insert into item_log values (new.value);
+        end
+      `)
+      db.run("insert into items values ('before export')")
+
+      const restored = new Database(db.export())
+      try {
+        restored.run("insert into items values ('after export')")
+        expect(
+          restored.exec('select value from item_log order by rowid')[0].values
+        )
+          .toEqual([['before export'], ['after export']])
+      } finally {
+        restored.close()
+      }
+    })
+
     test('reports modified rows and recovers after SQL errors', () => {
       db.run('create table items (id integer primary key)')
       db.run('insert into items values (1), (2)')
@@ -283,8 +325,6 @@ for (const [name, initialize] of [
 
     test.each([
       ['date/time functions', "select date('now')"],
-      ['window functions', 'select row_number() over ()'],
-      ['triggers', 'create trigger items_insert after insert on items begin select 1; end'],
       ['EXPLAIN', 'explain select 1'],
       ['ALTER TABLE', 'alter table items add column title text'],
       ['ANALYZE', 'analyze items']
