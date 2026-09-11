@@ -93,6 +93,52 @@ for (const [name, initialize] of [
       }
     })
 
+    test('keeps blobs returned by get stable after statement and database activity', () => {
+      const expected = new Uint8Array([0, 1, 2, 3, 127, 128, 254, 255])
+      db.run('create table blobs (value blob)')
+      db.run('insert into blobs values (?), (?)', [
+        expected,
+        new Uint8Array(expected.length).fill(42)
+      ])
+
+      const stmt = db.prepare('select value from blobs order by rowid')
+      expect(stmt.step()).toBe(true)
+      const value = stmt.get()[0]
+      expect(value).toEqual(expected)
+
+      expect(stmt.step()).toBe(true)
+      expect(value).toEqual(expected)
+      stmt.reset()
+      expect(value).toEqual(expected)
+      stmt.free()
+      expect(value).toEqual(expected)
+      db.run('select randomblob(1048576)')
+      expect(value).toEqual(expected)
+    })
+
+    test('keeps blobs returned by getAsObject stable without a second copy', () => {
+      const expected = new Uint8Array([255, 254, 128, 127, 3, 2, 1, 0])
+      db.run('create table blobs (value blob)')
+      db.run('insert into blobs values (?), (?)', [
+        expected,
+        new Uint8Array(expected.length).fill(84)
+      ])
+
+      const stmt = db.prepare('select value from blobs order by rowid')
+      expect(stmt.step()).toBe(true)
+      const value = stmt.getAsObject().value
+      expect(value).toEqual(expected)
+
+      expect(stmt.step()).toBe(true)
+      expect(value).toEqual(expected)
+      stmt.reset()
+      expect(value).toEqual(expected)
+      stmt.free()
+      expect(value).toEqual(expected)
+      db.run('select randomblob(1048576)')
+      expect(value).toEqual(expected)
+    })
+
     test('supports JSON extraction and table-valued JSON functions', () => {
       expect(db.exec(`select json_extract('{"value":42}', '$.value')`)[0].values)
         .toEqual([[42]])

@@ -207,7 +207,7 @@ export class Statement implements StatementI {
     const getBlob = (pos: number = this.pos++): Uint8Array => {
       const ptr: Pointer = this.wasm.sqlite3_column_blob(this.stmt, pos)
       const size: number = this.wasm.sqlite3_column_bytes(this.stmt, pos)
-      return this.wasm.HEAPU8.subarray(ptr, ptr + size)
+      return this.wasm.HEAPU8.slice(ptr, ptr + size)
     }
 
     if (typeof params !== 'undefined') {
