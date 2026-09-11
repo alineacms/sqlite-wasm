@@ -166,6 +166,62 @@ for (const [name, initialize] of [
       expect(db.exec('select * from items')[0].values).toEqual([['kept']])
     })
 
+    test('creates views and preserves them when exporting a database', () => {
+      db.run('create table items (value text)')
+      db.run("insert into items values ('kept'), ('hidden')")
+      db.run(
+        "create view kept_items as select value from items where value = 'kept'"
+      )
+      expect(db.exec('select * from kept_items')[0].values).toEqual([['kept']])
+
+      const restored = new Database(db.export())
+      try {
+        expect(restored.exec('select * from kept_items')[0].values)
+          .toEqual([['kept']])
+        restored.run('drop view kept_items')
+        expect(restored.exec(
+          "select count(*) from sqlite_master where name = 'kept_items'"
+        )[0].values).toEqual([[0]])
+      } finally {
+        restored.close()
+      }
+    })
+
+    test('supports temporary tables without including them in exports', () => {
+      db.run('create temp table temporary_items (value text)')
+      db.run("insert into temporary_items values ('temporary')")
+      expect(db.exec('select * from temporary_items')[0].values)
+        .toEqual([['temporary']])
+
+      const restored = new Database(db.export())
+      try {
+        expect(restored.exec(
+          "select count(*) from sqlite_temp_master where name = 'temporary_items'"
+        )[0].values).toEqual([[0]])
+      } finally {
+        restored.close()
+      }
+    })
+
+    test('supports attached in-memory databases', () => {
+      db.run("attach ':memory:' as extra")
+      db.run('create table extra.items (value text)')
+      db.run("insert into extra.items values ('attached')")
+      expect(db.exec('select * from extra.items')[0].values)
+        .toEqual([['attached']])
+      db.run('detach extra')
+    })
+
+    test('vacuums databases before export', () => {
+      db.run('create table payloads (value blob)')
+      db.run('insert into payloads values (zeroblob(1048576))')
+      db.run('delete from payloads')
+      const sizeBeforeVacuum = db.export().byteLength
+      db.run('vacuum')
+      const sizeAfterVacuum = db.export().byteLength
+      expect(sizeAfterVacuum).toBeLessThan(sizeBeforeVacuum)
+    })
+
     test('reports modified rows and recovers after SQL errors', () => {
       db.run('create table items (id integer primary key)')
       db.run('insert into items values (1), (2)')
@@ -229,10 +285,7 @@ for (const [name, initialize] of [
       ['date/time functions', "select date('now')"],
       ['window functions', 'select row_number() over ()'],
       ['triggers', 'create trigger items_insert after insert on items begin select 1; end'],
-      ['ATTACH', "attach ':memory:' as extra"],
-      ['VACUUM', 'vacuum'],
       ['EXPLAIN', 'explain select 1'],
-      ['views', 'create view item_values as select value from items'],
       ['ALTER TABLE', 'alter table items add column title text'],
       ['ANALYZE', 'analyze items']
     ])('intentionally omits %s', (_feature, sql) => {

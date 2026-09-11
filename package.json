@@ -1,8 +1,12 @@
 {
   "name": "@alinea/sqlite-wasm",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "packageManager": "bun@1.4.2",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alineacms/sqlite-wasm.git"
+  },
   "type": "module",
   "types": "./dist/init-base64.d.ts",
   "exports": {

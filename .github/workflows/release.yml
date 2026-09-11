@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -22,6 +23,8 @@ jobs:
           node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
+      - name: Install npm with trusted publishing support
+        run: npm install --global npm@11.13.0
       - name: Verify release tag matches package version
         run: |
           node --input-type=module <<'NODE'
@@ -35,5 +38,3 @@ jobs:
         uses: ./.github/actions/build
       - name: Publish to npm
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_AUTH_TOKEN }}
