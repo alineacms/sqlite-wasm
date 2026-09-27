@@ -12,9 +12,17 @@ export interface SQLite3Wasm extends EmscriptenModule {
   alinea_malloc: (size: number) => number
   alinea_open: (db: number) => number
   alinea_fork: (source: number, db: number) => number
-  alinea_deserialize: (db: number, data: number, size: number) => number
+  alinea_load: (
+    db: number,
+    data: number,
+    size: number,
+    offset: number,
+    total: number
+  ) => number
   alinea_serialize: (db: number, size: number) => number
   sqlite3_errmsg: Function
+  sqlite3_errstr: (code: number) => string
+  sqlite3_txn_state: (db: number, schema: string) => number
   sqlite3_changes: Function
   sqlite3_prepare_v2: Function
   sqlite3_prepare_v2_sqlptr: Function

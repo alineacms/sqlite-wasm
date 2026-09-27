@@ -329,16 +329,37 @@ for (const [name, initialize] of [
       }
     })
 
-    test('forks start from the last committed state', () => {
+    test('forks the committed state, but not during a write transaction', () => {
       db.run('create table items (value text)')
-      db.run('begin').run("insert into items values ('pending')")
+      db.run('begin')
       const fork = db.fork()
-      db.run('commit')
       try {
+        db.run("insert into items values ('pending')")
+        expect(() => db.fork()).toThrow('during a write transaction')
+        db.run('commit')
         expect(fork.exec('select count(*) from items')[0].values).toEqual([[0]])
       } finally {
         fork.close()
       }
+    })
+
+    test('exports uncommitted changes of large transactions consistently', () => {
+      db.run('create table payloads (value blob)')
+      db.run('begin')
+      // Larger than the page cache, so SQLite spills pages mid-transaction.
+      db.run(`
+        with recursive seq(i) as (select 1 union all select i + 1 from seq where i < 2000)
+        insert into payloads select randomblob(1000) from seq
+      `)
+      const restored = new Database(db.export())
+      try {
+        expect(restored.exec('select count(*) from payloads')[0].values)
+          .toEqual([[2000]])
+      } finally {
+        restored.close()
+      }
+      db.run('rollback')
+      expect(db.exec('select count(*) from payloads')[0].values).toEqual([[0]])
     })
 
     test('forks outlive their source and can be forked again', () => {
@@ -364,7 +385,8 @@ for (const [name, initialize] of [
       pageSize => {
         db.run(`pragma page_size = ${pageSize}`)
         db.run('create table items (value blob)')
-        db.run('insert into items values (zeroblob(200000))')
+        // Larger than the chunks images are loaded in.
+        db.run('insert into items values (zeroblob(3000000))')
         const restored = new Database(db.export())
         const fork = restored.fork()
         try {
@@ -374,7 +396,7 @@ for (const [name, initialize] of [
           expect(fork.exec('select count(*) from items')[0].values)
             .toEqual([[2]])
           expect(restored.exec('select length(value) from items')[0].values)
-            .toEqual([[200000]])
+            .toEqual([[3000000]])
         } finally {
           fork.close()
           restored.close()

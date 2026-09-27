@@ -8,6 +8,9 @@ import type {SQLite3Wasm} from './sqlite3-emscripten'
 import {Pointer, QueryResult, ReturnCode, ReturnMap} from './sqlite3-types.js'
 import {Statement} from './Statement.js'
 
+const LOAD_CHUNK_SIZE = 1 << 20
+const TXN_WRITE = 2 // SQLITE_TXN_WRITE
+
 export class Database {
   /** @internal */ public statements!: Record<number, Statement>
   /** @internal */ public wasm!: SQLite3Wasm
@@ -23,25 +26,7 @@ export class Database {
   constructor(wasm: SQLite3Wasm, data?: ArrayBufferView) {
     this.open(wasm, wasm.alinea_open(wasm.tempInt32))
     if (typeof data !== 'undefined' && data.byteLength > 0) {
-      const dataPtr = this.wasm.alinea_malloc(data.byteLength)
-      if (dataPtr === this.wasm.NULL) {
-        throw new Error('Unable to allocate memory for the database')
-      }
-      this.wasm.HEAPU8.set(
-        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
-        dataPtr
-      )
-      const result = this.wasm.alinea_deserialize(
-        this.dbPtr,
-        dataPtr,
-        data.byteLength
-      )
-      if (result !== ReturnCode.OK) {
-        const message = this.wasm.sqlite3_errmsg(this.dbPtr)
-        this.wasm.sqlite3_close_v2(this.dbPtr)
-        this.dbPtr = this.wasm.NULL
-        throw new Error(message)
-      }
+      this.load(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
     }
     // [TODO] Look into RegisterExtensionFunctions(this.db);
   }
@@ -52,7 +37,47 @@ export class Database {
     this.dbPtr = wasm.getValue(wasm.tempInt32, '*')
     this.statements = {}
     this.functions = {}
-    this.handleError(openResult)
+    if (openResult !== ReturnCode.OK) {
+      this.fail(wasm.sqlite3_errmsg(this.dbPtr))
+    }
+  }
+
+  /**
+   * Copy a database image into the freshly opened database, a chunk at a
+   * time so the Wasm heap never holds the whole image twice.
+   * @internal
+   */
+  private load(bytes: Uint8Array) {
+    const chunkSize = Math.min(bytes.byteLength, LOAD_CHUNK_SIZE)
+    const chunkPtr = this.wasm.alinea_malloc(chunkSize)
+    if (chunkPtr === this.wasm.NULL) {
+      this.fail('Unable to allocate memory for the database')
+    }
+    try {
+      for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+        const chunk = bytes.subarray(offset, offset + chunkSize)
+        this.wasm.HEAPU8.set(chunk, chunkPtr)
+        const result = this.wasm.alinea_load(
+          this.dbPtr,
+          chunkPtr,
+          chunk.byteLength,
+          offset,
+          bytes.byteLength
+        )
+        if (result !== ReturnCode.OK) {
+          this.fail(this.wasm.sqlite3_errstr(result))
+        }
+      }
+    } finally {
+      this.wasm.sqlite3_free(chunkPtr)
+    }
+  }
+
+  /** @internal */
+  private fail(message: string): never {
+    this.wasm.sqlite3_close_v2(this.dbPtr)
+    this.dbPtr = this.wasm.NULL
+    throw new Error(message)
   }
 
   /**
@@ -60,12 +85,16 @@ export class Database {
    * with this database and only copies a page when either side writes to it,
    * so forking is cheap regardless of the database size.
    *
-   * The fork starts from the last committed state. Functions registered with
-   * `create_function` are not carried over.
+   * The fork starts from the last committed state, and cannot be created
+   * while this database has an open write transaction. Functions registered
+   * with `create_function` are not carried over.
    */
   fork(): this {
     if (!this.dbPtr) {
       throw new Error('Database closed')
+    }
+    if (this.wasm.sqlite3_txn_state(this.dbPtr, 'main') === TXN_WRITE) {
+      throw new Error('Cannot fork a database during a write transaction')
     }
     const openResult = this.wasm.alinea_fork(this.dbPtr, this.wasm.tempInt32)
     const fork: this = Object.create(Object.getPrototypeOf(this))
