@@ -1,0 +1,59 @@
+name: Native extension
+
+# Builds and tests the prebuilt overlay extension (src/overlay.c) for every
+# supported platform. Each binary is uploaded as a native-<target> artifact.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {target: linux-x64, os: ubuntu-24.04}
+          - {target: linux-arm64, os: ubuntu-24.04-arm}
+          - {target: linux-x64-musl, os: ubuntu-24.04, musl: true}
+          - {target: linux-arm64-musl, os: ubuntu-24.04-arm, musl: true}
+          - {target: darwin, os: macos-15}
+          - {target: win32-x64, os: windows-2025}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Set up MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install SQLite for bun:sqlite
+        # Apple's system SQLite cannot load extensions.
+        if: runner.os == 'macOS'
+        run: brew install sqlite
+      - run: bun install --frozen-lockfile
+      - name: Build
+        run: bun run build:native
+      - name: Test with bun:sqlite
+        if: ${{ !matrix.musl }}
+        run: bun test native.test.ts
+      - name: Test with node:sqlite
+        if: ${{ !matrix.musl }}
+        run: node --test native.test.ts
+      - name: Build and test on musl
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm --volume "$PWD:/work" --workdir /work node:24-alpine \
+            sh -c 'apk add --no-cache build-base && node script/build-native.ts && node --test native.test.ts'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: dist/native/${{ matrix.target }}/
+          if-no-files-found: error

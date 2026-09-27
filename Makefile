@@ -6,6 +6,10 @@ all:
 SQLITE_SOURCE := sqlite-src-3530400
 SQLITE_SOURCE_ZIP_URL := https://www.sqlite.org/2026/sqlite-src-3530400.zip
 SQLITE_SOURCE_ZIP_SHA3 := b834d474b9b393d85a9e3ee4cc11f1329e007e9376a424ee740796f5c4bda3a8
+# Headers for the native extension build (script/build-native.ts reads these)
+SQLITE_AUTOCONF := sqlite-autoconf-3530400
+SQLITE_AUTOCONF_URL := https://www.sqlite.org/2026/sqlite-autoconf-3530400.tar.gz
+SQLITE_AUTOCONF_SHA3 := 454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338
 WASM_OPT := $(shell dirname $(shell command -v emcc))/../bin/wasm-opt
 
 # See: https://github.com/emscripten-core/emscripten/blob/incoming/src/settings.js
@@ -38,7 +42,14 @@ EMCC_SQLITE_FLAGS = \
 	-DYYSTACKDEPTH=2000 \
 	-DSQLITE_USE_ALLOCA \
 	-DSQLITE_UNTESTABLE \
+	-DSQLITE_OMIT_DESERIALIZE \
 	$(SQLITE_OMIT_FLAGS)
+
+# src/overlay.c is compiled into SQLite and stores every database; without a
+# file system its overlays have no base file.
+EMCC_OVERLAY_FLAGS = \
+	-DSQLITE_CORE \
+	-DOVERLAY_OMIT_BASE
 
 # These flags affect SQLite's parser and keyword table. They must be used both
 # while generating the amalgamation and while compiling it with Emscripten.
@@ -133,6 +144,7 @@ WASM_DEPS = \
 	src/sqlite3-emscripten-post-js.js \
 	cache/$(SQLITE_SOURCE)/sqlite3.c \
 	src/sqlite3-bridge.c \
+	src/overlay.c \
 	src/exported_functions.json \
 	src/exported_runtime_methods.json
 
@@ -140,13 +152,15 @@ cache/sqlite3-emscripten.js: $(WASM_DEPS)
 	EM_CLOSURE_COMPILER=$(CURDIR)/node_modules/.bin/google-closure-compiler emcc \
 		$(EMCC_OPTS) \
 		$(EMCC_SQLITE_FLAGS) \
+		$(EMCC_OVERLAY_FLAGS) \
 		--pre-js $(word 2, $^) \
 		--post-js $(word 3, $^) \
 		$(word 4, $^) \
 		$(word 5, $^) \
+		$(word 6, $^) \
 		-Icache/$(SQLITE_SOURCE) \
-		-s EXPORTED_FUNCTIONS=@$(word 6, $^) \
-		-s EXPORTED_RUNTIME_METHODS=@$(word 7, $^) \
+		-s EXPORTED_FUNCTIONS=@$(word 7, $^) \
+		-s EXPORTED_RUNTIME_METHODS=@$(word 8, $^) \
 		-o $(@:.wasm=.js)
 	$(WASM_OPT) --enable-bulk-memory --enable-nontrapping-float-to-int -Oz --converge $(@:.js=.wasm) -o $(@:.js=.opt.wasm)
 	mv $(@:.js=.opt.wasm) $(@:.js=.wasm)
