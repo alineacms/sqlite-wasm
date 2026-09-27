@@ -41,18 +41,7 @@ jobs:
           NODE
       - name: Build and test Wasm package
         uses: ./.github/actions/build
-      - name: Remove locally built native binaries
-        run: sudo rm -rf dist/native
-      - name: Download prebuilt native binaries
-        uses: actions/download-artifact@v4
-        with:
-          pattern: native-*
-          path: dist/native
-      - name: Arrange native binaries by target
-        run: |
-          for dir in dist/native/native-*; do
-            mv "$dir" "dist/native/${dir#dist/native/native-}"
-          done
-          ls -R dist/native
+      - name: Collect native binaries
+        uses: ./.github/actions/collect-native
       - name: Publish to npm
         run: npm publish --access public

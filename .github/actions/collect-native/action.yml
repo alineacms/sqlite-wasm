@@ -1,0 +1,29 @@
+name: Collect native binaries
+description: >
+  Replaces the locally built native extension with the prebuilt binaries from
+  the native workflow and checks that the package ships every target
+runs:
+  using: composite
+  steps:
+    - name: Remove locally built native binaries
+      shell: bash
+      run: sudo rm -rf dist/native
+    - name: Download prebuilt native binaries
+      uses: actions/download-artifact@v4
+      with:
+        pattern: native-*
+        path: dist/native
+    - name: Arrange by target and check the package
+      shell: bash
+      # Keep the target list in sync with the matrix in native.yml.
+      run: |
+        for dir in dist/native/native-*; do
+          mv "$dir" "dist/native/${dir#dist/native/native-}"
+        done
+        packed=$(npm pack --dry-run --json | node -e '
+          const [pack] = JSON.parse(require("fs").readFileSync(0, "utf8"))
+          console.log(pack.files.map(file => file.path).join("\n"))
+        ')
+        for target in darwin linux-x64 linux-arm64 linux-x64-musl linux-arm64-musl win32-x64; do
+          echo "$packed" | grep -E "^dist/native/$target/overlay\.(dylib|so|dll)$"
+        done
