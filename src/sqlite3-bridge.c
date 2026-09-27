@@ -118,7 +118,15 @@ static sqlite3_vfs alinea_vfs = {
   0
 };
 
+// Defined in overlay.c
 int sqlite3_overlay_register(int make_default);
+int sqlite3_overlay_load(
+  sqlite3 *db,
+  const char *schema,
+  const void *data,
+  int size,
+  sqlite3_int64 offset
+);
 
 int sqlite3_os_init(void) {
   int result = sqlite3_vfs_register(&alinea_vfs, 1);
@@ -172,48 +180,33 @@ int alinea_fork(sqlite3 *source, sqlite3 **db) {
   return alinea_open_overlay(db, name);
 }
 
-static sqlite3_file *alinea_main_file(sqlite3 *db) {
-  sqlite3_file *file = 0;
-  sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &file);
-  return file;
-}
-
 unsigned char *alinea_malloc(int size) {
   return sqlite3_malloc(size);
 }
 
-// Loads a database image into a freshly opened database. Takes ownership of
-// data.
-int alinea_deserialize(sqlite3 *db, unsigned char *data, int size) {
-  sqlite3_file *file = alinea_main_file(db);
-  int result = file
-    ? file->pMethods->xWrite(file, data, size, 0)
-    : SQLITE_MISUSE;
-  sqlite3_free(data);
-  if (result == SQLITE_OK) {
-    // Read the new header so the connection reports the image's page size
-    // right away. An invalid image still fails on first use, as before.
+// Appends a chunk of a database image to a freshly opened database. Once the
+// last chunk is in, the header is read so the connection reports the image's
+// page size right away; an invalid image still fails on first use.
+int alinea_load(
+  sqlite3 *db,
+  const unsigned char *data,
+  int size,
+  int offset,
+  int total
+) {
+  int result = sqlite3_overlay_load(db, "main", data, size, offset);
+  if (result == SQLITE_OK && offset + size == total) {
     sqlite3_exec(db, "select 1 from sqlite_schema limit 0", 0, 0, 0);
   }
   return result;
 }
 
 unsigned char *alinea_serialize(sqlite3 *db, int *size) {
-  sqlite3_file *file = alinea_main_file(db);
   sqlite3_int64 byte_length = 0;
-  unsigned char *data = 0;
-  *size = 0;
-  if (file == 0 || file->pMethods->xFileSize(file, &byte_length) != SQLITE_OK
-      || byte_length > INT_MAX) {
-    return 0;
-  }
-  data = sqlite3_malloc64(byte_length > 0 ? byte_length : 1);
-  if (data == 0) {
-    return 0;
-  }
-  if (byte_length > 0
-      && file->pMethods->xRead(file, data, (int)byte_length, 0) != SQLITE_OK) {
+  unsigned char *data = sqlite3_serialize(db, "main", &byte_length, 0);
+  if (data == 0 || byte_length > INT_MAX) {
     sqlite3_free(data);
+    *size = 0;
     return 0;
   }
   *size = (int)byte_length;

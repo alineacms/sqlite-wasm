@@ -151,14 +151,21 @@ static void ovPatchWal(u8 *buf, int n, i64 off){
   }
 }
 
+static int ovIsHeader(const u8 *h){
+  return memcmp(h, "SQLite format 3", 16)==0;
+}
+
+static int ovIsWalHeader(const u8 *h){
+  return ovIsHeader(h) && (h[18]==2 || h[19]==2);
+}
+
 /* Use the page size of a database header as the chunk size. */
-static void ovParseHeader(Overlay *ov, const u8 *h){
+static void ovUsePageSize(Overlay *ov, const u8 *h){
   int pgsz;
-  if( memcmp(h, "SQLite format 3", 16)!=0 ) return;
+  if( !ovIsHeader(h) ) return;
   pgsz = (h[16]<<8) | h[17];
   if( pgsz==1 ) pgsz = 65536;
   if( pgsz>=512 && pgsz<=65536 && (pgsz & (pgsz-1))==0 ) ov->szChunk = pgsz;
-  ov->bPatchWal = h[18]==2 || h[19]==2;
 }
 
 /* Read from the base file. Bytes past its end read as zero. */
@@ -359,7 +366,8 @@ static int ovCreateLocked(
     if( szBase>=100 ){
       rc = ov->pBase->pMethods->xRead(ov->pBase, h, 100, 0);
       if( rc!=SQLITE_OK ) goto failed;
-      ovParseHeader(ov, h);
+      ovUsePageSize(ov, h);
+      ov->bPatchWal = ovIsWalHeader(h);
     }
     ov->szFile = ov->szVisible = szBase;
   }
@@ -433,10 +441,12 @@ static int ovRead(sqlite3_file *pFile, void *zBuf, int iAmt, i64 iOfst){
 static int ovWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, i64 iOfst){
   Overlay *ov = ((OvFile*)pFile)->pOv;
   const u8 *in = (const u8*)zBuf;
-  int bLoad = ov->szFile==0 && ov->nUsed==0 && iOfst==0 && iAmt>=100;
   int done = 0;
-  /* An empty overlay being loaded with a database image uses its page size. */
-  if( bLoad ) ovParseHeader(ov, in);
+  /* The first write to an empty overlay starts with the header, which
+  ** tells the page size. */
+  if( ov->szFile==0 && ov->nUsed==0 && iOfst==0 && iAmt>=100 ){
+    ovUsePageSize(ov, in);
+  }
   while( done<iAmt ){
     i64 off = iOfst+done;
     i64 i = off/ov->szChunk;
@@ -448,7 +458,6 @@ static int ovWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, i64 iOfst){
     rc = ovPageForWrite(ov, i, o==0 && n==ov->szChunk, &pg);
     if( rc!=SQLITE_OK ) return rc==SQLITE_NOMEM ? SQLITE_IOERR_NOMEM : rc;
     memcpy(pg->a+o, in+done, n);
-    if( bLoad && i==0 && ov->bPatchWal ) ovPatchWal(pg->a, n, 0);
     done += n;
   }
   if( iOfst+iAmt>ov->szFile ) ov->szFile = iOfst+iAmt;
@@ -558,10 +567,17 @@ static int ovFileControl(sqlite3_file *pFile, int op, void *pArg){
     return SQLITE_OK;
   }
   if( op==SQLITE_FCNTL_PRAGMA ){
-    /* PRAGMA overlay_pages: number of pages held in memory. */
+    /* PRAGMA overlay_pages: pages held in memory by this overlay alone,
+    ** that is, not shared with a fork or the overlay it was forked from. */
     char **azArg = (char**)pArg;
     if( sqlite3_stricmp(azArg[1], "overlay_pages")==0 ){
-      azArg[0] = sqlite3_mprintf("%lld", ov->nUsed);
+      i64 i, nOwned = 0;
+      ovEnter();
+      for(i=0; i<ov->nPage; i++){
+        if( ov->apPage[i] && ov->apPage[i]->nRef==1 ) nOwned++;
+      }
+      ovLeave();
+      azArg[0] = sqlite3_mprintf("%lld", nOwned);
       return SQLITE_OK;
     }
   }
@@ -859,6 +875,32 @@ static sqlite3_vfs ovVfs = {
   ovCurrentTimeInt64,
   0, 0, 0
 };
+
+/*
+** Append part of a database image to an empty overlay, in order from offset
+** 0, taking its page size from the header. Overlays without a base file (see
+** OVERLAY_OMIT_BASE) are populated this way before first use.
+*/
+int sqlite3_overlay_load(
+  sqlite3 *db,
+  const char *zSchema,
+  const void *pData,
+  int nData,
+  sqlite3_int64 iOfst
+){
+  sqlite3_file *pFile = 0;
+  Overlay *ov;
+  int rc;
+  sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, &pFile);
+  if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return SQLITE_MISUSE;
+  ov = ((OvFile*)pFile)->pOv;
+  if( iOfst!=ov->szFile || (iOfst==0 && ov->nUsed>0) ) return SQLITE_MISUSE;
+  rc = ovWrite(pFile, pData, nData, iOfst);
+  if( rc==SQLITE_OK && iOfst==0 && nData>=100 && ovIsWalHeader(pData) ){
+    ovPatchWal(ov->apPage[0]->a, 20, 0);
+  }
+  return rc;
+}
 
 /*
 ** Register the "overlay" VFS on top of the current default VFS. Safe to call

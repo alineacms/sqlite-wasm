@@ -5,6 +5,7 @@
     "": {
       "name": "@alinea/sqlite-wasm",
       "devDependencies": {
+        "@alinea/suite": "0.6.3",
         "@types/bun": "1.4.1",
         "@types/emscripten": "1.41.6",
         "@types/sql.js": "1.4.11",
@@ -17,6 +18,8 @@
     },
   },
   "packages": {
+    "@alinea/suite": ["@alinea/suite@0.6.3", "", {}, "sha512-4oGhbwAGq3rQeuuq9ylmybMkIT1mAl6e+DiiTLwwmwNzHFQiVihishgOpkIGrs0fGVSD4T8jOLyNTuQ30RtVuQ=="],
+
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.28.2", "", { "os": "aix", "cpu": "ppc64" }, "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ=="],
 
     "@esbuild/android-arm": ["@esbuild/android-arm@0.28.2", "", { "os": "android", "cpu": "arm" }, "sha512-kXXoiPVVGQcnIYGOeaovwOURpniDBpSq4A03qkQ+BMQqtGG6HYap3xne9C1O1yo4TR3qxlCX5IqqmX6fFo2Lqg=="],

@@ -42,14 +42,15 @@ EMCC_SQLITE_FLAGS = \
 	-DYYSTACKDEPTH=2000 \
 	-DSQLITE_USE_ALLOCA \
 	-DSQLITE_UNTESTABLE \
-	-DSQLITE_OMIT_DESERIALIZE \
 	$(SQLITE_OMIT_FLAGS)
 
 # src/overlay.c is compiled into SQLite and stores every database; without a
-# file system its overlays have no base file.
+# file system its overlays have no base file. Pages already live in the
+# overlay, so each connection's page cache is kept small (256 KiB).
 EMCC_OVERLAY_FLAGS = \
 	-DSQLITE_CORE \
-	-DOVERLAY_OMIT_BASE
+	-DOVERLAY_OMIT_BASE \
+	-DSQLITE_DEFAULT_CACHE_SIZE=-256
 
 # These flags affect SQLite's parser and keyword table. They must be used both
 # while generating the amalgamation and while compiling it with Emscripten.

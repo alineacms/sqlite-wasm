@@ -1,12 +1,22 @@
-import {existsSync, readdirSync} from 'node:fs'
+import {existsSync, readFileSync} from 'node:fs'
 import {fileURLToPath} from 'node:url'
 
+let musl: boolean | undefined
 function isMusl() {
-  try {
-    return readdirSync('/lib').some(file => file.startsWith('ld-musl-'))
-  } catch {
-    return false
+  if (musl === undefined) {
+    // Same checks as detect-libc: the runtime reports the glibc version it
+    // runs on, otherwise ldd names the libc it belongs to.
+    const header = (process.report?.getReport() as any)?.header
+    if (header && 'glibcVersionRuntime' in header) musl = false
+    else {
+      try {
+        musl = readFileSync('/usr/bin/ldd', 'utf8').includes('musl')
+      } catch {
+        musl = false
+      }
+    }
   }
+  return musl
 }
 
 /**

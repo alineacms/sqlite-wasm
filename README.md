@@ -24,7 +24,8 @@ representation.
 Databases are stored copy-on-write, so `db.fork()` creates an independent copy
 without duplicating any data. The fork shares every page with its source and
 copies a page only when either side writes to it. It starts from the last
-committed state and stays valid after the source is closed.
+committed state, cannot be created during a write transaction, and stays valid
+after the source is closed.
 
 ```ts
 const draft = db.fork()
@@ -66,7 +67,10 @@ const b = new DatabaseSync('file:content.db?vfs=overlay&overlay=b&from=a')
   `SQLITE_BUSY` while overlays are open.
 - A WAL-mode base must be checkpointed; a leftover `-wal` file is ignored.
 - An overlay is discarded when its last connection closes.
-- `PRAGMA overlay_pages` returns the number of pages held in memory.
+- `from=` fails with `SQLITE_BUSY` while the source overlay is committing, or
+  while it is held with `locking_mode=exclusive`.
+- `PRAGMA overlay_pages` returns the number of pages an overlay holds alone,
+  not shared with the overlay it was forked from or with its forks.
 - `VACUUM INTO 'file:out.db?vfs=unix'` (`vfs=win32` on Windows) saves an
   overlay to disk.
 - In `bun:sqlite`, open overlays with

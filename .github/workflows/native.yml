@@ -41,6 +41,14 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Build
         run: bun run build:native
+      - name: Check glibc compatibility
+        # Keep the binary loadable on older distributions (glibc 2.17+).
+        if: runner.os == 'Linux' && !matrix.musl
+        run: |
+          required=$(objdump -T dist/native/${{ matrix.target }}/overlay.so \
+            | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+          echo "Requires $required"
+          test "$(printf '%s\n' "$required" GLIBC_2.17 | sort -V | tail -1)" = GLIBC_2.17
       - name: Test with bun:sqlite
         if: ${{ !matrix.musl }}
         run: bun test native.test.ts
