@@ -9,10 +9,10 @@ import {Pointer, QueryResult, ReturnCode, ReturnMap} from './sqlite3-types.js'
 import {Statement} from './Statement.js'
 
 export class Database {
-  /** @internal */ public statements: Record<number, Statement>
-  /** @internal */ public readonly wasm: SQLite3Wasm
-  /** @internal */ private dbPtr: Pointer
-  /** @internal */ private functions: Record<string, Pointer>
+  /** @internal */ public statements!: Record<number, Statement>
+  /** @internal */ public wasm!: SQLite3Wasm
+  /** @internal */ private dbPtr!: Pointer
+  /** @internal */ private functions!: Record<string, Pointer>
 
   /**
    * Represents an SQLite database
@@ -21,10 +21,7 @@ export class Database {
    * @param data An array of bytes representing an SQLite database file
    */
   constructor(wasm: SQLite3Wasm, data?: ArrayBufferView) {
-    this.wasm = wasm
-    const openResult = this.wasm.alinea_open(this.wasm.tempInt32)
-    this.dbPtr = this.wasm.getValue(this.wasm.tempInt32, '*')
-    this.handleError(openResult)
+    this.open(wasm, wasm.alinea_open(wasm.tempInt32))
     if (typeof data !== 'undefined' && data.byteLength > 0) {
       const dataPtr = this.wasm.alinea_malloc(data.byteLength)
       if (dataPtr === this.wasm.NULL) {
@@ -47,8 +44,33 @@ export class Database {
       }
     }
     // [TODO] Look into RegisterExtensionFunctions(this.db);
+  }
+
+  /** @internal */
+  private open(wasm: SQLite3Wasm, openResult: ReturnCode) {
+    this.wasm = wasm
+    this.dbPtr = wasm.getValue(wasm.tempInt32, '*')
     this.statements = {}
     this.functions = {}
+    this.handleError(openResult)
+  }
+
+  /**
+   * Create an independent copy of this database. The copy shares all pages
+   * with this database and only copies a page when either side writes to it,
+   * so forking is cheap regardless of the database size.
+   *
+   * The fork starts from the last committed state. Functions registered with
+   * `create_function` are not carried over.
+   */
+  fork(): this {
+    if (!this.dbPtr) {
+      throw new Error('Database closed')
+    }
+    const openResult = this.wasm.alinea_fork(this.dbPtr, this.wasm.tempInt32)
+    const fork: this = Object.create(Object.getPrototypeOf(this))
+    fork.open(this.wasm, openResult)
+    return fork
   }
 
   /**

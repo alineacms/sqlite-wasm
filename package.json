@@ -16,11 +16,13 @@
       "worker": "./dist/init-wasm.js",
       "default": "./dist/init-base64.js"
     },
+    "./native": "./dist/native.js",
     "./package.json": "./package.json",
     "./*": "./dist/*"
   },
   "scripts": {
-    "build": "make build-dist",
+    "build": "make build-dist && bun run build:native",
+    "build:native": "bun script/build-native.ts && esbuild --format=esm --minify --platform=node src/native.ts --outdir=dist",
     "build:ts": "tsc && cp src/sqlite3-emscripten.d.ts dist/sqlite3-emscripten.d.ts",
     "clean": "make clean"
   },

@@ -312,6 +312,76 @@ for (const [name, initialize] of [
       expect(db.exec('select count(*) from items')[0].values).toEqual([[1]])
     })
 
+    test('forks share pages until either side writes', () => {
+      db.run('create table items (value text)')
+      db.run("insert into items values ('base')")
+      const fork = db.fork()
+      try {
+        expect(fork).toBeInstanceOf(Database)
+        fork.run("insert into items values ('fork')")
+        db.run("insert into items values ('source')")
+        expect(fork.exec('select value from items order by rowid')[0].values)
+          .toEqual([['base'], ['fork']])
+        expect(db.exec('select value from items order by rowid')[0].values)
+          .toEqual([['base'], ['source']])
+      } finally {
+        fork.close()
+      }
+    })
+
+    test('forks start from the last committed state', () => {
+      db.run('create table items (value text)')
+      db.run('begin').run("insert into items values ('pending')")
+      const fork = db.fork()
+      db.run('commit')
+      try {
+        expect(fork.exec('select count(*) from items')[0].values).toEqual([[0]])
+      } finally {
+        fork.close()
+      }
+    })
+
+    test('forks outlive their source and can be forked again', () => {
+      const source = new Database()
+      source.run('create table items (value text)')
+      source.run("insert into items values ('kept')")
+      const fork = source.fork()
+      source.close()
+      const nested = fork.fork()
+      try {
+        nested.run("insert into items values ('nested')")
+        expect(fork.exec('select * from items')[0].values).toEqual([['kept']])
+        expect(nested.exec('select * from items order by rowid')[0].values)
+          .toEqual([['kept'], ['nested']])
+      } finally {
+        fork.close()
+        nested.close()
+      }
+    })
+
+    test.each([1024, 65536])(
+      'restores and forks databases with %i byte pages',
+      pageSize => {
+        db.run(`pragma page_size = ${pageSize}`)
+        db.run('create table items (value blob)')
+        db.run('insert into items values (zeroblob(200000))')
+        const restored = new Database(db.export())
+        const fork = restored.fork()
+        try {
+          expect(restored.exec('pragma page_size')[0].values)
+            .toEqual([[pageSize]])
+          fork.run('insert into items values (zeroblob(10))')
+          expect(fork.exec('select count(*) from items')[0].values)
+            .toEqual([[2]])
+          expect(restored.exec('select length(value) from items')[0].values)
+            .toEqual([[200000]])
+        } finally {
+          fork.close()
+          restored.close()
+        }
+      }
+    )
+
     test('closes outstanding statements and rejects use after close', () => {
       const stmt = db.prepare('select 1')
       const closed = db
@@ -321,6 +391,7 @@ for (const [name, initialize] of [
       expect(() => closed.run('select 1')).toThrow('Database closed')
       expect(() => closed.exec('select 1')).toThrow('Database closed')
       expect(() => closed.export()).toThrow('Database closed')
+      expect(() => closed.fork()).toThrow('Database closed')
     })
 
     test.each([

@@ -118,52 +118,102 @@ static sqlite3_vfs alinea_vfs = {
   0
 };
 
+int sqlite3_overlay_register(int make_default);
+
 int sqlite3_os_init(void) {
-  return sqlite3_vfs_register(&alinea_vfs, 1);
+  int result = sqlite3_vfs_register(&alinea_vfs, 1);
+  if (result != SQLITE_OK) {
+    return result;
+  }
+  return sqlite3_overlay_register(0);
 }
 
 int sqlite3_os_end(void) {
   return SQLITE_OK;
 }
 
-int alinea_open(sqlite3 **db) {
+// Every database is a named copy-on-write overlay (see overlay.c), so forks
+// share unchanged pages with their source.
+static int alinea_open_overlay(sqlite3 **db, const char *from) {
+  static unsigned int counter = 0;
   int result = sqlite3_initialize();
   if (result != SQLITE_OK) {
     return result;
   }
-  return sqlite3_open_v2(
-    ":memory:",
+  unsigned int id = ++counter;
+  char *uri = from
+    ? sqlite3_mprintf("file:db%u?overlay=db%u&from=%s", id, id, from)
+    : sqlite3_mprintf("file:db%u?overlay=db%u", id, id);
+  if (uri == 0) {
+    return SQLITE_NOMEM;
+  }
+  result = sqlite3_open_v2(
+    uri,
     db,
-    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MEMORY,
-    "alinea-memory"
+    SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI,
+    "overlay"
   );
+  sqlite3_free(uri);
+  return result;
+}
+
+int alinea_open(sqlite3 **db) {
+  return alinea_open_overlay(db, 0);
+}
+
+// Opens a snapshot of the last committed state of source.
+int alinea_fork(sqlite3 *source, sqlite3 **db) {
+  const char *name =
+    sqlite3_uri_parameter(sqlite3_db_filename(source, "main"), "overlay");
+  if (name == 0) {
+    *db = 0;
+    return SQLITE_MISUSE;
+  }
+  return alinea_open_overlay(db, name);
+}
+
+static sqlite3_file *alinea_main_file(sqlite3 *db) {
+  sqlite3_file *file = 0;
+  sqlite3_file_control(db, "main", SQLITE_FCNTL_FILE_POINTER, &file);
+  return file;
 }
 
 unsigned char *alinea_malloc(int size) {
   return sqlite3_malloc(size);
 }
 
+// Loads a database image into a freshly opened database. Takes ownership of
+// data.
 int alinea_deserialize(sqlite3 *db, unsigned char *data, int size) {
-  int result = sqlite3_deserialize(
-    db,
-    "main",
-    data,
-    size,
-    size,
-    SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE
-  );
-  if (result != SQLITE_OK) {
-    sqlite3_free(data);
+  sqlite3_file *file = alinea_main_file(db);
+  int result = file
+    ? file->pMethods->xWrite(file, data, size, 0)
+    : SQLITE_MISUSE;
+  sqlite3_free(data);
+  if (result == SQLITE_OK) {
+    // Read the new header so the connection reports the image's page size
+    // right away. An invalid image still fails on first use, as before.
+    sqlite3_exec(db, "select 1 from sqlite_schema limit 0", 0, 0, 0);
   }
   return result;
 }
 
 unsigned char *alinea_serialize(sqlite3 *db, int *size) {
+  sqlite3_file *file = alinea_main_file(db);
   sqlite3_int64 byte_length = 0;
-  unsigned char *data = sqlite3_serialize(db, "main", &byte_length, 0);
-  if (data == 0 || byte_length > INT_MAX) {
+  unsigned char *data = 0;
+  *size = 0;
+  if (file == 0 || file->pMethods->xFileSize(file, &byte_length) != SQLITE_OK
+      || byte_length > INT_MAX) {
+    return 0;
+  }
+  data = sqlite3_malloc64(byte_length > 0 ? byte_length : 1);
+  if (data == 0) {
+    return 0;
+  }
+  if (byte_length > 0
+      && file->pMethods->xRead(file, data, (int)byte_length, 0) != SQLITE_OK) {
     sqlite3_free(data);
-    *size = 0;
     return 0;
   }
   *size = (int)byte_length;
