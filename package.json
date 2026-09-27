@@ -17,6 +17,7 @@
       "default": "./dist/init-base64.js"
     },
     "./native": "./dist/native.js",
+    "./indexeddb": "./dist/indexeddb.js",
     "./package.json": "./package.json",
     "./*": "./dist/*"
   },
@@ -36,6 +37,7 @@
     "@types/sql.js": "1.4.11",
     "buffer-to-base64": "0.1.6",
     "esbuild": "0.28.2",
+    "fake-indexeddb": "6.2.5",
     "google-closure-compiler": "20260831.0.0",
     "terser": "5.51.2",
     "typescript": "7.0.2"

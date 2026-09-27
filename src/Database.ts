@@ -11,11 +11,45 @@ import {Statement} from './Statement.js'
 const LOAD_CHUNK_SIZE = 1 << 20
 const TXN_WRITE = 2 // SQLITE_TXN_WRITE
 
+/**
+ * The parts of the database file one commit changed, in chunks of
+ * `chunkSize` bytes. Chunks at or past `minSize` that are not in `chunks`
+ * were truncated away and read as zero.
+ * @internal
+ */
+export interface Commit {
+  chunkSize: number
+  /** File size after the commit */
+  size: number
+  /** Smallest file size during the commit */
+  minSize: number
+  /** Content of every written chunk, by chunk index */
+  chunks: Map<number, Uint8Array>
+}
+
+/** Storage that commits are written to, such as IndexedDB. @internal */
+export interface Persistence {
+  flush(): Promise<void>
+  close(): void
+}
+
+/**
+ * A place to keep a database, such as `indexedDBStorage(name)` from
+ * `@alinea/sqlite-wasm/indexeddb`. See `Database.sync`.
+ */
+export interface Storage {
+  sync<T extends Database>(
+    Database: new (data?: ArrayBufferView) => T
+  ): Promise<T>
+}
+
 export class Database {
   /** @internal */ public statements!: Record<number, Statement>
   /** @internal */ public wasm!: SQLite3Wasm
   /** @internal */ private dbPtr!: Pointer
   /** @internal */ private functions!: Record<string, Pointer>
+  /** @internal */ private commitListener?: Pointer
+  /** @internal */ public persistence?: Persistence
 
   /**
    * Represents an SQLite database
@@ -31,6 +65,18 @@ export class Database {
     // [TODO] Look into RegisterExtensionFunctions(this.db);
   }
 
+  /**
+   * Load the database kept in storage into memory, or start an empty one,
+   * and keep storing every commit there. Queries run in memory as usual.
+   * Await `flush()` to know the commits so far are stored.
+   */
+  static sync<T extends Database>(
+    this: new (data?: ArrayBufferView) => T,
+    storage: Storage
+  ): Promise<T> {
+    return storage.sync(this)
+  }
+
   /** @internal */
   private open(wasm: SQLite3Wasm, openResult: ReturnCode) {
     this.wasm = wasm
@@ -43,33 +89,41 @@ export class Database {
   }
 
   /**
-   * Copy a database image into the freshly opened database, a chunk at a
-   * time so the Wasm heap never holds the whole image twice.
+   * Copy (part of) a database image into the freshly opened database, a
+   * piece at a time so the Wasm heap never holds the whole image twice.
+   * Parts must be appended in order; `total` is the size of the image. The
+   * image is stored in chunks of `chunkSize` bytes, or of its page size.
    * @internal
    */
-  private load(bytes: Uint8Array) {
-    const chunkSize = Math.min(bytes.byteLength, LOAD_CHUNK_SIZE)
-    const chunkPtr = this.wasm.alinea_malloc(chunkSize)
-    if (chunkPtr === this.wasm.NULL) {
+  load(
+    bytes: Uint8Array,
+    offset = 0,
+    total = bytes.byteLength,
+    chunkSize = 0
+  ) {
+    const pieceSize = Math.min(bytes.byteLength, LOAD_CHUNK_SIZE)
+    const piecePtr = this.wasm.alinea_malloc(pieceSize)
+    if (piecePtr === this.wasm.NULL) {
       this.fail('Unable to allocate memory for the database')
     }
     try {
-      for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
-        const chunk = bytes.subarray(offset, offset + chunkSize)
-        this.wasm.HEAPU8.set(chunk, chunkPtr)
+      for (let done = 0; done < bytes.byteLength; done += pieceSize) {
+        const piece = bytes.subarray(done, done + pieceSize)
+        this.wasm.HEAPU8.set(piece, piecePtr)
         const result = this.wasm.alinea_load(
           this.dbPtr,
-          chunkPtr,
-          chunk.byteLength,
-          offset,
-          bytes.byteLength
+          piecePtr,
+          piece.byteLength,
+          offset + done,
+          total,
+          chunkSize
         )
         if (result !== ReturnCode.OK) {
           this.fail(this.wasm.sqlite3_errstr(result))
         }
       }
     } finally {
-      this.wasm.sqlite3_free(chunkPtr)
+      this.wasm.sqlite3_free(piecePtr)
     }
   }
 
@@ -100,6 +154,63 @@ export class Database {
     const fork: this = Object.create(Object.getPrototypeOf(this))
     fork.open(this.wasm, openResult)
     return fork
+  }
+
+  /**
+   * Call listener after every commit with copies of the chunks it changed,
+   * and return the current chunk size. Earlier changes are not reported.
+   * The listener runs inside the commit, so it must not use this database;
+   * if it throws, the changes are reported again with the next commit.
+   * @internal
+   */
+  onCommit(listener: (commit: Commit) => void): number {
+    const wasm = this.wasm
+    const callback = wasm.addFunction(
+      (
+        count: number,
+        indexes: Pointer,
+        chunks: Pointer,
+        chunkSize: number,
+        size: number,
+        minSize: number
+      ) => {
+        // An exception must not unwind through SQLite's commit.
+        try {
+          const changed = new Map<number, Uint8Array>()
+          for (let i = 0; i < count; i++) {
+            const data = wasm.getValue(chunks + 4 * i, '*')
+            // Chunk indexes are 64-bit, but fit the low 32 bits in Wasm.
+            changed.set(
+              wasm.getValue(indexes + 8 * i, 'i32'),
+              wasm.HEAPU8.slice(data, data + chunkSize)
+            )
+          }
+          listener({chunkSize, size, minSize, chunks: changed})
+          return ReturnCode.OK
+        } catch {
+          return ReturnCode.ERROR
+        }
+      },
+      'iiiiidd'
+    )
+    const chunkSize = wasm.alinea_persist(this.dbPtr, callback)
+    if (chunkSize === 0) {
+      wasm.removeFunction(callback)
+      throw new Error('Unable to track commits')
+    }
+    if (this.commitListener) wasm.removeFunction(this.commitListener)
+    this.commitListener = callback
+    return chunkSize
+  }
+
+  /**
+   * Wait until every committed change is stored, for databases loaded with
+   * `Database.sync`. Rejects if storing failed; failed writes are retried
+   * with the next commit or flush. Resolves right away for in-memory
+   * databases.
+   */
+  flush(): Promise<void> {
+    return this.persistence ? this.persistence.flush() : Promise.resolve()
   }
 
   /**
@@ -296,7 +407,16 @@ export class Database {
       this.wasm.removeFunction(func)
     }
     this.functions = {}
-    this.handleError(this.wasm.sqlite3_close_v2(this.dbPtr))
+    if (this.commitListener) {
+      this.wasm.alinea_persist(this.dbPtr, this.wasm.NULL)
+      this.wasm.removeFunction(this.commitListener)
+      this.commitListener = undefined
+    }
+    try {
+      this.handleError(this.wasm.sqlite3_close_v2(this.dbPtr))
+    } finally {
+      this.persistence?.close()
+    }
   }
 
   /**
@@ -328,7 +448,9 @@ export class Database {
    * cannot be used anymore.
    *
    * Databases must be closed when you're finished with them, or the
-   * memory consumption will grow forever
+   * memory consumption will grow forever. Commits of a persistent database
+   * that are not stored yet are still written after it closes; await
+   * `flush()` first to know they were.
    * @see [https://sql.js.org/documentation/Database.html#["close"]](https://sql.js.org/documentation/Database.html#%5B%22close%22%5D)
    */
   public close() {

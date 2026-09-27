@@ -1,9 +1,10 @@
-import {Database as DatabaseImpl} from './Database.js'
+import {Database as DatabaseImpl, type Storage} from './Database.js'
 import initialize from './sqlite3-emscripten.js'
 import type {SQLite3Wasm} from './sqlite3-emscripten.js'
 
 export interface Database {
   new (data?: ArrayBufferView): DatabaseImpl
+  sync(storage: Storage): Promise<DatabaseImpl>
 }
 
 export type Imports = WebAssembly.Imports

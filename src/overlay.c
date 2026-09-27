@@ -41,6 +41,13 @@
 ** SHARED/RESERVED/PENDING/EXCLUSIVE locks (the same protocol the OS VFSes
 ** implement with file locks). A SHARED lock is held on the base file for as
 ** long as an overlay exists, so other SQLite connections cannot modify it.
+**
+** Commit hook
+** -----------
+** sqlite3_overlay_commit_hook() reports the chunks every commit changed,
+** which lets an embedder persist an overlay incrementally (the Wasm build
+** writes them to IndexedDB). Changed chunks are tracked only while a hook is
+** registered.
 */
 #ifdef SQLITE_CORE
 # include "sqlite3.h"
@@ -49,6 +56,7 @@
   SQLITE_EXTENSION_INIT1
 #endif
 #include <string.h>
+#include "overlay.h"
 
 #define OVERLAY_VFS_NAME "overlay"
 #define OVERLAY_DEFAULT_CHUNK 4096
@@ -92,6 +100,15 @@ struct Overlay {
   int nShared;            /* Connections holding SHARED or higher */
   OvFile *pWriter;        /* Connection holding RESERVED or higher */
   int eWriter;            /* Lock level held by pWriter */
+  sqlite3_overlay_hook xCommit; /* Commit hook, or NULL */
+  void *pCommitArg;       /* First argument to xCommit */
+  u8 *aDirty;             /* Bitmap of chunks written since the last commit */
+  i64 nDirtyBit;          /* Bits in aDirty */
+  i64 *aiDirty;           /* The same chunks as a list */
+  i64 nDirty;             /* Entries in aiDirty */
+  i64 nDirtyAlloc;        /* Allocated entries in aiDirty */
+  i64 szCommitted;        /* File size at the last commit */
+  i64 szMin;              /* Smallest file size since the last commit */
 };
 
 /* An open main database file. */
@@ -244,6 +261,90 @@ static int ovPageForWrite(Overlay *ov, i64 i, int bFull, OvPage **ppOut){
 }
 
 /* ------------------------------------------------------------------------ */
+/* Commit reporting                                                         */
+/* ------------------------------------------------------------------------ */
+
+/* Remember that chunk i was written, if a commit hook wants to know. */
+static int ovMarkDirty(Overlay *ov, i64 i){
+  if( ov->xCommit==0 ) return SQLITE_OK;
+  if( i>=ov->nDirtyBit ){
+    i64 nNew = ov->nDirtyBit ? ov->nDirtyBit*2 : 512;
+    u8 *a;
+    while( nNew<=i ) nNew *= 2;
+    a = sqlite3_realloc64(ov->aDirty, nNew/8);
+    if( a==0 ) return SQLITE_NOMEM;
+    memset(a+ov->nDirtyBit/8, 0, (size_t)((nNew-ov->nDirtyBit)/8));
+    ov->aDirty = a;
+    ov->nDirtyBit = nNew;
+  }
+  if( ov->aDirty[i/8] & (1<<(i%8)) ) return SQLITE_OK;
+  if( ov->nDirty==ov->nDirtyAlloc ){
+    i64 nNew = ov->nDirtyAlloc ? ov->nDirtyAlloc*2 : 64;
+    i64 *a = sqlite3_realloc64(ov->aiDirty, nNew*sizeof(i64));
+    if( a==0 ) return SQLITE_NOMEM;
+    ov->aiDirty = a;
+    ov->nDirtyAlloc = nNew;
+  }
+  ov->aiDirty[ov->nDirty++] = i;
+  ov->aDirty[i/8] |= (u8)(1<<(i%8));
+  return SQLITE_OK;
+}
+
+/* Start tracking changes from the current state. */
+static void ovResetDirty(Overlay *ov){
+  i64 k;
+  for(k=0; k<ov->nDirty; k++){
+    i64 i = ov->aiDirty[k];
+    ov->aDirty[i/8] &= (u8)~(1<<(i%8));
+  }
+  ov->nDirty = 0;
+  ov->szCommitted = ov->szMin = ov->szFile;
+}
+
+/*
+** Pass the chunks written since the last commit to the commit hook. Chunks
+** that were truncated away are left out: every chunk at or past szMin that
+** is not listed reads as zero (or from the base file, if there is one).
+*/
+static void ovReportCommit(Overlay *ov){
+  sqlite3_overlay_commit c;
+  i64 nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
+  i64 *ai = 0;
+  const u8 **ap = 0;
+  i64 k;
+  int rc;
+  if( ov->xCommit==0 ) return;
+  if( ov->nDirty==0 && ov->szFile==ov->szCommitted
+   && ov->szMin==ov->szCommitted ){
+    return;
+  }
+  if( ov->nDirty ){
+    ai = sqlite3_malloc64(ov->nDirty*(sizeof(i64)+sizeof(u8*)));
+    /* Out of memory: the changes are reported with the next commit. */
+    if( ai==0 ) return;
+    ap = (const u8**)&ai[ov->nDirty];
+  }
+  memset(&c, 0, sizeof(c));
+  for(k=0; k<ov->nDirty; k++){
+    i64 i = ov->aiDirty[k];
+    if( i<nChunk && i<ov->nPage && ov->apPage[i] ){
+      ai[c.nChunk] = i;
+      ap[c.nChunk] = ov->apPage[i]->a;
+      c.nChunk++;
+    }
+  }
+  c.szChunk = ov->szChunk;
+  c.aiChunk = ai;
+  c.apChunk = ap;
+  c.szFile = ov->szFile;
+  c.szMin = ov->szMin;
+  rc = ov->xCommit(ov->pCommitArg, &c);
+  sqlite3_free(ai);
+  /* If the hook failed, report the changes again with the next commit. */
+  if( rc==SQLITE_OK ) ovResetDirty(ov);
+}
+
+/* ------------------------------------------------------------------------ */
 /* Overlay registry                                                         */
 /* ------------------------------------------------------------------------ */
 
@@ -279,6 +380,8 @@ static void ovDestroyLocked(Overlay *ov){
   }
   ovDropPagesLocked(ov, 0);
   sqlite3_free(ov->apPage);
+  sqlite3_free(ov->aDirty);
+  sqlite3_free(ov->aiDirty);
   if( ov->pBase ){
     if( ov->pBase->pMethods ) ov->pBase->pMethods->xClose(ov->pBase);
     sqlite3_free(ov->pBase);
@@ -438,15 +541,8 @@ static int ovRead(sqlite3_file *pFile, void *zBuf, int iAmt, i64 iOfst){
   return SQLITE_OK;
 }
 
-static int ovWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, i64 iOfst){
-  Overlay *ov = ((OvFile*)pFile)->pOv;
-  const u8 *in = (const u8*)zBuf;
+static int ovWriteChunks(Overlay *ov, const u8 *in, int iAmt, i64 iOfst){
   int done = 0;
-  /* The first write to an empty overlay starts with the header, which
-  ** tells the page size. */
-  if( ov->szFile==0 && ov->nUsed==0 && iOfst==0 && iAmt>=100 ){
-    ovUsePageSize(ov, in);
-  }
   while( done<iAmt ){
     i64 off = iOfst+done;
     i64 i = off/ov->szChunk;
@@ -456,6 +552,7 @@ static int ovWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, i64 iOfst){
     int rc;
     if( n>iAmt-done ) n = iAmt-done;
     rc = ovPageForWrite(ov, i, o==0 && n==ov->szChunk, &pg);
+    if( rc==SQLITE_OK ) rc = ovMarkDirty(ov, i);
     if( rc!=SQLITE_OK ) return rc==SQLITE_NOMEM ? SQLITE_IOERR_NOMEM : rc;
     memcpy(pg->a+o, in+done, n);
     done += n;
@@ -464,9 +561,20 @@ static int ovWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, i64 iOfst){
   return SQLITE_OK;
 }
 
+static int ovWrite(sqlite3_file *pFile, const void *zBuf, int iAmt, i64 iOfst){
+  Overlay *ov = ((OvFile*)pFile)->pOv;
+  /* The first write to an empty overlay starts with the header, which
+  ** tells the page size. */
+  if( ov->szFile==0 && ov->nUsed==0 && iOfst==0 && iAmt>=100 ){
+    ovUsePageSize(ov, (const u8*)zBuf);
+  }
+  return ovWriteChunks(ov, (const u8*)zBuf, iAmt, iOfst);
+}
+
 static int ovTruncate(sqlite3_file *pFile, i64 size){
   Overlay *ov = ((OvFile*)pFile)->pOv;
   if( size<ov->szVisible ) ov->szVisible = size;
+  if( size<ov->szMin ) ov->szMin = size;
   if( size<ov->szFile ){
     i64 nKeep = (size+ov->szChunk-1)/ov->szChunk;
     int iTail = (int)(size%ov->szChunk);
@@ -477,6 +585,7 @@ static int ovTruncate(sqlite3_file *pFile, i64 size){
     if( iTail && nKeep-1<ov->nPage && ov->apPage[nKeep-1] ){
       OvPage *pg;
       int rc = ovPageForWrite(ov, nKeep-1, 0, &pg);
+      if( rc==SQLITE_OK ) rc = ovMarkDirty(ov, nKeep-1);
       if( rc!=SQLITE_OK ) return rc==SQLITE_NOMEM ? SQLITE_IOERR_NOMEM : rc;
       memset(pg->a+iTail, 0, ov->szChunk-iTail);
     }
@@ -564,6 +673,11 @@ static int ovFileControl(sqlite3_file *pFile, int op, void *pArg){
   Overlay *ov = ((OvFile*)pFile)->pOv;
   if( op==SQLITE_FCNTL_VFSNAME ){
     *(char**)pArg = sqlite3_mprintf("%s", OVERLAY_VFS_NAME);
+    return SQLITE_OK;
+  }
+  if( op==SQLITE_FCNTL_COMMIT_PHASETWO ){
+    /* Committed, and still holding the write lock. */
+    ovReportCommit(ov);
     return SQLITE_OK;
   }
   if( op==SQLITE_FCNTL_PRAGMA ){
@@ -878,15 +992,19 @@ static sqlite3_vfs ovVfs = {
 
 /*
 ** Append part of a database image to an empty overlay, in order from offset
-** 0, taking its page size from the header. Overlays without a base file (see
-** OVERLAY_OMIT_BASE) are populated this way before first use.
+** 0. Overlays without a base file (see OVERLAY_OMIT_BASE) are populated this
+** way before first use. The first part sets the chunk size: szChunk, or the
+** page size in the header if szChunk is 0. Loading an image with the chunk
+** size it was stored with keeps chunk indexes stable across reloads, also
+** after VACUUM changed the page size.
 */
 int sqlite3_overlay_load(
   sqlite3 *db,
   const char *zSchema,
   const void *pData,
   int nData,
-  sqlite3_int64 iOfst
+  sqlite3_int64 iOfst,
+  int szChunk
 ){
   sqlite3_file *pFile = 0;
   Overlay *ov;
@@ -895,11 +1013,51 @@ int sqlite3_overlay_load(
   if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return SQLITE_MISUSE;
   ov = ((OvFile*)pFile)->pOv;
   if( iOfst!=ov->szFile || (iOfst==0 && ov->nUsed>0) ) return SQLITE_MISUSE;
-  rc = ovWrite(pFile, pData, nData, iOfst);
+  if( iOfst==0 ){
+    if( szChunk==0 ){
+      if( nData>=100 ) ovUsePageSize(ov, pData);
+    }else if( szChunk>=512 && szChunk<=65536 && (szChunk & (szChunk-1))==0 ){
+      ov->szChunk = szChunk;
+    }else{
+      return SQLITE_MISUSE;
+    }
+  }
+  rc = ovWriteChunks(ov, pData, nData, iOfst);
   if( rc==SQLITE_OK && iOfst==0 && nData>=100 && ovIsWalHeader(pData) ){
     ovPatchWal(ov->apPage[0]->a, 20, 0);
   }
   return rc;
+}
+
+/*
+** Call xCommit(pArg, pCommit) after every commit that changes the overlay
+** behind zSchema, with the chunks written since the previous commit; their
+** content is valid for the duration of the call. xCommit runs inside the
+** commit and must not use the database connection. If it returns anything
+** but SQLITE_OK, its changes are reported again with the next commit.
+** Changes made before registering are not reported; register while no
+** transaction is open. A NULL xCommit removes the hook. The current chunk
+** size is written to *pszChunk; it only changes when the overlay is emptied
+** and refilled with a different page size, which is then reported with
+** szMin 0.
+*/
+int sqlite3_overlay_commit_hook(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3_overlay_hook xCommit,
+  void *pArg,
+  int *pszChunk
+){
+  sqlite3_file *pFile = 0;
+  Overlay *ov;
+  sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, &pFile);
+  if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return SQLITE_MISUSE;
+  ov = ((OvFile*)pFile)->pOv;
+  ovResetDirty(ov);
+  ov->xCommit = xCommit;
+  ov->pCommitArg = pArg;
+  if( pszChunk ) *pszChunk = ov->szChunk;
+  return SQLITE_OK;
 }
 
 /*

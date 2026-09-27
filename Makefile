@@ -125,6 +125,7 @@ build-dist:
 	bun x esbuild --format=esm --minify --tree-shaking --external:./load-module.js --bundle src/init-base64.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/init-wasm.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/init-edge.ts --outdir=dist
+	bun x esbuild --format=esm --minify --tree-shaking src/indexeddb.ts --outdir=dist
 	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm
 	bun script/embed.js
 
@@ -147,7 +148,8 @@ WASM_DEPS = \
 	src/sqlite3-bridge.c \
 	src/overlay.c \
 	src/exported_functions.json \
-	src/exported_runtime_methods.json
+	src/exported_runtime_methods.json \
+	src/overlay.h
 
 cache/sqlite3-emscripten.js: $(WASM_DEPS)
 	EM_CLOSURE_COMPILER=$(CURDIR)/node_modules/.bin/google-closure-compiler emcc \

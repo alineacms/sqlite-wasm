@@ -1,4 +1,5 @@
 #include "sqlite3.h"
+#include "overlay.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -118,16 +119,6 @@ static sqlite3_vfs alinea_vfs = {
   0
 };
 
-// Defined in overlay.c
-int sqlite3_overlay_register(int make_default);
-int sqlite3_overlay_load(
-  sqlite3 *db,
-  const char *schema,
-  const void *data,
-  int size,
-  sqlite3_int64 offset
-);
-
 int sqlite3_os_init(void) {
   int result = sqlite3_vfs_register(&alinea_vfs, 1);
   if (result != SQLITE_OK) {
@@ -184,17 +175,20 @@ unsigned char *alinea_malloc(int size) {
   return sqlite3_malloc(size);
 }
 
-// Appends a chunk of a database image to a freshly opened database. Once the
-// last chunk is in, the header is read so the connection reports the image's
-// page size right away; an invalid image still fails on first use.
+// Appends a chunk of a database image to a freshly opened database, stored
+// in chunks of chunk_size bytes (0: the page size). Once the last chunk is
+// in, the header is read so the connection reports the image's page size
+// right away; an invalid image still fails on first use.
 int alinea_load(
   sqlite3 *db,
   const unsigned char *data,
   int size,
   int offset,
-  int total
+  int total,
+  int chunk_size
 ) {
-  int result = sqlite3_overlay_load(db, "main", data, size, offset);
+  int result =
+    sqlite3_overlay_load(db, "main", data, size, offset, chunk_size);
   if (result == SQLITE_OK && offset + size == total) {
     sqlite3_exec(db, "select 1 from sqlite_schema limit 0", 0, 0, 0);
   }
@@ -211,4 +205,43 @@ unsigned char *alinea_serialize(sqlite3 *db, int *size) {
   }
   *size = (int)byte_length;
   return data;
+}
+
+// A JavaScript function, added with addFunction, that receives the chunks a
+// commit changed: their count, an array of 64-bit chunk indexes, an array of
+// pointers to their content, the chunk size, the new file size and the
+// smallest size the file had during the commit. It returns SQLITE_OK, or an
+// error to have the changes reported again with the next commit.
+typedef int (*alinea_commit_listener)(
+  int count,
+  const sqlite3_int64 *indexes,
+  const unsigned char *const *chunks,
+  int chunk_size,
+  double file_size,
+  double min_file_size
+);
+
+static int alinea_on_commit(void *arg, const sqlite3_overlay_commit *commit) {
+  return ((alinea_commit_listener)arg)(
+    commit->nChunk,
+    commit->aiChunk,
+    commit->apChunk,
+    commit->szChunk,
+    (double)commit->szFile,
+    (double)commit->szMin
+  );
+}
+
+// Calls listener after every commit that changes db, or stops calling a
+// listener when it is null. Returns the chunk size, or 0 on error.
+int alinea_persist(sqlite3 *db, alinea_commit_listener listener) {
+  int chunk_size = 0;
+  int result = sqlite3_overlay_commit_hook(
+    db,
+    "main",
+    listener ? alinea_on_commit : 0,
+    (void *)listener,
+    &chunk_size
+  );
+  return result == SQLITE_OK ? chunk_size : 0;
 }

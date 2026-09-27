@@ -19,7 +19,7 @@ The build includes SQLite JSON functions, FTS5, views, triggers, window
 functions, temporary tables, `VACUUM`, and `ATTACH` for additional in-memory
 databases. Databases live in memory;
 use `db.export()` and `new Database(bytes)` to persist and restore their file
-representation.
+representation, or [sync them with IndexedDB](#indexeddb-storage).
 
 Databases are stored copy-on-write, so `db.fork()` creates an independent copy
 without duplicating any data. The fork shares every page with its source and
@@ -37,6 +37,41 @@ draft.close()
 This is deliberately a size-oriented SQLite build. Date/time functions,
 `EXPLAIN`, `ALTER TABLE`, and `ANALYZE` are omitted. The complete compile-time
 option list is kept in the `SQLITE_OMIT_FLAGS` variable in the Makefile.
+
+## IndexedDB storage
+
+In browsers and workers, `Database.sync` loads a database from IndexedDB,
+or starts an empty one, and keeps storing its commits there:
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {indexedDBStorage} from '@alinea/sqlite-wasm/indexeddb'
+
+const {Database} = await init()
+const storage = indexedDBStorage('notes')
+const db = await Database.sync(storage)
+db.run('create table if not exists notes (text)')
+db.run('insert into notes values (?)', ['stored'])
+await db.flush()
+```
+
+- The whole database is loaded into memory, and queries run synchronously as
+  usual. After every commit, the pages it changed are written to IndexedDB
+  in the background.
+- Each IndexedDB transaction holds one or more whole commits, so the stored
+  database is always a committed state. Commits that were not written yet
+  are lost if the page closes or crashes.
+- `await db.flush()` resolves once every commit so far is stored and rejects
+  if writing failed (for example, over quota); failed writes are retried with
+  the next commit or flush. `db.flush()` resolves right away for in-memory
+  databases.
+- `db.close()` still writes the remaining commits, and syncing the same name
+  again waits for them. After closing, `await storage.delete()` removes the
+  stored database.
+- Sync a database in one place at a time, for example in a SharedWorker.
+  Nothing coordinates writes between tabs or workers that use the same name.
+- `db.fork()` creates an in-memory copy, which is not stored, and
+  `db.export()` returns the file as usual.
 
 ## Native extension
 
