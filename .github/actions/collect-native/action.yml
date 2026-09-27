@@ -7,7 +7,10 @@ runs:
   steps:
     - name: Remove locally built native binaries
       shell: bash
-      run: sudo rm -rf dist/native
+      # The Docker build leaves dist/ owned by root.
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" dist
+        rm -rf dist/native
     - name: Download prebuilt native binaries
       uses: actions/download-artifact@v4
       with:
