@@ -14,15 +14,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  native:
+    name: Native extension
+    uses: ./.github/workflows/native.yml
+
   build:
     name: Build and test
+    needs: native
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - name: Build and test Wasm package
         uses: ./.github/actions/build
-
-  native:
-    name: Native extension
-    uses: ./.github/workflows/native.yml
+      # The same packaging steps as the release, without publishing.
+      - name: Collect native binaries
+        uses: ./.github/actions/collect-native
