@@ -240,11 +240,60 @@ test('overlay_pages counts the pages an overlay holds alone', () => {
 })
 
 test('WAL-mode base is opened as a rollback database', () => {
-  const db = open(`${uri(walBasePath)}?vfs=overlay`)
+  const db = open(`${uri(walBasePath)}?vfs=overlay&overlay=wal`)
   insertRows(db, 10, 'a')
   test.is(count(db), 1010)
   test.is(pragma(db, 'integrity_check'), 'ok')
+  // A fork shares the patched header, also after its source is gone.
+  const fork = open(`${uri(walBasePath)}?vfs=overlay&overlay=wal-fork&from=wal`)
   db.close()
+  test.is(pragma(fork, 'journal_mode'), 'delete')
+  insertRows(fork, 5, 'fork')
+  test.is(count(fork), 1015)
+  test.is(pragma(fork, 'integrity_check'), 'ok')
+  fork.close()
+})
+
+test('mmap_size maps unchanged base pages only', () => {
+  // Returns the limit in effect, which the base file's mapping must allow.
+  const mmap = (db: Db, size: number) =>
+    Number(pragma(db, `mmap_size = ${size}`))
+  const a = open(`${base}&overlay=mmap`)
+  const b = open(`${base}&overlay=mmap`)
+  test.is(mmap(a, 1 << 28), 1 << 28)
+  test.is(count(a, "tag = 'base'"), 1000)
+
+  // Pages another connection changes are read from the overlay.
+  b.exec("update t set tag = 'b' where id % 10 = 0")
+  test.is(count(a, "tag = 'b'"), 100)
+
+  // So are pages changed within a transaction.
+  a.exec('begin')
+  a.exec("update t set tag = 'a' where id % 10 = 1")
+  test.is(count(a, "tag = 'a'"), 100)
+  a.exec('commit')
+  test.is(count(b, "tag = 'a'"), 100)
+
+  // A connection that does not map leaves the mapping of others alone.
+  const c = open(`${base}&overlay=mmap`)
+  test.is(mmap(c, 0), 0)
+  test.is(Number(pragma(a, 'mmap_size')), 1 << 28)
+  test.is(count(c, "tag = 'a'"), 100)
+  test.is(count(a, "tag = 'b'"), 100)
+
+  // A mapped fork is as independent as any other.
+  const fork = open(`${base}&overlay=mmap-fork&from=mmap`)
+  test.is(mmap(fork, 1 << 28), 1 << 28)
+  fork.exec("update t set tag = 'f' where tag = 'b'")
+  test.is(count(fork, "tag = 'f'"), 100)
+  test.is(count(a, "tag = 'f'"), 0)
+  a.exec("delete from t where tag = 'a'")
+  test.is(count(fork, "tag = 'a'"), 100)
+  test.is(count(a), 900)
+
+  test.is(pragma(a, 'integrity_check'), 'ok')
+  test.is(pragma(fork, 'integrity_check'), 'ok')
+  for (const db of [a, b, c, fork]) db.close()
 })
 
 test('VACUUM INTO exports an overlay through another vfs', () => {

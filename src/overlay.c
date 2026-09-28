@@ -42,6 +42,13 @@
 ** implement with file locks). A SHARED lock is held on the base file for as
 ** long as an overlay exists, so other SQLite connections cannot modify it.
 **
+** Reading the base file
+** ---------------------
+** Because the base file cannot change, its first page is kept in memory
+** (SQLite rereads the header at the start of every transaction) and, with
+** PRAGMA mmap_size, pages the overlay has not changed are memory-mapped
+** straight from the base file instead of copied with xRead.
+**
 ** Commit hook
 ** -----------
 ** sqlite3_overlay_commit_hook() reports the chunks every commit changed,
@@ -90,7 +97,9 @@ struct Overlay {
   Overlay *pNext;         /* Next named overlay in gList */
   int nRef;               /* Open connections using this overlay */
   sqlite3_file *pBase;    /* Read-only handle on the base file, or NULL */
-  int bPatchWal;          /* Base header says WAL: report rollback mode */
+  OvPage *pHead;          /* First nHead bytes of the base file, or NULL */
+  int nHead;              /* Bytes in pHead */
+  i64 szMmap;             /* Memory-mapping limit of pBase (guarded by gMutex) */
   int szChunk;            /* Bytes per page-table entry */
   i64 szFile;             /* Virtual file size */
   i64 szVisible;          /* Prefix of the base file not truncated away */
@@ -116,6 +125,7 @@ struct OvFile {
   sqlite3_file base;
   Overlay *pOv;
   int eLock;
+  i64 szMmap;             /* This connection's PRAGMA mmap_size */
 };
 
 /* A private in-memory file used for journals and WAL files. */
@@ -185,14 +195,48 @@ static void ovUsePageSize(Overlay *ov, const u8 *h){
   if( pgsz>=512 && pgsz<=65536 && (pgsz & (pgsz-1))==0 ) ov->szChunk = pgsz;
 }
 
-/* Read from the base file. Bytes past its end read as zero. */
+/*
+** Read from the base file, of which the first chunk is kept in memory. Bytes
+** past its end read as zero.
+*/
 static int ovBaseRead(Overlay *ov, u8 *buf, int n, i64 off){
-  int rc = ov->pBase->pMethods->xRead(ov->pBase, buf, n, off);
-  if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
-  if( rc==SQLITE_OK && ov->bPatchWal && off<20 && off+n>18 ){
-    ovPatchWal(buf, n, off);
+  int rc;
+  if( off<ov->nHead ){
+    int k = ov->nHead-off<n ? (int)(ov->nHead-off) : n;
+    memcpy(buf, ov->pHead->a+off, k);
+    if( k==n ) return SQLITE_OK;
+    buf += k;
+    n -= k;
+    off += k;
   }
+  rc = ov->pBase->pMethods->xRead(ov->pBase, buf, n, off);
+  if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
   return rc;
+}
+
+/*
+** Keep the first chunk of the base file in memory: SQLite reads the header
+** at the start of every transaction to see if the database changed. The
+** header also tells the page size, which becomes the chunk size.
+*/
+static int ovReadHead(Overlay *ov, i64 szBase){
+  int n, rc;
+  if( szBase>=100 ){
+    u8 h[100];
+    rc = ov->pBase->pMethods->xRead(ov->pBase, h, 100, 0);
+    if( rc!=SQLITE_OK ) return rc;
+    ovUsePageSize(ov, h);
+  }
+  ov->pHead = ovPageAlloc(ov->szChunk);
+  if( ov->pHead==0 ) return SQLITE_NOMEM;
+  n = szBase<ov->szChunk ? (int)szBase : ov->szChunk;
+  rc = ov->pBase->pMethods->xRead(ov->pBase, ov->pHead->a, n, 0);
+  if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
+  if( rc!=SQLITE_OK ) return rc;
+  if( n<ov->szChunk ) memset(ov->pHead->a+n, 0, (size_t)(ov->szChunk-n));
+  if( n>=100 && ovIsWalHeader(ov->pHead->a) ) ovPatchWal(ov->pHead->a, 20, 0);
+  ov->nHead = ov->szChunk;
+  return SQLITE_OK;
 }
 
 /* Fill a page buffer with the lower layer's content for chunk iChunk. */
@@ -382,6 +426,7 @@ static void ovDestroyLocked(Overlay *ov){
   sqlite3_free(ov->apPage);
   sqlite3_free(ov->aDirty);
   sqlite3_free(ov->aiDirty);
+  if( ov->pHead && --ov->pHead->nRef==0 ) sqlite3_free(ov->pHead);
   if( ov->pBase ){
     if( ov->pBase->pMethods ) ov->pBase->pMethods->xClose(ov->pBase);
     sqlite3_free(ov->pBase);
@@ -391,6 +436,28 @@ static void ovDestroyLocked(Overlay *ov){
 #endif
   sqlite3_free(ov->zName);
   sqlite3_free(ov);
+}
+
+/*
+** Read the memory-mapping limit of the base file into ov->szMmap, raising it
+** to sz first if sz is larger. The base file handle is shared by every
+** connection of the overlay, so its limit only grows: pages other
+** connections hold stay mapped. While pages are out, the OS VFS keeps the
+** old limit; callers try again later. Caller holds gMutex.
+*/
+static void ovMmapLimitLocked(Overlay *ov, i64 sz){
+  sqlite3_file *pBase = ov->pBase;
+  if( pBase==0 || pBase->pMethods->iVersion<3 ) return;
+  if( sz>ov->szMmap
+   && pBase->pMethods->xFileControl(pBase, SQLITE_FCNTL_MMAP_SIZE, &sz)
+      !=SQLITE_OK ){
+    return;
+  }
+  sz = -1;
+  if( pBase->pMethods->xFileControl(pBase, SQLITE_FCNTL_MMAP_SIZE, &sz)
+      ==SQLITE_OK && sz>=0 ){
+    ov->szMmap = sz;
+  }
 }
 
 #ifndef OVERLAY_OMIT_BASE
@@ -410,6 +477,8 @@ static int ovOpenBase(Overlay *ov, const char *zPath, i64 *pSize){
   /* Keep other connections from modifying the base while we depend on it. */
   rc = ov->pBase->pMethods->xLock(ov->pBase, SQLITE_LOCK_SHARED);
   if( rc!=SQLITE_OK ) return rc;
+  /* The OS VFS may start from a default mapping limit. */
+  ovMmapLimitLocked(ov, 0);
   return ov->pBase->pMethods->xFileSize(ov->pBase, pSize);
 }
 #endif
@@ -448,7 +517,9 @@ static int ovCreateLocked(
   if( pSrc ){
     i64 i;
     ov->szChunk = pSrc->szChunk;
-    ov->bPatchWal = pSrc->bPatchWal;
+    ov->pHead = pSrc->pHead;
+    ov->nHead = pSrc->nHead;
+    if( ov->pHead ) ov->pHead->nRef++;
     ov->szFile = pSrc->szFile;
     ov->szVisible = pSrc->szVisible;
     if( pSrc->nPage ){
@@ -465,13 +536,8 @@ static int ovCreateLocked(
       }
     }
   }else if( szBase>0 ){
-    u8 h[100];
-    if( szBase>=100 ){
-      rc = ov->pBase->pMethods->xRead(ov->pBase, h, 100, 0);
-      if( rc!=SQLITE_OK ) goto failed;
-      ovUsePageSize(ov, h);
-      ov->bPatchWal = ovIsWalHeader(h);
-    }
+    rc = ovReadHead(ov, szBase);
+    if( rc!=SQLITE_OK ) goto failed;
     ov->szFile = ov->szVisible = szBase;
   }
 
@@ -617,6 +683,8 @@ static int ovLock(sqlite3_file *pFile, int eLock){
       }else{
         ov->nShared++;
         p->eLock = SQLITE_LOCK_SHARED;
+        /* Raising the mapping limit fails while pages are out. */
+        if( p->szMmap>ov->szMmap ) ovMmapLimitLocked(ov, p->szMmap);
       }
       break;
     case SQLITE_LOCK_RESERVED:
@@ -680,6 +748,23 @@ static int ovFileControl(sqlite3_file *pFile, int op, void *pArg){
     ovReportCommit(ov);
     return SQLITE_OK;
   }
+  if( op==SQLITE_FCNTL_MMAP_SIZE ){
+    /* PRAGMA mmap_size: map up to this connection's limit, and report the
+    ** part of it the base file's mapping covers. */
+    OvFile *p = (OvFile*)pFile;
+    i64 sz = *(i64*)pArg;
+    if( ov->pBase==0 || ov->pBase->pMethods->iVersion<3 ){
+      return SQLITE_NOTFOUND;
+    }
+    ovEnter();
+    if( sz>=0 ){
+      p->szMmap = sz;
+      ovMmapLimitLocked(ov, sz);
+    }
+    *(i64*)pArg = p->szMmap<ov->szMmap ? p->szMmap : ov->szMmap;
+    ovLeave();
+    return SQLITE_OK;
+  }
   if( op==SQLITE_FCNTL_PRAGMA ){
     /* PRAGMA overlay_pages: pages held in memory by this overlay alone,
     ** that is, not shared with a fork or the overlay it was forked from. */
@@ -709,8 +794,46 @@ static int ovDeviceCharacteristics(sqlite3_file *pFile){
          SQLITE_IOCAP_SAFE_APPEND | SQLITE_IOCAP_SEQUENTIAL;
 }
 
+/*
+** Memory-map a page of the base file that the overlay has not changed, with
+** PRAGMA mmap_size. The base file does not change while the overlay exists,
+** so a mapped page stays valid. Other pages, and every page while this
+** connection writes, are read with xRead. SQLite never maps page 1.
+*/
+static int ovFetch(sqlite3_file *pFile, i64 iOfst, int iAmt, void **pp){
+  OvFile *p = (OvFile*)pFile;
+  Overlay *ov = p->pOv;
+  sqlite3_file *pBase = ov->pBase;
+  i64 i = iOfst/ov->szChunk;
+  int rc;
+  *pp = 0;
+  if( pBase==0 || pBase->pMethods->iVersion<3 || pBase->pMethods->xFetch==0
+   || p->eLock>SQLITE_LOCK_SHARED
+   || iOfst<ov->nHead || iOfst+iAmt>ov->szVisible || iOfst+iAmt>p->szMmap
+   || iOfst%ov->szChunk+iAmt>ov->szChunk
+   || (i<ov->nPage && ov->apPage[i]) ){
+    return SQLITE_OK;
+  }
+  ovEnter();
+  rc = pBase->pMethods->xFetch(pBase, iOfst, iAmt, pp);
+  ovLeave();
+  return rc;
+}
+
+static int ovUnfetch(sqlite3_file *pFile, i64 iOfst, void *pPage){
+  Overlay *ov = ((OvFile*)pFile)->pOv;
+  int rc;
+  /* Without a page SQLite asks to drop a mapping that may be stale. The
+  ** base file does not change, and other connections may use its pages. */
+  if( pPage==0 ) return SQLITE_OK;
+  ovEnter();
+  rc = ov->pBase->pMethods->xUnfetch(ov->pBase, iOfst, pPage);
+  ovLeave();
+  return rc;
+}
+
 static const sqlite3_io_methods ovIoMethods = {
-  1,                          /* iVersion: no shared memory, no mmap */
+  3,                          /* iVersion: no shared memory, mmap */
   ovClose,
   ovRead,
   ovWrite,
@@ -723,7 +846,9 @@ static const sqlite3_io_methods ovIoMethods = {
   ovFileControl,
   ovSectorSize,
   ovDeviceCharacteristics,
-  0, 0, 0, 0, 0, 0
+  0, 0, 0, 0,                 /* xShmMap, xShmLock, xShmBarrier, xShmUnmap */
+  ovFetch,
+  ovUnfetch
 };
 
 /* ------------------------------------------------------------------------ */

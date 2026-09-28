@@ -104,6 +104,10 @@ const b = new DatabaseSync('file:content.db?vfs=overlay&overlay=b&from=a')
 - An overlay is discarded when its last connection closes.
 - `from=` fails with `SQLITE_BUSY` while the source overlay is committing, or
   while it is held with `locking_mode=exclusive`.
+- Set `PRAGMA mmap_size` (for example `268435456`) on every connection,
+  including each fork, to read the pages an overlay has not changed straight
+  from the memory-mapped base file. Where the file is not in the OS page cache
+  yet, this turns many small reads into a few large ones.
 - `PRAGMA overlay_pages` returns the number of pages an overlay holds alone,
   not shared with the overlay it was forked from or with its forks.
 - `VACUUM INTO 'file:out.db?vfs=unix'` (`vfs=win32` on Windows) saves an
