@@ -24,6 +24,7 @@ Module['tempInt32'] = stackAlloc(4);
   Module['alinea_load'] = cwrap('alinea_load', 'number', ['number', 'number', 'number', 'number', 'number', 'number']);
   Module['alinea_serialize'] = cwrap('alinea_serialize', 'number', ['number', 'number']);
   Module['alinea_persist'] = cwrap('alinea_persist', 'number', ['number', 'number']);
+  Module['alinea_persist_all'] = cwrap('alinea_persist_all', 'number', ['number']);
   Module['sqlite3_changes'] = cwrap('sqlite3_changes', 'number', ['number']);
   Module['sqlite3_prepare_v2'] = cwrap('sqlite3_prepare_v2', 'number', ['number', 'string', 'number', 'number', 'number']);
   Module['sqlite3_prepare_v2_sqlptr'] = cwrap('sqlite3_prepare_v2', 'number', ['number', 'number', 'number', 'number', 'number']);

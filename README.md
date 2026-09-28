@@ -65,13 +65,84 @@ await db.flush()
   if writing failed (for example, over quota); failed writes are retried with
   the next commit or flush. `db.flush()` resolves right away for in-memory
   databases.
-- `db.close()` still writes the remaining commits, and syncing the same name
-  again waits for them. After closing, `await storage.delete()` removes the
-  stored database.
-- Sync a database in one place at a time, for example in a SharedWorker.
-  Nothing coordinates writes between tabs or workers that use the same name.
-- `db.fork()` creates an in-memory copy, which is not stored, and
-  `db.export()` returns the file as usual.
+- `db.close()` still writes the remaining commits, and storing a database
+  under the same name again waits for them. After closing,
+  `await storage.delete()` removes the stored database.
+- One database at a time is stored under a name: syncing, attaching or
+  deleting a name that is in use fails with `SQLITE_BUSY`. Store a database
+  in one place at a time, for example in a SharedWorker; nothing coordinates
+  writes between tabs or workers that use the same name.
+- `db.fork()` creates an in-memory copy, which is not stored unless you
+  attach it, and `db.export()` returns the file as usual.
+
+### Attaching and detaching
+
+`await db.attach(storage)` stores a database that is in memory already, such
+as a fork, without loading anything. Its committed state when storing starts
+replaces whatever the storage held, and every later commit is stored, as
+with `Database.sync`. `db.detach()` stops storing a database and keeps it in
+memory. Together they hand a database over to new storage without waiting
+for the old one:
+
+```ts
+const next = db.fork()
+await next.attach(indexedDBStorage('notes-v2'))
+db.detach()
+await next.flush() // the replacement is stored
+```
+
+- The replacement is written in a single IndexedDB transaction that deletes
+  the stored pages, then writes every page and the file size. IndexedDB
+  applies a transaction entirely or not at all, so until it completes the
+  storage keeps its previous database, and a crash or a closed page never
+  leaves a mix of both. If it fails, it is retried with the next commit or
+  flush.
+- The whole database is copied out of the Wasm heap for that transaction.
+- `attach` fails during a write transaction, and for a database that is
+  stored already; detach it first.
+- After `db.detach()`, the commits made so far are still written, and
+  `db.flush()` waits for them and rejects if that failed. Later commits are
+  not stored or kept for storing, and `db.close()` writes nothing. Storing a
+  database under the same name again waits for the final write, as after
+  `close()`.
+
+### Errors
+
+Errors from SQLite, and from storing a database, are `SQLiteError`s
+(exported by `@alinea/sqlite-wasm`) with the name of the result code in
+`error.code`, such as `'SQLITE_CONSTRAINT'` or `'SQLITE_BUSY'`, and its
+number in `error.resultCode`. Check `code` rather than the class, which
+differs between two copies of this package. Errors from IndexedDB itself,
+such as a `QuotaExceededError`, are passed on as they are.
+
+`Database.sync` rejects with `code` `'SQLITE_CORRUPT'` if the stored data is
+not a valid database: an invalid size record, header or page size, fewer
+pages than the header lists, or a schema that cannot be read. Delete it to
+start over:
+
+```ts
+const storage = indexedDBStorage('notes')
+const db = await Database.sync(storage).catch(async error => {
+  if (error.code !== 'SQLITE_CORRUPT') throw error
+  await storage.delete()
+  return Database.sync(storage)
+})
+```
+
+These checks cover the header and the schema, not every page: damage
+elsewhere surfaces when a query reads it. `PRAGMA integrity_check` is left
+out of this build.
+
+### Other IndexedDB implementations
+
+`indexedDBStorage(name, {indexedDB, IDBKeyRange})` uses the given
+implementation instead of the globals, for example fake-indexeddb in tests:
+
+```ts
+import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
+
+const storage = indexedDBStorage('notes', {indexedDB: new IDBFactory(), IDBKeyRange})
+```
 
 ## Native extension
 

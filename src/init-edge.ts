@@ -20,3 +20,4 @@ export function init() {
 }
 
 export default init
+export {SQLiteError} from './SQLiteError.js'

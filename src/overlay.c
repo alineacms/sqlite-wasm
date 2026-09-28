@@ -349,23 +349,24 @@ static void ovResetDirty(Overlay *ov){
 ** Pass the chunks written since the last commit to the commit hook. Chunks
 ** that were truncated away are left out: every chunk at or past szMin that
 ** is not listed reads as zero (or from the base file, if there is one).
+** Returns the error of the hook, or SQLITE_NOMEM; the changes are then
+** reported again with the next commit.
 */
-static void ovReportCommit(Overlay *ov){
+static int ovReportCommit(Overlay *ov){
   sqlite3_overlay_commit c;
   i64 nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
   i64 *ai = 0;
   const u8 **ap = 0;
   i64 k;
   int rc;
-  if( ov->xCommit==0 ) return;
+  if( ov->xCommit==0 ) return SQLITE_OK;
   if( ov->nDirty==0 && ov->szFile==ov->szCommitted
    && ov->szMin==ov->szCommitted ){
-    return;
+    return SQLITE_OK;
   }
   if( ov->nDirty ){
     ai = sqlite3_malloc64(ov->nDirty*(sizeof(i64)+sizeof(u8*)));
-    /* Out of memory: the changes are reported with the next commit. */
-    if( ai==0 ) return;
+    if( ai==0 ) return SQLITE_NOMEM;
     ap = (const u8**)&ai[ov->nDirty];
   }
   memset(&c, 0, sizeof(c));
@@ -384,8 +385,8 @@ static void ovReportCommit(Overlay *ov){
   c.szMin = ov->szMin;
   rc = ov->xCommit(ov->pCommitArg, &c);
   sqlite3_free(ai);
-  /* If the hook failed, report the changes again with the next commit. */
   if( rc==SQLITE_OK ) ovResetDirty(ov);
+  return rc;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -744,7 +745,8 @@ static int ovFileControl(sqlite3_file *pFile, int op, void *pArg){
     return SQLITE_OK;
   }
   if( op==SQLITE_FCNTL_COMMIT_PHASETWO ){
-    /* Committed, and still holding the write lock. */
+    /* Committed, and still holding the write lock. The commit stands even
+    ** if the hook failed: its changes are reported with the next one. */
     ovReportCommit(ov);
     return SQLITE_OK;
   }
@@ -1183,6 +1185,35 @@ int sqlite3_overlay_commit_hook(
   ov->pCommitArg = pArg;
   if( pszChunk ) *pszChunk = ov->szChunk;
   return SQLITE_OK;
+}
+
+/*
+** Report the whole committed file behind zSchema to its commit hook, as one
+** commit that replaces everything (szMin 0) and writes every chunk the
+** overlay holds; the chunks it does not hold read as zero. Use it to store
+** an overlay somewhere new. Only for overlays without a base file, which
+** hold every chunk that is not zero (SQLITE_MISUSE otherwise). Fails with
+** SQLITE_BUSY during a write transaction. Returns the error of the hook if
+** it failed; the file is then reported again with the next commit.
+*/
+int sqlite3_overlay_report_all(sqlite3 *db, const char *zSchema){
+  sqlite3_file *pFile = 0;
+  Overlay *ov;
+  i64 i, nChunk;
+  int rc;
+  sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, &pFile);
+  if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return SQLITE_MISUSE;
+  ov = ((OvFile*)pFile)->pOv;
+  if( ov->xCommit==0 || ov->pBase ) return SQLITE_MISUSE;
+  if( ov->pWriter ) return SQLITE_BUSY;
+  nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
+  for(i=0; i<nChunk && i<ov->nPage; i++){
+    if( ov->apPage[i] && (rc = ovMarkDirty(ov, i))!=SQLITE_OK ) return rc;
+  }
+  ov->szMin = 0;
+  /* Report even an empty file, which still replaces the stored one. */
+  ov->szCommitted = -1;
+  return ovReportCommit(ov);
 }
 
 /*

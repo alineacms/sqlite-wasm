@@ -22,6 +22,7 @@ export interface SQLite3Wasm extends EmscriptenModule {
   ) => number
   alinea_serialize: (db: number, size: number) => number
   alinea_persist: (db: number, listener: number) => number
+  alinea_persist_all: (db: number) => number
   sqlite3_errmsg: Function
   sqlite3_errstr: (code: number) => string
   sqlite3_txn_state: (db: number, schema: string) => number

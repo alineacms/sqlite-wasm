@@ -7,6 +7,7 @@
   "_alinea_load",
   "_alinea_serialize",
   "_alinea_persist",
+  "_alinea_persist_all",
   "_sqlite3_exec",
   "_sqlite3_free",
   "_sqlite3_errmsg",

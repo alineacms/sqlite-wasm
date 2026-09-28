@@ -5,6 +5,7 @@ import type {
   StatementIterator
 } from 'sql.js'
 import type {SQLite3Wasm} from './sqlite3-emscripten'
+import {SQLiteError} from './SQLiteError.js'
 import {Pointer, QueryResult, ReturnCode, ReturnMap} from './sqlite3-types.js'
 import {Statement} from './Statement.js'
 
@@ -35,12 +36,13 @@ export interface Persistence {
 
 /**
  * A place to keep a database, such as `indexedDBStorage(name)` from
- * `@alinea/sqlite-wasm/indexeddb`. See `Database.sync`.
+ * `@alinea/sqlite-wasm/indexeddb`. See `Database.sync` and `db.attach`.
  */
 export interface Storage {
   sync<T extends Database>(
     Database: new (data?: ArrayBufferView) => T
   ): Promise<T>
+  attach(db: Database): Promise<void>
 }
 
 export class Database {
@@ -50,6 +52,7 @@ export class Database {
   /** @internal */ private functions!: Record<string, Pointer>
   /** @internal */ private commitListener?: Pointer
   /** @internal */ public persistence?: Persistence
+  /** @internal */ private attaching = false
 
   /**
    * Represents an SQLite database
@@ -77,6 +80,25 @@ export class Database {
     return storage.sync(this)
   }
 
+  /**
+   * Keep this database in storage from now on, as `Database.sync` does,
+   * without loading anything: its committed state when storing starts
+   * replaces whatever the storage held, as one write. Await `flush()` to
+   * know it is written. Fails during a write transaction, and for a
+   * database that is stored already; `detach()` it first.
+   */
+  async attach(storage: Storage): Promise<void> {
+    if (!this.dbPtr) throw new Error('Database closed')
+    if (this.attaching || this.commitListener)
+      throw new SQLiteError('Database is stored already', ReturnCode.MISUSE)
+    this.attaching = true
+    try {
+      await storage.attach(this)
+    } finally {
+      this.attaching = false
+    }
+  }
+
   /** @internal */
   private open(wasm: SQLite3Wasm, openResult: ReturnCode) {
     this.wasm = wasm
@@ -84,7 +106,7 @@ export class Database {
     this.statements = {}
     this.functions = {}
     if (openResult !== ReturnCode.OK) {
-      this.fail(wasm.sqlite3_errmsg(this.dbPtr))
+      this.fail(wasm.sqlite3_errmsg(this.dbPtr), openResult)
     }
   }
 
@@ -119,7 +141,7 @@ export class Database {
           chunkSize
         )
         if (result !== ReturnCode.OK) {
-          this.fail(this.wasm.sqlite3_errstr(result))
+          this.fail(this.wasm.sqlite3_errstr(result), result)
         }
       }
     } finally {
@@ -128,10 +150,10 @@ export class Database {
   }
 
   /** @internal */
-  private fail(message: string): never {
+  private fail(message: string, resultCode = ReturnCode.ERROR): never {
     this.wasm.sqlite3_close_v2(this.dbPtr)
     this.dbPtr = this.wasm.NULL
-    throw new Error(message)
+    throw new SQLiteError(message, resultCode)
   }
 
   /**
@@ -204,13 +226,45 @@ export class Database {
   }
 
   /**
-   * Wait until every committed change is stored, for databases loaded with
-   * `Database.sync`. Rejects if storing failed; failed writes are retried
-   * with the next commit or flush. Resolves right away for in-memory
-   * databases.
+   * Report the whole committed database to the commit listener, as one
+   * commit that replaces everything (`minSize` 0).
+   * @internal
+   */
+  persistAll(): void {
+    const result = this.wasm.alinea_persist_all(this.dbPtr)
+    if (result !== ReturnCode.OK)
+      throw new SQLiteError(this.wasm.sqlite3_errstr(result), result)
+  }
+
+  /** @internal */
+  private stopCommits() {
+    if (!this.commitListener) return
+    this.wasm.alinea_persist(this.dbPtr, this.wasm.NULL)
+    this.wasm.removeFunction(this.commitListener)
+    this.commitListener = undefined
+  }
+
+  /**
+   * Wait until every committed change is stored, for stored databases (see
+   * `Database.sync` and `attach`). Rejects if storing failed; failed writes
+   * are retried with the next commit or flush. After `detach()` or
+   * `close()`, waits for the final write and rejects if it failed. Resolves
+   * right away for in-memory databases.
    */
   flush(): Promise<void> {
     return this.persistence ? this.persistence.flush() : Promise.resolve()
+  }
+
+  /**
+   * Stop storing this database and keep it in memory. The commits made so
+   * far are still written; `flush()` waits for them. Later commits are not
+   * stored, and syncing or attaching the same storage waits for the final
+   * write, as after `close()`.
+   */
+  detach(): void {
+    if (!this.commitListener) return
+    this.stopCommits()
+    this.persistence?.close()
   }
 
   /**
@@ -407,11 +461,7 @@ export class Database {
       this.wasm.removeFunction(func)
     }
     this.functions = {}
-    if (this.commitListener) {
-      this.wasm.alinea_persist(this.dbPtr, this.wasm.NULL)
-      this.wasm.removeFunction(this.commitListener)
-      this.commitListener = undefined
-    }
+    this.stopCommits()
     try {
       this.handleError(this.wasm.sqlite3_close_v2(this.dbPtr))
     } finally {
@@ -468,7 +518,10 @@ export class Database {
     if (returnCode === ReturnCode.OK) {
       return null
     } else {
-      throw new Error(this.wasm.sqlite3_errmsg(this.dbPtr))
+      throw new SQLiteError(
+        this.wasm.sqlite3_errmsg(this.dbPtr),
+        returnCode ?? ReturnCode.ERROR
+      )
     }
   }
 

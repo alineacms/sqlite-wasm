@@ -245,3 +245,9 @@ int alinea_persist(sqlite3 *db, alinea_commit_listener listener) {
   );
   return result == SQLITE_OK ? chunk_size : 0;
 }
+
+// Reports the whole committed file to the commit listener of db, as one
+// commit that replaces everything.
+int alinea_persist_all(sqlite3 *db) {
+  return sqlite3_overlay_report_all(db, "main");
+}

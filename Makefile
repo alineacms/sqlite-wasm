@@ -117,15 +117,18 @@ build-dist:
 		--define:WebAssembly.instantiateStreaming=false \
 		--define:XMLHttpRequest=false \
 		--define:import.meta.url=false \
+		--external:./SQLiteError.js \
 		--minify \
 		--tree-shaking \
 		src/load-module.ts --outdir=dist
 	bun x terser dist/load-module.js --compress passes=3 --mangle --module --output dist/load-module.min.js
 	mv dist/load-module.min.js dist/load-module.js
-	bun x esbuild --format=esm --minify --tree-shaking --external:./load-module.js --bundle src/init-base64.ts --outdir=dist
+	bun x esbuild --format=esm --minify --tree-shaking --external:./load-module.js --external:./SQLiteError.js --bundle src/init-base64.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/init-wasm.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/init-edge.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/indexeddb.ts --outdir=dist
+# SQLiteError.js is imported by the modules above, so they share one class.
+	bun x esbuild --format=esm --minify src/SQLiteError.ts --outdir=dist
 	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm
 	bun script/embed.js
 
