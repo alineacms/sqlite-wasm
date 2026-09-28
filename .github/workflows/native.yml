@@ -17,23 +17,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {target: linux-x64, os: ubuntu-24.04}
-          - {target: linux-arm64, os: ubuntu-24.04-arm}
-          - {target: linux-x64-musl, os: ubuntu-24.04, musl: true}
-          - {target: linux-arm64-musl, os: ubuntu-24.04-arm, musl: true}
-          - {target: darwin, os: macos-15}
+          - {target: linux-x64, os: ubuntu-26.04}
+          - {target: linux-arm64, os: ubuntu-26.04-arm}
+          - {target: linux-x64-musl, os: ubuntu-26.04, musl: true}
+          - {target: linux-arm64-musl, os: ubuntu-26.04-arm, musl: true}
+          - {target: darwin, os: macos-26}
           - {target: win32-x64, os: windows-2025}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: package.json
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
       - name: Set up MSVC
+        # Export the variables vcvars64.bat sets, so later steps find cl.
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -property installationPath `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+          if (-not $vs) { throw 'Visual Studio with C++ tools not found' }
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and
+                [Environment]::GetEnvironmentVariable($Matches[1]) -ne $Matches[2]) {
+              "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+            }
+          }
+          if ($LASTEXITCODE) { throw 'vcvars64.bat failed' }
       - name: Install SQLite for bun:sqlite
         # Apple's system SQLite cannot load extensions.
         if: runner.os == 'macOS'
@@ -60,7 +73,7 @@ jobs:
         run: |
           docker run --rm --volume "$PWD:/work" --workdir /work node:24-alpine \
             sh -c 'apk add --no-cache build-base && node script/build-native.ts && node --test native.test.ts'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: native-${{ matrix.target }}
           path: dist/native/${{ matrix.target }}/
