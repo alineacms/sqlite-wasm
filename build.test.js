@@ -404,6 +404,25 @@ for (const [name, initialize] of [
       }
     )
 
+    // B-tree balancing needs scratch space of up to 7 pages.
+    test.each([4096, 8192, 16384, 32768, 65536])(
+      'balances indexes with %i byte pages',
+      pageSize => {
+        db.run(`pragma page_size = ${pageSize}`)
+        db.run('create table items (value text)')
+        db.run('create index items_value on items (value)')
+        db.run(`
+          with recursive n(i) as (
+            select 1 union all select i + 1 from n where i < 20000
+          )
+          insert into items select hex(randomblob(24)) from n
+        `)
+        const count =
+          'select count(*) from items indexed by items_value where value > 0'
+        expect(db.exec(count)[0].values).toEqual([[20000]])
+      }
+    )
+
     test('closes outstanding statements and rejects use after close', () => {
       const stmt = db.prepare('select 1')
       const closed = db

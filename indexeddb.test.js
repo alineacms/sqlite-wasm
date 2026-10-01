@@ -223,14 +223,21 @@ describe('IndexedDB storage', () => {
     expect((await stored(name)).image).toEqual(db.export())
   })
 
-  test.each([1024, 65536])(
+  test.each([1024, 4096, 8192, 16384, 32768, 65536])(
     'stores databases with %i byte pages',
     async pageSize => {
       const name = uniqueName()
       const db = await syncDb(name)
       db.run(`pragma page_size = ${pageSize}`)
       db.run('create table items (value blob)')
+      db.run('create index items_value on items (value)')
       db.run('insert into items values (randomblob(300000))')
+      db.run(`
+        with recursive n(i) as (
+          select 1 union all select i + 1 from n where i < 10000
+        )
+        insert into items select randomblob(24) from n
+      `)
       await db.flush()
       const {meta, image} = await stored(name)
       expect(meta.chunkSize).toBe(pageSize)

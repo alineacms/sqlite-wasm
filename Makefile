@@ -29,6 +29,8 @@ EMCC_OPTS = \
 	-sENVIRONMENT=web,worker
 
 # See https://www.sqlite.org/compile.html for more about the compile-time options
+# No SQLITE_USE_ALLOCA: B-tree balancing would take up to 7 pages of the
+# 64 KB Wasm stack and overflow it with 64 KB pages.
 EMCC_SQLITE_FLAGS = \
 	-DSQLITE_ENABLE_FTS5 \
 	-DSQLITE_DISABLE_LFS \
@@ -40,7 +42,6 @@ EMCC_SQLITE_FLAGS = \
 	-DSQLITE_TEMP_STORE=3 \
 	-DSQLITE_MAX_EXPR_DEPTH=0 \
 	-DYYSTACKDEPTH=2000 \
-	-DSQLITE_USE_ALLOCA \
 	-DSQLITE_UNTESTABLE \
 	$(SQLITE_OMIT_FLAGS)
 
