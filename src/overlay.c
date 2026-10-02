@@ -51,7 +51,8 @@
 **
 ** Reading the base file
 ** ---------------------
-** Because the base file cannot change, its first page is kept in memory
+** Because the base file cannot change (unless it is writable, see below),
+** its first page is kept in memory
 ** (SQLite rereads the header at the start of every transaction) and, with
 ** PRAGMA mmap_size, pages the overlay has not changed are memory-mapped
 ** straight from the base file instead of copied with xRead.
@@ -130,6 +131,7 @@ struct Overlay {
   char *zJournal;         /* Its name */
   i64 szStored;           /* Size of a writable base file */
   int rcWrite;            /* Error of the last write-back, or SQLITE_OK */
+  int bChanging;          /* The base is writable, here or in its source */
 };
 
 /* An open main database file. */
@@ -580,11 +582,13 @@ static int ovCreateLocked(
       rc = SQLITE_CANTOPEN;
     }else{
       rc = ovOpenWritableBase(ov, pVfs, zPath, &szBase);
+      ov->bChanging = 1;
     }
   }else if( pSrc && pSrc->pBaseVfs ){
     /* A snapshot of an overlay on a writable base reads the same file;
     ** the source keeps what it reads from changing (ovPreserveLocked). */
     rc = ovOpenBase(ov, pSrc->pBaseVfs, pSrc->zPath, 0, &szBase);
+    ov->bChanging = 1;
   }else{
 #ifndef OVERLAY_OMIT_BASE
     rc = ovOpenBase(ov, gOrig, zPath, 0, &szBase);
@@ -1167,7 +1171,9 @@ static int ovFetch(sqlite3_file *pFile, i64 iOfst, int iAmt, void **pp){
   i64 i = iOfst/ov->szChunk;
   int rc;
   *pp = 0;
-  if( pBase==0 || pBase->pMethods->iVersion<3 || pBase->pMethods->xFetch==0
+  /* A writable base changes with every write-back: never map it. */
+  if( pBase==0 || ov->bChanging || pBase->pMethods->iVersion<3
+   || pBase->pMethods->xFetch==0
    || p->eLock>SQLITE_LOCK_SHARED
    || iOfst<ov->nHead || iOfst+iAmt>ov->szVisible || iOfst+iAmt>p->szMmap
    || iOfst%ov->szChunk+iAmt>ov->szChunk
