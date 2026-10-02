@@ -151,6 +151,12 @@ export class Database {
       : new SQLiteError(this.wasm.sqlite3_errstr(result), result)
   }
 
+  /** True while a transaction is open (after BEGIN). @internal */
+  inTransaction(): boolean {
+    return this.dbPtr !== this.wasm.NULL &&
+      this.wasm.sqlite3_get_autocommit(this.dbPtr) === 0
+  }
+
   /**
    * Store the commits of a database opened with `openFile` that could not
    * be stored yet, and throw if that fails again.

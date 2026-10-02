@@ -19,6 +19,7 @@
     "./native": "./dist/native.js",
     "./indexeddb": "./dist/indexeddb.js",
     "./opfs": "./dist/opfs.js",
+    "./shared": "./dist/shared.js",
     "./package.json": "./package.json",
     "./*": "./dist/*"
   },
