@@ -30,6 +30,7 @@ export interface SQLite3Wasm extends EmscriptenModule {
   sqlite3_errmsg: Function
   sqlite3_errstr: (code: number) => string
   sqlite3_txn_state: (db: number, schema: string) => number
+  sqlite3_get_autocommit: (db: number) => number
   sqlite3_changes: Function
   sqlite3_prepare_v2: Function
   sqlite3_prepare_v2_sqlptr: Function
