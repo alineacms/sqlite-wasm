@@ -18,6 +18,7 @@
     },
     "./native": "./dist/native.js",
     "./indexeddb": "./dist/indexeddb.js",
+    "./opfs": "./dist/opfs.js",
     "./package.json": "./package.json",
     "./*": "./dist/*"
   },

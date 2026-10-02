@@ -128,6 +128,7 @@ build-dist:
 	bun x esbuild --format=esm --minify --tree-shaking src/init-wasm.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/init-edge.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/indexeddb.ts --outdir=dist
+	bun x esbuild --format=esm --minify --tree-shaking src/opfs.ts --outdir=dist
 # SQLiteError.js is imported by the modules above, so they share one class.
 	bun x esbuild --format=esm --minify src/SQLiteError.ts --outdir=dist
 	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm
@@ -151,6 +152,7 @@ WASM_DEPS = \
 	cache/$(SQLITE_SOURCE)/sqlite3.c \
 	src/sqlite3-bridge.c \
 	src/overlay.c \
+	src/jsvfs.c \
 	src/exported_functions.json \
 	src/exported_runtime_methods.json \
 	src/overlay.h
@@ -165,9 +167,10 @@ cache/sqlite3-emscripten.js: $(WASM_DEPS)
 		$(word 4, $^) \
 		$(word 5, $^) \
 		$(word 6, $^) \
+		$(word 7, $^) \
 		-Icache/$(SQLITE_SOURCE) \
-		-s EXPORTED_FUNCTIONS=@$(word 7, $^) \
-		-s EXPORTED_RUNTIME_METHODS=@$(word 8, $^) \
+		-s EXPORTED_FUNCTIONS=@$(word 8, $^) \
+		-s EXPORTED_RUNTIME_METHODS=@$(word 9, $^) \
 		-o $(@:.wasm=.js)
 	$(WASM_OPT) --enable-bulk-memory --enable-nontrapping-float-to-int -Oz --converge $(@:.js=.wasm) -o $(@:.js=.opt.wasm)
 	mv $(@:.js=.opt.wasm) $(@:.js=.wasm)

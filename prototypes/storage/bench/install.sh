@@ -13,7 +13,8 @@ mkdir -p "$engines/proto/dist" "$engines/bench"
 cp "$here"/../*.js "$engines/proto/"
 cp -r "$here"/../dist/sync "$here"/../dist/jspi "$engines/proto/dist/"
 cp "$here"/*.js "$engines/bench/"
-mv "$engines/bench/alinea.js" "$engines/bench/alinea-worker.js" "$engines/"
+mv "$engines/bench/alinea.js" "$engines/bench/alinea-worker.js" \
+  "$engines/bench/alinea-opfs.js" "$engines/bench/alinea-opfs-worker.js" "$engines/"
 python3 - "$compare" <<'PY'
 import sys
 compare = sys.argv[1]
@@ -22,6 +23,8 @@ p = f'{compare}/app/harness.js'
 s = open(p).read()
 if "alinea:" not in s:
     s = s.replace("  pglite: () => import('./engines/pglite.js'),\n", "  pglite: () => import('./engines/pglite.js'),\n  alinea: () => import('./engines/alinea.js'),\n")
+if "'alinea-opfs'" not in s:
+    s = s.replace("  alinea: () => import('./engines/alinea.js'),\n", "  alinea: () => import('./engines/alinea.js'),\n  'alinea-opfs': () => import('./engines/alinea-opfs.js'),\n")
 if 'proto-opfs' not in s:
     entries = ''.join(f"  'proto-{n}': () => import('./engines/bench/{n}.js'),\n" for n in names)
     s = s.replace('const engines = {\n', 'const engines = {\n' + entries)
@@ -33,12 +36,16 @@ if "'alinea'" not in s:
     s = s.replace("pglite: '@electric-sql/pglite'};", "pglite: '@electric-sql/pglite', alinea: '@alinea/sqlite-wasm'};")
     s = s.replace("pglite: 'opfs-ahp://'},", "pglite: 'opfs-ahp://', alinea: 'indexeddb'},")
     s = s.replace("pglite: 'memory://'},", "pglite: 'memory://', alinea: 'memory'},")
+if "'alinea-opfs'" not in s:
+    s = s.replace("'alinea'];", "'alinea', 'alinea-opfs'];")
+    s = s.replace("alinea: '@alinea/sqlite-wasm'};", "alinea: '@alinea/sqlite-wasm', 'alinea-opfs': '@alinea/sqlite-wasm'};")
+    s = s.replace("alinea: 'indexeddb'},", "alinea: 'indexeddb', 'alinea-opfs': 'opfs, page cache only'},")
 if 'proto-opfs' not in s:
     # Appended: run.mjs installs every engine after the first from npm
-    s = s.replace("'alinea'];", "'alinea', " + ', '.join(f"'proto-{n}'" for n in names) + "];")
-    s = s.replace("alinea: '@alinea/sqlite-wasm'};", "alinea: '@alinea/sqlite-wasm', " + ''.join(f"'proto-{n}': '@alinea/sqlite-wasm', " for n in names) + "};")
+    s = s.replace("'alinea-opfs'];", "'alinea-opfs', " + ', '.join(f"'proto-{n}'" for n in names) + "];")
+    s = s.replace("'alinea-opfs': '@alinea/sqlite-wasm'};", "'alinea-opfs': '@alinea/sqlite-wasm', " + ''.join(f"'proto-{n}': '@alinea/sqlite-wasm', " for n in names) + "};")
     storage = {'opfs': 'opfs sync access handles', 'jspi': 'indexeddb via JSPI', 'retry': 'indexeddb, retry on miss'}
     s = s.replace("  opfs: {", "  opfs: {" + ''.join(f"'proto-{n}': '{storage[n]}', " for n in names))
-    open(p, 'w').write(s)
+open(p, 'w').write(s)
 PY
 echo "installed into $engines"
