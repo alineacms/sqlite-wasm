@@ -224,6 +224,19 @@ int alinea_open_file(const char *file, sqlite3 **db) {
   return alinea_open_overlay(db, 0, file);
 }
 
+// Stores db, an in-memory database, in file of the "js" VFS from now on, as
+// if it had been opened with alinea_open_file: its committed state replaces
+// what the file held.
+int alinea_attach_file(sqlite3 *db, const char *file) {
+  return sqlite3_overlay_attach_base(db, "main", "js", file);
+}
+
+// Stops storing db in its file and keeps it in memory. Returns the error of
+// storing the last commits, if that failed; db is detached anyway.
+int alinea_detach_file(sqlite3 *db) {
+  return sqlite3_overlay_detach_base(db, "main");
+}
+
 // Writes the commits that could not be stored yet, for databases opened
 // with alinea_open_file. Returns their error if writing fails again.
 int alinea_flush(sqlite3 *db) {

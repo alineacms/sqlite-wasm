@@ -5,6 +5,8 @@
   "_alinea_open",
   "_alinea_open_file",
   "_alinea_flush",
+  "_alinea_attach_file",
+  "_alinea_detach_file",
   "_alinea_fork",
   "_alinea_load",
   "_alinea_serialize",
