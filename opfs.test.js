@@ -202,6 +202,59 @@ describe('Interrupted commits', () => {
   })
 })
 
+describe('The journal', () => {
+  test('replays every commit since the last checkpoint after a crash', async () => {
+    const first = await sync()
+    fill(first, 100)
+    // Closing checkpoints: the file holds these rows, synced.
+    first.close()
+    const db = await sync()
+    for (let i = 1; i <= 5; i++) {
+      db.run(`update items set body = 'commit ${i}' where id = ${i * 10}`)
+    }
+    // The file itself was not synced since; only the journal was.
+    const crashed = fs.afterCrash()
+    const copy = new Database(crashed.file('notes.sqlite3').bytes())
+    open.push(copy)
+    expect(rows(copy, "select count(*) from items where body like 'commit%'"))
+      .toEqual([[0]])
+    fs = crashed
+    const again = await sync()
+    expect(rows(again, "select id, body from items where body like 'commit%'"))
+      .toEqual([1, 2, 3, 4, 5].map(i => [i * 10, `commit ${i}`]))
+  })
+
+  test('never replays records left from before a checkpoint', async () => {
+    const first = await sync()
+    fill(first, 10)
+    first.run("update items set body = 'one' where id = 1")
+    first.run("update items set body = 'two' where id = 1")
+    first.close()
+    // Closing checkpointed: the journal still holds those records, behind
+    // a cleared header. One record of the same size is written over them.
+    const second = await sync()
+    second.run("update items set body = 'three' where id = 1")
+    const crashed = fs.afterCrash()
+    fs = crashed
+    const again = await sync()
+    expect(rows(again, 'select body from items where id = 1')).toEqual([['three']])
+  })
+
+  test('starts over once it grows past its limit', async () => {
+    const db = await sync()
+    fill(db, 2000)
+    for (let i = 0; i < 300; i++) {
+      db.run(`update items set body = 'x${i}' where id % 50 = ${i % 50}`)
+    }
+    const journal = fs.file('notes.sqlite3-journal').size
+    expect(journal).toBeLessThan(6_000_000)
+    db.close()
+    const again = await sync()
+    expect(rows(again, "select count(*) from items where body like 'x%'"))
+      .toEqual([[2000]])
+  })
+})
+
 describe('One database per file', () => {
   test('fails with SQLITE_BUSY while the file is in use', async () => {
     const storage = fileStorage('notes.sqlite3', fs)

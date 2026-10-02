@@ -4,8 +4,8 @@ import {SQLiteError} from './SQLiteError.js'
 
 // A database stored this way is not kept in memory: SQLite reads its pages
 // from the file as it needs them (through the "js" VFS, jsvfs.c), and every
-// commit is written to the file before it returns, through a redo journal
-// next to it (see "Writable base files" in overlay.c).
+// commit is stored before it returns, in a redo journal next to the file
+// (see "Writable base files" in overlay.c).
 
 const SQLITE_BUSY = 5
 const SQLITE_IOERR_READ = 266
@@ -222,9 +222,9 @@ let defaultFileSystem: FileSystem | undefined
  *
  * Unlike IndexedDB storage, the database is not loaded into memory: pages
  * are read from the file as queries need them, and only the pages of the
- * open transaction are held in memory. Every commit is in the file when it
- * returns, written through a redo journal (`name` plus `-journal`), so the
- * file always holds a committed state.
+ * open transaction are held in memory. Every commit is stored when it
+ * returns, in a redo journal next to the file (`name` plus `-journal`) that
+ * is replayed after a crash.
  *
  * OPFS files can only be opened this way in a dedicated Worker, by one
  * Worker at a time: syncing a database another Worker or tab holds fails
