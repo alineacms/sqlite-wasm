@@ -14,6 +14,50 @@ static sqlite3_int64 alinea_unix_time_ms(void) {
   return (sqlite3_int64)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+// With SQLITE_OMIT_DATETIME_FUNCS, SQLite only calls strftime for
+// current_time, current_date and current_timestamp. The C library's
+// strftime pulls in its whole printf (about 11 KB of Wasm), so this one
+// formats only the fields those functions use and fails on any other.
+size_t strftime(
+  char *restrict output,
+  size_t output_size,
+  const char *restrict format,
+  const struct tm *restrict time
+) {
+  char *end = output;
+  char *limit = output + output_size;
+  if (output_size == 0) {
+    return 0;
+  }
+  for (; *format; format++) {
+    int value;
+    const char *layout = "%02d";
+    if (*format != '%') {
+      if (end + 1 >= limit) {
+        return 0;
+      }
+      *end++ = *format;
+      continue;
+    }
+    switch (*++format) {
+      case 'Y': value = time->tm_year + 1900; layout = "%04d"; break;
+      case 'm': value = time->tm_mon + 1; break;
+      case 'd': value = time->tm_mday; break;
+      case 'H': value = time->tm_hour; break;
+      case 'M': value = time->tm_min; break;
+      case 'S': value = time->tm_sec; break;
+      default: return 0;
+    }
+    sqlite3_snprintf((int)(limit - end), end, layout, value);
+    end += strlen(end);
+    if (end + 1 >= limit) {
+      return 0;
+    }
+  }
+  *end = 0;
+  return (size_t)(end - output);
+}
+
 static int alinea_vfs_open(
   sqlite3_vfs *vfs,
   sqlite3_filename filename,
