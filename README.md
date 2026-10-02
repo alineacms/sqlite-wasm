@@ -19,7 +19,8 @@ The build includes SQLite JSON functions, FTS5, views, triggers, window
 functions, temporary tables, `VACUUM`, and `ATTACH` for additional in-memory
 databases. Databases live in memory;
 use `db.export()` and `new Database(bytes)` to persist and restore their file
-representation, or [sync them with IndexedDB](#indexeddb-storage).
+representation, [sync them with IndexedDB](#indexeddb-storage), or
+[store them in OPFS](#opfs-storage) without keeping them in memory.
 
 Databases are stored copy-on-write, so `db.fork()` creates an independent copy
 without duplicating any data. The fork shares every page with its source and
@@ -143,6 +144,45 @@ import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
 
 const storage = indexedDBStorage('notes', {indexedDB: new IDBFactory(), IDBKeyRange})
 ```
+
+## OPFS storage
+
+In a dedicated Worker, `Database.sync` can also keep a database in a file of
+the origin private file system (OPFS). Unlike IndexedDB storage, the database
+is not loaded into memory: pages are read from the file as queries need them.
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
+
+const {Database} = await init()
+const db = await Database.sync(opfsStorage('notes.sqlite3'))
+db.run('create table if not exists notes (text)')
+db.run('insert into notes values (?)', ['stored'])
+```
+
+- Only SQLite's page cache and the pages of the open transaction are held
+  in memory, so a database can be larger than the memory available to it.
+- Every commit is in the file when it returns. It is first written to a
+  journal next to the file (`notes.sqlite3-journal`), so the file always
+  holds a committed state; opening the database finishes a commit that was
+  interrupted. `await db.flush()` stores commits that failed to write, and
+  rejects if that fails again.
+- OPFS files can only be opened this way in a dedicated Worker, by one
+  Worker at a time: syncing a database that another Worker or tab holds
+  fails with `SQLITE_BUSY`. Have one Worker own the database, and the other
+  tabs send it their queries. No cross-origin isolation headers are needed.
+- `db.fork()` creates an in-memory snapshot, as for any database. It keeps
+  its content when the stored database changes or closes, copying the pages
+  it still read from the file first.
+- A database in memory cannot be attached to OPFS storage: `db.attach`
+  fails with `SQLITE_MISUSE`. Load `db.export()` into a database synced to
+  the storage instead. `await storage.delete()` removes the file and its
+  journal once the database is closed.
+
+`opfsStorage(name, {directory})` keeps the files in a directory of OPFS
+instead of its root. `fileStorage(name, fileSystem)` uses any other
+`FileSystem` that opens files for synchronous access.
 
 ## Native extension
 

@@ -99,6 +99,32 @@ export class Database {
     }
   }
 
+  /**
+   * Replace this new, empty database with the one stored in `file` of the
+   * "js" VFS (see opfs.ts), or a new one there, which stores every commit.
+   * @internal
+   */
+  openFile(file: string) {
+    this.wasm.sqlite3_close_v2(this.dbPtr)
+    this.open(
+      this.wasm,
+      this.wasm.alinea_open_file(encodeURIComponent(file), this.wasm.tempInt32)
+    )
+  }
+
+  /**
+   * Store the commits of a database opened with `openFile` that could not
+   * be stored yet, and throw if that fails again.
+   * @internal
+   */
+  storeFile() {
+    if (!this.dbPtr) return
+    const result = this.wasm.alinea_flush(this.dbPtr)
+    if (result !== ReturnCode.OK) {
+      throw new SQLiteError(this.wasm.sqlite3_errstr(result), result)
+    }
+  }
+
   /** @internal */
   private open(wasm: SQLite3Wasm, openResult: ReturnCode) {
     this.wasm = wasm
