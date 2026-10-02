@@ -175,10 +175,14 @@ db.run('insert into notes values (?)', ['stored'])
 - `db.fork()` creates an in-memory snapshot, as for any database. It keeps
   its content when the stored database changes or closes, copying the pages
   it still read from the file first.
-- A database in memory cannot be attached to OPFS storage: `db.attach`
-  fails with `SQLITE_MISUSE`. Load `db.export()` into a database synced to
-  the storage instead. `await storage.delete()` removes the file and its
-  journal once the database is closed.
+- `await db.attach(opfsStorage(name))` stores a database that is in memory:
+  its committed state replaces what the file held, written as one commit,
+  and from then on it is no longer kept in memory. `db.detach()` stores the
+  last commits, reads every page into memory and closes the file; `await
+  db.flush()` rejects if storing those commits failed. Neither works during
+  a write transaction (`SQLITE_BUSY`).
+- `await storage.delete()` removes the file and its journal once the
+  database is closed or detached.
 
 `opfsStorage(name, {directory})` keeps the files in a directory of OPFS
 instead of its root. `fileStorage(name, fileSystem)` uses any other

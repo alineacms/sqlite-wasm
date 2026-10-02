@@ -293,11 +293,102 @@ describe('One database per file', () => {
     expect(rows(a, 'select count(*) from items')).toEqual([[5]])
     expect(rows(b, 'select count(*) from items')).toEqual([[7]])
   })
+})
 
-  test('cannot attach a database in memory', async () => {
+describe('Attaching a database to a file', () => {
+  test('stores it, replacing what the file held, and stops keeping it in memory', async () => {
+    const previous = await sync()
+    fill(previous, 50)
+    previous.close()
     const db = new Database()
     open.push(db)
+    fill(db, 1000)
+    expect(Number(rows(db, 'pragma overlay_pages')[0][0])).toBeGreaterThan(100)
+    await db.attach(fileStorage('notes.sqlite3', fs))
+    expect(rows(db, 'pragma overlay_pages')).toEqual([['0']])
+    db.run("insert into items (body) values ('after')")
+    db.close()
+    const again = await sync()
+    expect(rows(again, 'select count(*), max(body) from items'))
+      .toEqual([[1001, 'after']])
+  })
+
+  test('leaves the file and the database as they were when it fails', async () => {
+    const previous = await sync()
+    fill(previous, 50)
+    previous.close()
+    const db = new Database()
+    open.push(db)
+    fill(db, 10)
+    fs.file('notes.sqlite3-journal').failWrites = true
     await expect(db.attach(fileStorage('notes.sqlite3', fs)))
+      .rejects.toMatchObject({code: 'SQLITE_IOERR'})
+    fs.file('notes.sqlite3-journal').failWrites = false
+    db.run("insert into items (body) values ('in memory')")
+    expect(rows(db, 'select count(*) from items')).toEqual([[11]])
+    const again = await sync()
+    expect(rows(again, 'select count(*) from items')).toEqual([[50]])
+  })
+
+  test('fails during a write transaction, or for a stored database', async () => {
+    const db = new Database()
+    open.push(db)
+    fill(db, 1)
+    db.run('begin')
+    db.run('delete from items')
+    await expect(db.attach(fileStorage('a.sqlite3', fs)))
+      .rejects.toMatchObject({code: 'SQLITE_BUSY'})
+    db.run('rollback')
+    // The name was released.
+    await db.attach(fileStorage('a.sqlite3', fs))
+    await expect(db.attach(fileStorage('b.sqlite3', fs)))
       .rejects.toMatchObject({code: 'SQLITE_MISUSE'})
+  })
+})
+
+describe('Detaching a database from its file', () => {
+  test('keeps it in memory and stops storing it', async () => {
+    const db = await sync()
+    fill(db, 1000)
+    db.detach()
+    expect(Number(rows(db, 'pragma overlay_pages')[0][0])).toBeGreaterThan(100)
+    db.run("delete from items where id > 10")
+    expect(rows(db, 'select count(*) from items')).toEqual([[10]])
+    // The file is free, and holds the state at detaching.
+    const again = await sync()
+    expect(rows(again, 'select count(*) from items')).toEqual([[1000]])
+    await db.flush()
+  })
+
+  test('keeps forks of it readable', async () => {
+    const db = await sync()
+    fill(db, 1000)
+    const fork = db.fork()
+    open.push(fork)
+    db.detach()
+    await fileStorage('notes.sqlite3', fs).delete()
+    expect(rows(fork, 'select count(*) from items')).toEqual([[1000]])
+    expect(rows(db, 'select count(*) from items')).toEqual([[1000]])
+  })
+
+  test('reports when storing the last commits failed', async () => {
+    const db = await sync()
+    fill(db, 10)
+    fs.file('notes.sqlite3').failWrites = true
+    db.run('delete from items')
+    db.detach()
+    await expect(db.flush()).rejects.toMatchObject({code: 'SQLITE_IOERR'})
+    expect(rows(db, 'select count(*) from items')).toEqual([[0]])
+  })
+
+  test('can be stored again', async () => {
+    const db = await sync()
+    fill(db, 10)
+    db.detach()
+    db.run('delete from items where id > 5')
+    await db.attach(fileStorage('copy.sqlite3', fs))
+    db.close()
+    const copy = await sync('copy.sqlite3')
+    expect(rows(copy, 'select count(*) from items')).toEqual([[5]])
   })
 })
