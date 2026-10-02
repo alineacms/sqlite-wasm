@@ -163,11 +163,13 @@ db.run('insert into notes values (?)', ['stored'])
 
 - Only SQLite's page cache and the pages of the open transaction are held
   in memory, so a database can be larger than the memory available to it.
-- Every commit is in the file when it returns. It is first written to a
-  journal next to the file (`notes.sqlite3-journal`), so the file always
-  holds a committed state; opening the database finishes a commit that was
-  interrupted. `await db.flush()` stores commits that failed to write, and
-  rejects if that fails again.
+- Every commit is stored when it returns: it is appended to a journal next
+  to the file (`notes.sqlite3-journal`) and synced there, and written to
+  the file itself. The file is synced, and the journal started over, every
+  few megabytes and when the database closes. Opening the database replays
+  the journal after a crash, so it always holds the last commit. `await
+  db.flush()` stores commits that failed to write, and rejects if that
+  fails again.
 - OPFS files can only be opened this way in a dedicated Worker, by one
   Worker at a time: syncing a database that another Worker or tab holds
   fails with `SQLITE_BUSY`. Have one Worker own the database, and the other

@@ -1,10 +1,12 @@
 // An in-memory file system with the same synchronous access as OPFS, which
 // Bun does not have, for the storage tests. `failWrites` makes writes to a
-// file fail, to interrupt a commit halfway.
+// file fail, to interrupt a commit halfway, and `afterCrash()` returns the
+// files as a crash would leave them: as they were when last flushed.
 
 export class MemoryFile {
   data = new Uint8Array(0)
   size = 0
+  synced = new Uint8Array(0)
   open = false
   failWrites = false
 
@@ -37,7 +39,9 @@ export class MemoryFile {
     return this.size
   }
 
-  flush() {}
+  flush() {
+    this.synced = this.bytes()
+  }
 
   close() {
     this.open = false
@@ -66,5 +70,15 @@ export class MemoryFileSystem {
 
   async remove(name) {
     this.files.delete(name)
+  }
+
+  afterCrash() {
+    const copy = new MemoryFileSystem()
+    for (const [name, file] of this.files) {
+      const durable = copy.file(name)
+      durable.write(file.synced, {at: 0})
+      durable.flush()
+    }
+    return copy
   }
 }
