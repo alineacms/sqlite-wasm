@@ -41,6 +41,7 @@ Module['tempInt32'] = stackAlloc(4);
   Module['sqlite3_errmsg'] = cwrap('sqlite3_errmsg', 'string', ['number']);
   Module['sqlite3_errstr'] = cwrap('sqlite3_errstr', 'string', ['number']);
   Module['sqlite3_txn_state'] = cwrap('sqlite3_txn_state', 'number', ['number', 'string']);
+  Module['sqlite3_get_autocommit'] = cwrap('sqlite3_get_autocommit', 'number', ['number']);
   Module['sqlite3_data_count'] = cwrap('sqlite3_data_count', 'number', ['number']);
   Module['sqlite3_column_double'] = cwrap('sqlite3_column_double', 'number', ['number', 'number']);
   Module['sqlite3_column_text'] = cwrap('sqlite3_column_text', 'string', ['number', 'number']);

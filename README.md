@@ -171,7 +171,8 @@ db.run('insert into notes values (?)', ['stored'])
 - OPFS files can only be opened this way in a dedicated Worker, by one
   Worker at a time: syncing a database that another Worker or tab holds
   fails with `SQLITE_BUSY`. Have one Worker own the database, and the other
-  tabs send it their queries. No cross-origin isolation headers are needed.
+  tabs send it their queries, as [shareDatabase](#sharing-a-database-between-tabs)
+  does. No cross-origin isolation headers are needed.
 - `db.fork()` creates an in-memory snapshot, as for any database. It keeps
   its content when the stored database changes or closes, copying the pages
   it still read from the file first.
@@ -187,6 +188,42 @@ db.run('insert into notes values (?)', ['stored'])
 `opfsStorage(name, {directory})` keeps the files in a directory of OPFS
 instead of its root. `fileStorage(name, fileSystem)` uses any other
 `FileSystem` that opens files for synchronous access.
+
+### Sharing a database between tabs
+
+Only one Worker can hold an OPFS file. `shareDatabase` from
+`@alinea/sqlite-wasm/shared` lets every tab use it anyway: call it in a
+dedicated Worker in each tab, and the Web Locks API elects one of them to
+open the database while the others send it their statements over a
+BroadcastChannel.
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
+import {shareDatabase} from '@alinea/sqlite-wasm/shared'
+
+const db = shareDatabase('notes', async () => {
+  const {Database} = await init()
+  return Database.sync(opfsStorage('notes.sqlite3'))
+})
+await db.exec('create table if not exists notes (text)')
+await db.transaction([['insert into notes values (?)', ['shared']]])
+console.log(await db.query('select * from notes'))
+```
+
+- `query(sql, params)` returns rows as objects, `exec(sql)` runs a script
+  without parameters, and `transaction(statements)` runs statements in one
+  transaction and returns the rows of each. They resolve once the
+  statements ran in the owning Worker and their commits are stored.
+- Requests run one at a time, so tabs never interleave inside a
+  transaction. A transaction must begin and end in one request: a request
+  that leaves one open is rolled back and fails with `SQLITE_MISUSE`.
+- When the owning tab closes, the next Worker in line opens the database
+  (finishing a commit that was interrupted) and the others send what was
+  not answered yet again. A request the previous owner ran but did not
+  answer runs twice, so make writes safe to repeat where that matters.
+- `isOwner` tells if this Worker holds the database; `close()` releases it.
+- `open` can return any database, also one stored in IndexedDB.
 
 ## Native extension
 
