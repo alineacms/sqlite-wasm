@@ -280,6 +280,10 @@ bun run build
 bun test
 ```
 
+`bun run test:browser` runs the tests in `test/browser` in headless
+Chromium, which OPFS storage and shared databases need; install the browser
+it expects once with `bunx playwright-core install chromium`.
+
 `bun run build` also builds the native extension for the current platform
 into `dist/native`. `bun run build:native` rebuilds only that, and
 `node --test native.test.ts` runs its tests under Node.js. CI builds and
@@ -287,8 +291,9 @@ tests the extension on every supported platform, and releases publish all
 of the binaries.
 
 The toolchain is pinned in the devcontainer and package manifest. The build
-uses SQLite's in-memory pager with a minimal VFS, so it does not ship
-Emscripten's JavaScript filesystem implementation. The Makefile downloads and
+stores databases in the copy-on-write overlay VFS (`src/overlay.c`), and
+files only through a small VFS answered by JavaScript (`src/jsvfs.c`), so it
+does not ship Emscripten's JavaScript filesystem implementation. The Makefile downloads and
 checksums SQLite's canonical source archive, applies the small compatibility
 patch needed by this feature set, and generates the custom amalgamation before
 compiling it.

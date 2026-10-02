@@ -27,6 +27,15 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build and test Wasm package
         uses: ./.github/actions/build
+      # OPFS storage and shared databases need a browser: run test/browser
+      # in Chromium on the runner, against the package built above.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: package.json
+      - name: Test in Chromium
+        run: |
+          bunx playwright-core install --with-deps chromium
+          bun run test:browser
       # The same packaging steps as the release, without publishing.
       - name: Collect native binaries
         uses: ./.github/actions/collect-native
