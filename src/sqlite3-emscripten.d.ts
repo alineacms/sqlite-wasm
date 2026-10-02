@@ -73,6 +73,13 @@ export interface SQLite3Wasm extends EmscriptenModule {
   addFunction: typeof addFunction
   removeFunction: typeof removeFunction
   _malloc(size: number): number
+  // Raw exports, for the per-value calls where cwrap's overhead shows
+  _sqlite3_data_count(stmt: number): number
+  _sqlite3_column_type(stmt: number, col: number): number
+  _sqlite3_column_double(stmt: number, col: number): number
+  _sqlite3_column_text(stmt: number, col: number): number
+  _sqlite3_column_blob(stmt: number, col: number): number
+  _sqlite3_column_bytes(stmt: number, col: number): number
   _free(pointer: number): void
   HEAPU8: Uint8Array
 
