@@ -37,5 +37,6 @@ int sqlite3_overlay_commit_hook(
   int *pszChunk
 );
 int sqlite3_overlay_report_all(sqlite3 *db, const char *zSchema);
+int sqlite3_overlay_flush(sqlite3 *db, const char *zSchema);
 
 #endif

@@ -12,6 +12,8 @@ export interface SQLite3Wasm extends EmscriptenModule {
   alinea_malloc: (size: number) => number
   alinea_open: (db: number) => number
   alinea_fork: (source: number, db: number) => number
+  alinea_open_file: (file: string, db: number) => number
+  alinea_flush: (db: number) => number
   alinea_load: (
     db: number,
     data: number,
@@ -83,6 +85,9 @@ export interface SQLite3Wasm extends EmscriptenModule {
   _free(pointer: number): void
   HEAPU8: Uint8Array
 
+  // Files of the "js" VFS (jsvfs.c), installed by opfs.ts
+  jsvfs?: JSFiles
+
   // Extra fields by -post-js.js
   NULL: number // 0
   tempInt32: number // A temporary pointer located in stack.
@@ -90,3 +95,16 @@ export interface SQLite3Wasm extends EmscriptenModule {
 
 declare const init: EmscriptenModuleFactory<SQLite3Wasm>
 export default init
+
+/** Answers the "js" VFS (jsvfs.c): files by id, SQLite result codes. */
+export interface JSFiles {
+  open(name: string, flags: number): number
+  close(id: number): number
+  read(id: number, ptr: number, size: number, offset: number): number
+  write(id: number, ptr: number, size: number, offset: number): number
+  truncate(id: number, size: number): number
+  sync(id: number): number
+  size(id: number): number
+  delete(name: string): number
+  exists(name: string): number
+}

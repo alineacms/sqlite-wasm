@@ -163,8 +163,13 @@ static sqlite3_vfs alinea_vfs = {
   0
 };
 
+int jsvfs_register(void);
+
 int sqlite3_os_init(void) {
   int result = sqlite3_vfs_register(&alinea_vfs, 1);
+  if (result == SQLITE_OK) {
+    result = jsvfs_register();
+  }
   if (result != SQLITE_OK) {
     return result;
   }
@@ -177,7 +182,13 @@ int sqlite3_os_end(void) {
 
 // Every database is a named copy-on-write overlay (see overlay.c), so forks
 // share unchanged pages with their source.
-static int alinea_open_overlay(sqlite3 **db, const char *from) {
+// With file, a URI-escaped name, the overlay is stored in that file of the
+// "js" VFS (see jsvfs.c) instead of only in memory.
+static int alinea_open_overlay(
+  sqlite3 **db,
+  const char *from,
+  const char *file
+) {
   static unsigned int counter = 0;
   int result = sqlite3_initialize();
   if (result != SQLITE_OK) {
@@ -186,6 +197,8 @@ static int alinea_open_overlay(sqlite3 **db, const char *from) {
   unsigned int id = ++counter;
   char *uri = from
     ? sqlite3_mprintf("file:db%u?overlay=db%u&from=%s", id, id, from)
+    : file
+    ? sqlite3_mprintf("file:%s?overlay=db%u&base=js", file, id)
     : sqlite3_mprintf("file:db%u?overlay=db%u", id, id);
   if (uri == 0) {
     return SQLITE_NOMEM;
@@ -201,7 +214,20 @@ static int alinea_open_overlay(sqlite3 **db, const char *from) {
 }
 
 int alinea_open(sqlite3 **db) {
-  return alinea_open_overlay(db, 0);
+  return alinea_open_overlay(db, 0, 0);
+}
+
+// Opens the database stored in file, a URI-escaped name in the "js" VFS,
+// or starts one there. Every commit is written to it; only the pages of
+// the open transaction are kept in memory.
+int alinea_open_file(const char *file, sqlite3 **db) {
+  return alinea_open_overlay(db, 0, file);
+}
+
+// Writes the commits that could not be stored yet, for databases opened
+// with alinea_open_file. Returns their error if writing fails again.
+int alinea_flush(sqlite3 *db) {
+  return sqlite3_overlay_flush(db, "main");
 }
 
 // Opens a snapshot of the last committed state of source.
@@ -212,7 +238,7 @@ int alinea_fork(sqlite3 *source, sqlite3 **db) {
     *db = 0;
     return SQLITE_MISUSE;
   }
-  return alinea_open_overlay(db, name);
+  return alinea_open_overlay(db, name, 0);
 }
 
 unsigned char *alinea_malloc(int size) {
