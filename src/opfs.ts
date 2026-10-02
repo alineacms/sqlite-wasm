@@ -8,7 +8,6 @@ import {SQLiteError} from './SQLiteError.js'
 // next to it (see "Writable base files" in overlay.c).
 
 const SQLITE_BUSY = 5
-const SQLITE_MISUSE = 21
 const SQLITE_IOERR_READ = 266
 const SQLITE_IOERR_SHORT_READ = 522
 const SQLITE_IOERR_WRITE = 778
@@ -178,15 +177,24 @@ function busy(name: string) {
 
 class FilePersistence implements Persistence {
   private closed = false
+  private error?: SQLiteError
 
   constructor(
     private db: Database,
     private release: () => void
   ) {}
 
-  // Commits are stored before they return; this retries any that failed.
+  // Commits are stored before they return; this retries any that failed,
+  // or after detaching, reports if storing the last ones failed.
   async flush() {
     if (!this.closed) this.db.storeFile()
+    else if (this.error) throw this.error
+  }
+
+  detach() {
+    if (this.closed) return
+    this.error = this.db.detachFile()
+    this.close()
   }
 
   close() {
@@ -223,6 +231,10 @@ let defaultFileSystem: FileSystem | undefined
  * with `SQLITE_BUSY`. Have one Worker own the database and the others send
  * it their queries. `db.fork()` creates an in-memory snapshot, which keeps
  * its content when the stored database changes or closes.
+ *
+ * `db.attach` stores a database that is in memory in the file instead,
+ * replacing what it held, and `db.detach` moves a stored database back
+ * into memory.
  */
 export function opfsStorage(
   name: string,
@@ -252,8 +264,29 @@ export class FileStorage implements Storage {
     return `${this.name}-journal`
   }
 
-  async sync<T extends Database>(
+  sync<T extends Database>(
     Database: new (data?: ArrayBufferView) => T
+  ): Promise<T> {
+    return this.store(() => new Database(), db => db.openFile(this.name), true)
+  }
+
+  /**
+   * Store a database that is in memory from now on: its committed state
+   * replaces what the file held, written as one commit, after which it is
+   * no longer kept in memory. See `opfsStorage`.
+   */
+  async attach(db: Database): Promise<void> {
+    await this.store(() => db, db => db.attachFile(this.name), false)
+  }
+
+  /**
+   * Open the files, have the database create() returns use them, with
+   * use(), and keep them until it closes or detaches.
+   */
+  private async store<T extends Database>(
+    create: () => T,
+    use: (db: T) => void,
+    owned: boolean
   ): Promise<T> {
     const names = activeIn(this.fileSystem)
     if (names.has(this.name)) throw busy(this.name)
@@ -272,31 +305,20 @@ export class FileStorage implements Storage {
       for (const name of [this.name, this.journal]) {
         opened.push([name, await this.fileSystem.open(name)])
       }
-      db = new Database()
+      db = create()
       files = filesOf(db.wasm)
       for (const [name, file] of opened) files.add(name, file)
-      db.openFile(this.name)
+      use(db)
       db.persistence = new FilePersistence(db, release)
       return db
     } catch (error) {
       try {
-        db?.close()
+        if (owned) db?.close()
       } finally {
         release()
       }
       throw error
     }
-  }
-
-  /**
-   * Not supported: a database in memory cannot move into a file. Store
-   * `db.export()` with `sync` on a new database instead.
-   */
-  async attach(_db: Database): Promise<void> {
-    throw new SQLiteError(
-      'A database in memory cannot be attached to file storage',
-      SQLITE_MISUSE
-    )
   }
 
   /**
