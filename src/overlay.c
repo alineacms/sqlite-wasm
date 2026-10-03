@@ -132,6 +132,7 @@ struct Overlay {
   i64 szStored;           /* Size of a writable base file */
   int rcWrite;            /* Error of the last write-back, or SQLITE_OK */
   int bChanging;          /* The base is writable, here or in its source */
+  int bBorrowed;          /* pBase is that of the overlay it came from */
   i64 iJournal;           /* End of the last record in the redo journal */
   unsigned int nSeq;      /* Sequence number of the next record */
   unsigned int salt;      /* Salt of the records since the last checkpoint */
@@ -430,11 +431,13 @@ static int ovSameBase(Overlay *ov, const char *zName){
 }
 
 static int ovPreserveLocked(Overlay *ov, i64 iFirst, int bAll);
+static void ovReleaseBorrowersLocked(Overlay *ov);
 static int ovCheckpoint(Overlay *ov);
+static int ovWriteBack(Overlay *ov);
 
 /* Close the base file and its journal, if any, and forget them. */
 static void ovCloseBase(Overlay *ov){
-  if( ov->pBase ){
+  if( ov->pBase && !ov->bBorrowed ){
     if( ov->pBase->pMethods ) ov->pBase->pMethods->xClose(ov->pBase);
     sqlite3_free(ov->pBase);
   }
@@ -449,16 +452,18 @@ static void ovCloseBase(Overlay *ov){
   ov->zPath = 0;
   ov->pBaseVfs = 0;
   ov->bChanging = 0;
+  ov->bBorrowed = 0;
   ov->rcWrite = SQLITE_OK;
 }
 
 /* Free an overlay whose last connection has closed. Caller holds gMutex. */
 static void ovDestroyLocked(Overlay *ov){
-  /* Its base file may change or go away from now on: snapshots of it
-  ** that still read from the base copy what they read. Leave the base
-  ** file synced, so the journal is not needed. */
+  /* Its base file may change or go away from now on: snapshots that still
+  ** read from it copy what they read. Leave the base file synced, so the
+  ** journal is not needed. */
   if( ov->pBaseVfs ){
     ovPreserveLocked(ov, 0, 1);
+    ovReleaseBorrowersLocked(ov);
     ovCheckpoint(ov);
   }
   if( ov->zName ){
@@ -603,11 +608,15 @@ static int ovCreateLocked(
       rc = ovOpenWritableBase(ov, pVfs, zPath, &szBase);
       ov->bChanging = 1;
     }
-  }else if( pSrc && pSrc->pBaseVfs ){
-    /* A snapshot of an overlay on a writable base reads the same file;
-    ** the source keeps what it reads from changing (ovPreserveLocked). */
-    rc = ovOpenBase(ov, pSrc->pBaseVfs, pSrc->zPath, 0, &szBase);
-    ov->bChanging = 1;
+  }else if( pSrc && pSrc->bChanging ){
+    /* A snapshot of an overlay on a writable base (or of a snapshot of
+    ** one) reads the same file, through the same handle: the writable
+    ** overlay keeps what it reads from changing, and lets go of it when
+    ** it closes (ovPreserveLocked, ovReleaseBorrowersLocked). */
+    ov->pBase = pSrc->pBase;
+    ov->bBorrowed = ov->bChanging = 1;
+    ov->zPath = sqlite3_create_filename(pSrc->zPath, "", "", 0, 0);
+    if( ov->zPath==0 ) rc = SQLITE_NOMEM;
   }else{
 #ifndef OVERLAY_OMIT_BASE
     rc = ovOpenBase(ov, gOrig, zPath, 0, &szBase);
@@ -739,10 +748,7 @@ static int ovPreserveLocked(Overlay *ov, i64 iFirst, int bAll){
   for(o=gList; o; o=o->pNext){
     i64 k, i, nVisible;
     int rc = SQLITE_OK;
-    if( o==ov || o->pBaseVfs || o->pBase==0 || o->zPath==0
-     || strcmp(o->zPath, ov->zPath)!=0 ){
-      continue;
-    }
+    if( o==ov || !o->bBorrowed || o->pBase!=ov->pBase ) continue;
     nVisible = (o->szVisible+o->szChunk-1)/o->szChunk;
     if( bAll ) iFirst = 0;
     for(i=iFirst; rc==SQLITE_OK && i<nVisible; i++){
@@ -753,6 +759,38 @@ static int ovPreserveLocked(Overlay *ov, i64 iFirst, int bAll){
     }
     if( rc!=SQLITE_OK ) return rc;
   }
+  return SQLITE_OK;
+}
+
+/*
+** Before the writable overlay ov closes its base file: the overlays that
+** borrowed it, which ovPreserveLocked(ov, 0, 1) gave a copy of every chunk
+** they read from it, no longer have a base. Caller holds gMutex, if any.
+*/
+static void ovReleaseBorrowersLocked(Overlay *ov){
+  Overlay *o;
+  for(o=gList; o; o=o->pNext){
+    if( o==ov || !o->bBorrowed || o->pBase!=ov->pBase ) continue;
+    o->pBase = 0;
+    o->bBorrowed = o->bChanging = 0;
+    o->szVisible = 0;
+  }
+}
+
+/*
+** Give an overlay that borrows a base file a copy of every chunk it reads
+** from it, and let go of the base, so it can be stored elsewhere.
+*/
+static int ovUnborrow(Overlay *ov){
+  i64 i, nVisible;
+  int rc = SQLITE_OK;
+  if( !ov->bBorrowed ) return SQLITE_OK;
+  nVisible = (ov->szVisible+ov->szChunk-1)/ov->szChunk;
+  for(i=0; rc==SQLITE_OK && i<nVisible; i++) rc = ovPreserveChunk(ov, i);
+  if( rc!=SQLITE_OK ) return rc;
+  ov->pBase = 0;
+  ov->bBorrowed = ov->bChanging = 0;
+  ov->szVisible = 0;
   return SQLITE_OK;
 }
 
@@ -1034,6 +1072,9 @@ static int ovClose(sqlite3_file *pFile){
   OvFile *p = (OvFile*)pFile;
   Overlay *ov = p->pOv;
   ovUnlock(pFile, SQLITE_LOCK_NONE);
+  /* The last connection: store commits whose write-back failed, if that
+  ** works now (outside gMutex, which ovWriteBack takes). */
+  if( ov->pBaseVfs && ov->nRef==1 ) ovWriteBack(ov);
   ovEnter();
   if( --ov->nRef==0 ) ovDestroyLocked(ov);
   ovLeave();
@@ -1655,6 +1696,12 @@ int sqlite3_overlay_commit_hook(
   if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return SQLITE_MISUSE;
   ov = ((OvFile*)pFile)->pOv;
   if( xCommit && ov->pBaseVfs ) return SQLITE_MISUSE;
+  if( xCommit ){
+    /* A snapshot of a stored database is stored elsewhere: it no longer
+    ** reads from that file. */
+    int rc = ovUnborrow(ov);
+    if( rc!=SQLITE_OK ) return rc;
+  }
   ovResetDirty(ov);
   ov->xCommit = xCommit;
   ov->pCommitArg = pArg;
@@ -1718,9 +1765,13 @@ int sqlite3_overlay_attach_base(
   sqlite3_vfs *pVfs = zVfs ? sqlite3_vfs_find(zVfs) : 0;
   i64 i, nChunk, szBase = 0;
   int rc;
-  if( ov==0 || ov->pBase || ov->xCommit ) return SQLITE_MISUSE;
+  if( ov==0 || ov->pBaseVfs || ov->xCommit ) return SQLITE_MISUSE;
   if( pVfs==0 || strcmp(zVfs, OVERLAY_VFS_NAME)==0 ) return SQLITE_CANTOPEN;
   if( ov->pWriter ) return SQLITE_BUSY;
+  /* A snapshot of a stored database first copies what it reads from it. */
+  rc = ovUnborrow(ov);
+  if( rc!=SQLITE_OK ) return rc;
+  if( ov->pBase ) return SQLITE_MISUSE;
   /* Fill holes with zero chunks first: once there is a base file, missing
   ** chunks would be read from it. */
   nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
@@ -1753,30 +1804,32 @@ int sqlite3_overlay_attach_base(
 ** keep it in memory from now on: first store the commits that are not
 ** stored yet, then read every chunk it does not hold from the base file,
 ** and close that. Snapshots that read the file copy what they read too.
-** Returns the error of storing those commits (the overlay is detached
-** anyway, and holds them), SQLITE_MISUSE for overlays without a writable
-** base and SQLITE_BUSY during a write transaction.
+** Fails, staying as it was, if reading fails (SQLITE_NOMEM or an I/O
+** error), with SQLITE_MISUSE for overlays without a writable base and with
+** SQLITE_BUSY during a write transaction. Otherwise it detaches, and the
+** error of storing those commits, if that failed, is written to *pWrite;
+** the overlay holds them either way.
 */
-int sqlite3_overlay_detach_base(sqlite3 *db, const char *zSchema){
+int sqlite3_overlay_detach_base(sqlite3 *db, const char *zSchema, int *pWrite){
   Overlay *ov = ovOf(db, zSchema);
   i64 i, nChunk;
-  int rc, rcRead = SQLITE_OK;
+  int rcWrite, rc = SQLITE_OK;
   if( ov==0 || ov->pBaseVfs==0 ) return SQLITE_MISUSE;
   if( ov->pWriter ) return SQLITE_BUSY;
-  rc = ovWriteBack(ov);
+  rcWrite = ovWriteBack(ov);
   nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
-  for(i=0; rcRead==SQLITE_OK && i<nChunk; i++) rcRead = ovPreserveChunk(ov, i);
-  if( rcRead==SQLITE_OK ){
-    ovEnter();
-    rcRead = ovPreserveLocked(ov, 0, 1);
-    ovLeave();
-  }
-  if( rcRead!=SQLITE_OK ) return rcRead;
+  for(i=0; rc==SQLITE_OK && i<nChunk; i++) rc = ovPreserveChunk(ov, i);
+  ovEnter();
+  if( rc==SQLITE_OK ) rc = ovPreserveLocked(ov, 0, 1);
+  if( rc==SQLITE_OK ) ovReleaseBorrowersLocked(ov);
+  ovLeave();
+  if( rc!=SQLITE_OK ) return rc;
   ovCheckpoint(ov);
   ovCloseBase(ov);
   ovResetDirty(ov);
   ov->szVisible = 0;
-  return rc;
+  if( pWrite ) *pWrite = rcWrite;
+  return SQLITE_OK;
 }
 
 /*
