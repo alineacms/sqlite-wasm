@@ -157,6 +157,19 @@ describe('Forks of a stored database', () => {
       .toEqual([[1000, 500_000]])
   })
 
+  test('fail to read what they could not copy when the stored database closes', async () => {
+    const db = await sync()
+    fill(db, 1000)
+    const fork = db.fork()
+    open.push(fork)
+    fs.file('notes.sqlite3').failReads = true
+    db.close()
+    fs.file('notes.sqlite3').failReads = false
+    // Not zeros: the pages it lacks fail to read.
+    expect(() => rows(fork, 'select count(*), sum(length(body)) from items'))
+      .toThrow()
+  })
+
   test('can be stored elsewhere', async () => {
     const db = await sync()
     fill(db, 300)
