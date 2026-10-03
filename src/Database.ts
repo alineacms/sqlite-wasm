@@ -32,6 +32,10 @@ export interface Commit {
 export interface Persistence {
   flush(): Promise<void>
   close(): void
+  /** Stop storing, for storage that does not use the commit listener */
+  detach?(): void
+  /** Called right before the database closes */
+  closing?(): void
 }
 
 /**
@@ -52,6 +56,8 @@ export class Database {
   /** @internal */ private functions!: Record<string, Pointer>
   /** @internal */ private commitListener?: Pointer
   /** @internal */ public persistence?: Persistence
+  /** The file of the "js" VFS this database is stored in @internal */
+  public file?: string
   /** @internal */ private attaching = false
 
   /**
@@ -89,13 +95,83 @@ export class Database {
    */
   async attach(storage: Storage): Promise<void> {
     if (!this.dbPtr) throw new Error('Database closed')
-    if (this.attaching || this.commitListener)
+    if (this.attaching || this.commitListener || this.file !== undefined)
       throw new SQLiteError('Database is stored already', ReturnCode.MISUSE)
     this.attaching = true
     try {
       await storage.attach(this)
     } finally {
       this.attaching = false
+    }
+  }
+
+  /**
+   * Replace this new, empty database with the one stored in `file` of the
+   * "js" VFS (see opfs.ts), or a new one there, which stores every commit.
+   * @internal
+   */
+  openFile(file: string) {
+    this.wasm.sqlite3_close_v2(this.dbPtr)
+    this.open(
+      this.wasm,
+      this.wasm.alinea_open_file(encodeURIComponent(file), this.wasm.tempInt32)
+    )
+    this.file = file
+  }
+
+  /**
+   * Store this database in `file` of the "js" VFS from now on, replacing
+   * what it held, as if it had been opened with `openFile`.
+   * @internal
+   */
+  attachFile(file: string) {
+    if (!this.dbPtr) throw new Error('Database closed')
+    const result = this.wasm.alinea_attach_file(this.dbPtr, file)
+    if (result !== ReturnCode.OK) {
+      throw new SQLiteError(this.wasm.sqlite3_errstr(result), result)
+    }
+    this.file = file
+  }
+
+  /**
+   * Stop storing this database in its file and keep it in memory. Returns
+   * the error of storing the last commits, if that failed.
+   * @internal
+   */
+  detachFile(): SQLiteError | undefined {
+    if (!this.dbPtr || this.file === undefined) return
+    const result = this.wasm.alinea_detach_file(this.dbPtr, this.wasm.tempInt32)
+    if (result !== ReturnCode.OK) {
+      throw new SQLiteError(
+        result === ReturnCode.BUSY
+          ? 'Cannot detach a database during a write transaction'
+          : this.wasm.sqlite3_errstr(result),
+        result
+      )
+    }
+    this.file = undefined
+    const writeError = this.wasm.getValue(this.wasm.tempInt32, 'i32')
+    return writeError === ReturnCode.OK
+      ? undefined
+      : new SQLiteError(this.wasm.sqlite3_errstr(writeError), writeError)
+  }
+
+  /** True while a transaction is open (after BEGIN). @internal */
+  inTransaction(): boolean {
+    return this.dbPtr !== this.wasm.NULL &&
+      this.wasm.sqlite3_get_autocommit(this.dbPtr) === 0
+  }
+
+  /**
+   * Store the commits of a database opened with `openFile` that could not
+   * be stored yet, and throw if that fails again.
+   * @internal
+   */
+  storeFile() {
+    if (!this.dbPtr) return
+    const result = this.wasm.alinea_flush(this.dbPtr)
+    if (result !== ReturnCode.OK) {
+      throw new SQLiteError(this.wasm.sqlite3_errstr(result), result)
     }
   }
 
@@ -262,6 +338,7 @@ export class Database {
    * write, as after `close()`.
    */
   detach(): void {
+    if (this.file !== undefined) return this.persistence?.detach?.()
     if (!this.commitListener) return
     this.stopCommits()
     this.persistence?.close()
@@ -462,6 +539,7 @@ export class Database {
     }
     this.functions = {}
     this.stopCommits()
+    this.persistence?.closing?.()
     try {
       this.handleError(this.wasm.sqlite3_close_v2(this.dbPtr))
     } finally {

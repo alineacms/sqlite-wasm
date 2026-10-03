@@ -19,6 +19,12 @@
 ** system) overlays have no base file: they start empty, or from= another
 ** overlay, and the filename is only a label.
 **
+**   file:base.db?vfs=overlay&overlay=A&base=VFS
+**                                             named overlay A on a writable
+**                                             base file of VFS, to which
+**                                             every commit is written back
+**                                             (see "Writable base files")
+**
 ** Page storage
 ** ------------
 ** An overlay holds a table of pointers indexed by chunk number (a chunk is
@@ -33,7 +39,8 @@
 ** Lifetime
 ** --------
 ** An overlay lives as long as at least one connection has it open. When the
-** last connection closes, its changes are discarded.
+** last connection closes, its changes are discarded (unless its base file
+** is writable: they were written there with every commit).
 **
 ** Locking
 ** -------
@@ -44,7 +51,8 @@
 **
 ** Reading the base file
 ** ---------------------
-** Because the base file cannot change, its first page is kept in memory
+** Because the base file cannot change (unless it is writable, see below),
+** its first page is kept in memory
 ** (SQLite rereads the header at the start of every transaction) and, with
 ** PRAGMA mmap_size, pages the overlay has not changed are memory-mapped
 ** straight from the base file instead of copied with xRead.
@@ -118,6 +126,16 @@ struct Overlay {
   i64 nDirtyAlloc;        /* Allocated entries in aiDirty */
   i64 szCommitted;        /* File size at the last commit */
   i64 szMin;              /* Smallest file size since the last commit */
+  sqlite3_vfs *pBaseVfs;  /* VFS of a writable base (base=), or NULL */
+  sqlite3_file *pJournal; /* Redo journal next to a writable base */
+  char *zJournal;         /* Its name */
+  i64 szStored;           /* Size of a writable base file */
+  int rcWrite;            /* Error of the last write-back, or SQLITE_OK */
+  int bChanging;          /* The base is writable, here or in its source */
+  int bBorrowed;          /* pBase is that of the overlay it came from */
+  i64 iJournal;           /* End of the last record in the redo journal */
+  unsigned int nSeq;      /* Sequence number of the next record */
+  unsigned int salt;      /* Salt of the records since the last checkpoint */
 };
 
 /* An open main database file. */
@@ -209,6 +227,8 @@ static int ovBaseRead(Overlay *ov, u8 *buf, int n, i64 off){
     n -= k;
     off += k;
   }
+  /* Its base file was taken away before all of it could be copied. */
+  if( ov->pBase==0 ) return SQLITE_IOERR_READ;
   rc = ov->pBase->pMethods->xRead(ov->pBase, buf, n, off);
   if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
   return rc;
@@ -310,7 +330,7 @@ static int ovPageForWrite(Overlay *ov, i64 i, int bFull, OvPage **ppOut){
 
 /* Remember that chunk i was written, if a commit hook wants to know. */
 static int ovMarkDirty(Overlay *ov, i64 i){
-  if( ov->xCommit==0 ) return SQLITE_OK;
+  if( ov->xCommit==0 && ov->pBaseVfs==0 ) return SQLITE_OK;
   if( i>=ov->nDirtyBit ){
     i64 nNew = ov->nDirtyBit ? ov->nDirtyBit*2 : 512;
     u8 *a;
@@ -412,8 +432,41 @@ static int ovSameBase(Overlay *ov, const char *zName){
 #endif
 }
 
+static int ovPreserveLocked(Overlay *ov, i64 iFirst, int bAll);
+static void ovReleaseBorrowersLocked(Overlay *ov);
+static int ovCheckpoint(Overlay *ov);
+static int ovWriteBack(Overlay *ov);
+
+/* Close the base file and its journal, if any, and forget them. */
+static void ovCloseBase(Overlay *ov){
+  if( ov->pBase && !ov->bBorrowed ){
+    if( ov->pBase->pMethods ) ov->pBase->pMethods->xClose(ov->pBase);
+    sqlite3_free(ov->pBase);
+  }
+  if( ov->pJournal ){
+    if( ov->pJournal->pMethods ) ov->pJournal->pMethods->xClose(ov->pJournal);
+    sqlite3_free(ov->pJournal);
+  }
+  sqlite3_free(ov->zJournal);
+  if( ov->zPath ) sqlite3_free_filename((char*)ov->zPath);
+  ov->pBase = ov->pJournal = 0;
+  ov->zJournal = 0;
+  ov->zPath = 0;
+  ov->pBaseVfs = 0;
+  ov->bChanging = 0;
+  ov->bBorrowed = 0;
+  ov->rcWrite = SQLITE_OK;
+}
+
 /* Free an overlay whose last connection has closed. Caller holds gMutex. */
 static void ovDestroyLocked(Overlay *ov){
+  /* Its base file may change or go away from now on: snapshots that still
+  ** read from it copy what they read. Leave the base file synced, so the
+  ** journal is not needed. */
+  if( ov->pBaseVfs ){
+    ovReleaseBorrowersLocked(ov);
+    ovCheckpoint(ov);
+  }
   if( ov->zName ){
     Overlay **pp;
     for(pp=&gList; *pp; pp=&(*pp)->pNext){
@@ -428,13 +481,7 @@ static void ovDestroyLocked(Overlay *ov){
   sqlite3_free(ov->aDirty);
   sqlite3_free(ov->aiDirty);
   if( ov->pHead && --ov->pHead->nRef==0 ) sqlite3_free(ov->pHead);
-  if( ov->pBase ){
-    if( ov->pBase->pMethods ) ov->pBase->pMethods->xClose(ov->pBase);
-    sqlite3_free(ov->pBase);
-  }
-#ifndef OVERLAY_OMIT_BASE
-  sqlite3_free_filename(ov->zPath);
-#endif
+  ovCloseBase(ov);
   sqlite3_free(ov->zName);
   sqlite3_free(ov);
 }
@@ -461,28 +508,69 @@ static void ovMmapLimitLocked(Overlay *ov, i64 sz){
   }
 }
 
-#ifndef OVERLAY_OMIT_BASE
-/* Open the base file read-only and lock it against writers. */
-static int ovOpenBase(Overlay *ov, const char *zPath, i64 *pSize){
+/*
+** Open the base file with VFS pVfs: read-only, locked against writers, or
+** for a writable base (bWrite), read-write and locked exclusively.
+*/
+static int ovOpenBase(
+  Overlay *ov,
+  sqlite3_vfs *pVfs,
+  const char *zPath,
+  int bWrite,
+  i64 *pSize
+){
   int outFlags = 0;
+  int flags = bWrite
+    ? SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_MAIN_DB
+    : SQLITE_OPEN_READONLY|SQLITE_OPEN_MAIN_DB;
   int rc;
   /* A private filename object keeps URI lookups by the OS VFS valid after
   ** the connection that created the overlay has closed. */
   ov->zPath = sqlite3_create_filename(zPath, "", "", 0, 0);
-  ov->pBase = sqlite3_malloc(gOrig->szOsFile);
+  ov->pBase = sqlite3_malloc(pVfs->szOsFile);
   if( ov->zPath==0 || ov->pBase==0 ) return SQLITE_NOMEM;
-  memset(ov->pBase, 0, gOrig->szOsFile);
-  rc = gOrig->xOpen(gOrig, ov->zPath, ov->pBase,
-                    SQLITE_OPEN_READONLY|SQLITE_OPEN_MAIN_DB, &outFlags);
+  memset(ov->pBase, 0, pVfs->szOsFile);
+  rc = pVfs->xOpen(pVfs, ov->zPath, ov->pBase, flags, &outFlags);
   if( rc!=SQLITE_OK ) return rc;
   /* Keep other connections from modifying the base while we depend on it. */
   rc = ov->pBase->pMethods->xLock(ov->pBase, SQLITE_LOCK_SHARED);
+  if( rc==SQLITE_OK && bWrite ){
+    rc = ov->pBase->pMethods->xLock(ov->pBase, SQLITE_LOCK_RESERVED);
+    if( rc==SQLITE_OK ){
+      rc = ov->pBase->pMethods->xLock(ov->pBase, SQLITE_LOCK_EXCLUSIVE);
+    }
+  }
   if( rc!=SQLITE_OK ) return rc;
   /* The OS VFS may start from a default mapping limit. */
   ovMmapLimitLocked(ov, 0);
   return ov->pBase->pMethods->xFileSize(ov->pBase, pSize);
 }
-#endif
+
+static int ovRecover(Overlay *ov);
+
+/* Open a writable base file and its redo journal, finishing a write-back
+** that was interrupted. */
+static int ovOpenWritableBase(
+  Overlay *ov,
+  sqlite3_vfs *pVfs,
+  const char *zPath,
+  i64 *pSize
+){
+  int outFlags = 0;
+  int rc = ovOpenBase(ov, pVfs, zPath, 1, pSize);
+  if( rc!=SQLITE_OK ) return rc;
+  ov->pBaseVfs = pVfs;
+  ov->zJournal = sqlite3_mprintf("%s-journal", ov->zPath);
+  ov->pJournal = sqlite3_malloc(pVfs->szOsFile);
+  if( ov->zJournal==0 || ov->pJournal==0 ) return SQLITE_NOMEM;
+  memset(ov->pJournal, 0, pVfs->szOsFile);
+  rc = pVfs->xOpen(pVfs, ov->zJournal, ov->pJournal,
+      SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_MAIN_JOURNAL,
+      &outFlags);
+  if( rc==SQLITE_OK ) rc = ovRecover(ov);
+  if( rc==SQLITE_OK ) rc = ov->pBase->pMethods->xFileSize(ov->pBase, pSize);
+  return rc;
+}
 
 /*
 ** Create an overlay on base file zPath, optionally as a snapshot of pSrc.
@@ -496,6 +584,7 @@ static int ovCreateLocked(
 ){
   Overlay *ov;
   i64 szBase = 0;
+  const char *zBaseVfs;
   int rc = SQLITE_OK;
 
   ov = sqlite3_malloc(sizeof(*ov));
@@ -508,12 +597,33 @@ static int ovCreateLocked(
     goto failed;
   }
 
+  zBaseVfs = sqlite3_uri_parameter(zPath, "base");
+  if( zBaseVfs ){
+    sqlite3_vfs *pVfs = sqlite3_vfs_find(zBaseVfs);
+    if( pVfs==0 || strcmp(zBaseVfs, OVERLAY_VFS_NAME)==0 || pSrc ){
+      sqlite3_log(SQLITE_CANTOPEN, pSrc
+          ? "overlay: base= and from= cannot be combined"
+          : "overlay: no VFS '%s' for the base file", zBaseVfs);
+      rc = SQLITE_CANTOPEN;
+    }else{
+      rc = ovOpenWritableBase(ov, pVfs, zPath, &szBase);
+      ov->bChanging = 1;
+    }
+  }else if( pSrc && pSrc->bChanging ){
+    /* A snapshot of an overlay on a writable base (or of a snapshot of
+    ** one) reads the same file, through the same handle: the writable
+    ** overlay keeps what it reads from changing, and lets go of it when
+    ** it closes (ovPreserveLocked, ovReleaseBorrowersLocked). */
+    ov->pBase = pSrc->pBase;
+    ov->bBorrowed = ov->bChanging = 1;
+    ov->zPath = sqlite3_create_filename(pSrc->zPath, "", "", 0, 0);
+    if( ov->zPath==0 ) rc = SQLITE_NOMEM;
+  }else{
 #ifndef OVERLAY_OMIT_BASE
-  rc = ovOpenBase(ov, zPath, &szBase);
-  if( rc!=SQLITE_OK ) goto failed;
-#else
-  (void)zPath;
+    rc = ovOpenBase(ov, gOrig, zPath, 0, &szBase);
 #endif
+  }
+  if( rc!=SQLITE_OK ) goto failed;
 
   if( pSrc ){
     i64 i;
@@ -541,6 +651,7 @@ static int ovCreateLocked(
     if( rc!=SQLITE_OK ) goto failed;
     ov->szFile = ov->szVisible = szBase;
   }
+  ov->szStored = szBase;
 
   if( ov->zName ){
     ov->pNext = gList;
@@ -555,6 +666,409 @@ failed:
 }
 
 /* ------------------------------------------------------------------------ */
+/* Writable base files                                                      */
+/* ------------------------------------------------------------------------ */
+/*
+** With base=VFS, the base file is opened read-write through that VFS and
+** every commit is written back to it, after which the overlay drops its
+** copies of the written chunks and reads them from the base again. Only
+** the chunks of the open transaction are kept in memory.
+**
+** Commits are made durable in a redo journal next to the base file (its
+** name plus "-journal"), much like write-ahead logging: a write-back appends
+** a record of the chunks to the journal and syncs only that, then writes
+** them to the base file without syncing it. Once the journal holds more
+** than OV_JOURNAL_LIMIT bytes, and when the overlay closes or detaches, the
+** base file is synced and the journal starts over (a checkpoint). Opening
+** the base replays the journal, so after a crash the base again holds the
+** last commit. A record:
+**
+**   header   "OVREDO02", salt (4), sequence number (4), chunk size (4),
+**            chunk count (4), file size (8)
+**   entries  chunk index (8) and chunk content, per chunk
+**   trailer  checksum (4), chunk count (4), "OVCOMMIT"
+**
+** Integers are big-endian; the checksum covers the header and entries.
+** Records follow each other from the start of the journal with one salt and
+** consecutive sequence numbers, and replay stops at the first record that
+** is incomplete or does not follow. A checkpoint clears the first header
+** and picks a new salt, so records left from before can never follow.
+**
+** Snapshots (from=) of an overlay on a writable base read the same file.
+** Before a chunk they still read from it changes, they get a private copy
+** of it, so they keep their point-in-time view; when the writable overlay
+** closes, they copy every chunk they read from the base. Only named
+** overlays are found this way, as every overlay with from= is.
+*/
+
+#define OV_REDO_HEADER 32
+#define OV_REDO_TRAILER 16
+#define OV_JOURNAL_LIMIT (4<<20)
+
+static void ovPut32(u8 *a, unsigned int v){
+  a[0] = (u8)(v>>24); a[1] = (u8)(v>>16); a[2] = (u8)(v>>8); a[3] = (u8)v;
+}
+
+static unsigned int ovGet32(const u8 *a){
+  return ((unsigned int)a[0]<<24) | ((unsigned int)a[1]<<16)
+       | ((unsigned int)a[2]<<8) | a[3];
+}
+
+static void ovPut64(u8 *a, i64 v){
+  ovPut32(a, (unsigned int)((sqlite3_uint64)v>>32));
+  ovPut32(a+4, (unsigned int)v);
+}
+
+static i64 ovGet64(const u8 *a){
+  return (i64)(((sqlite3_uint64)ovGet32(a)<<32) | ovGet32(a+4));
+}
+
+static unsigned int ovChecksum(unsigned int s, const u8 *a, i64 n){
+  i64 k;
+  for(k=0; k<n; k++) s = s*31 + a[k];
+  return s;
+}
+
+/* Give overlay o its own copy of chunk i, if it reads it from the base. */
+static int ovPreserveChunk(Overlay *o, i64 i){
+  OvPage *pg;
+  if( i*o->szChunk>=o->szVisible ) return SQLITE_OK;
+  if( i<o->nPage && o->apPage[i] ) return SQLITE_OK;
+  /* A missing entry means an unshared page: no mutex needed. */
+  return ovPageForWrite(o, i, 0, &pg);
+}
+
+/*
+** Before the writable overlay ov changes its base file: give every other
+** overlay on that file a copy of the chunks it reads from the base and ov
+** is about to change, its dirty chunks and every chunk from iFirst on (all
+** of them with bAll). Caller holds gMutex, if there is one.
+*/
+static int ovPreserveLocked(Overlay *ov, i64 iFirst, int bAll){
+  Overlay *o;
+  for(o=gList; o; o=o->pNext){
+    i64 k, i, nVisible;
+    int rc = SQLITE_OK;
+    if( o==ov || !o->bBorrowed || o->pBase!=ov->pBase ) continue;
+    nVisible = (o->szVisible+o->szChunk-1)/o->szChunk;
+    if( bAll ) iFirst = 0;
+    for(i=iFirst; rc==SQLITE_OK && i<nVisible; i++){
+      rc = ovPreserveChunk(o, i);
+    }
+    for(k=0; rc==SQLITE_OK && !bAll && k<ov->nDirty; k++){
+      rc = ovPreserveChunk(o, ov->aiDirty[k]);
+    }
+    if( rc!=SQLITE_OK ) return rc;
+  }
+  return SQLITE_OK;
+}
+
+/*
+** Before the writable overlay ov closes its base file: give the overlays
+** that borrowed it a copy of every chunk they read from it, and take the
+** base away from them. If copying fails, the chunks they lack fail to read
+** (see ovBaseRead) rather than read as zeros. Caller holds gMutex, if any.
+*/
+static void ovReleaseBorrowersLocked(Overlay *ov){
+  Overlay *o;
+  for(o=gList; o; o=o->pNext){
+    i64 i, nVisible;
+    int rc = SQLITE_OK;
+    if( o==ov || !o->bBorrowed || o->pBase!=ov->pBase ) continue;
+    nVisible = (o->szVisible+o->szChunk-1)/o->szChunk;
+    for(i=0; rc==SQLITE_OK && i<nVisible; i++) rc = ovPreserveChunk(o, i);
+    o->pBase = 0;
+    o->bBorrowed = o->bChanging = 0;
+    if( rc==SQLITE_OK ) o->szVisible = 0;
+  }
+}
+
+/*
+** Give an overlay that borrows a base file a copy of every chunk it reads
+** from it, and let go of the base, so it can be stored elsewhere.
+*/
+static int ovUnborrow(Overlay *ov){
+  i64 i, nVisible;
+  int rc = SQLITE_OK;
+  if( !ov->bBorrowed ) return SQLITE_OK;
+  nVisible = (ov->szVisible+ov->szChunk-1)/ov->szChunk;
+  for(i=0; rc==SQLITE_OK && i<nVisible; i++) rc = ovPreserveChunk(ov, i);
+  if( rc!=SQLITE_OK ) return rc;
+  ov->pBase = 0;
+  ov->bBorrowed = ov->bChanging = 0;
+  ov->szVisible = 0;
+  return SQLITE_OK;
+}
+
+/* Start a new generation of journal records, from its start. */
+static void ovNewJournal(Overlay *ov){
+  unsigned int salt;
+  do{
+    sqlite3_randomness(sizeof(salt), &salt);
+  }while( salt==ov->salt );
+  ov->salt = salt;
+  ov->iJournal = 0;
+  ov->nSeq = 0;
+}
+
+/* Writes to the journal, gathered into fewer, larger writes. */
+typedef struct OvWriter OvWriter;
+struct OvWriter {
+  sqlite3_file *pFile;
+  u8 *a;                  /* Buffer of nAlloc bytes */
+  int n;                  /* Bytes in the buffer */
+  int nAlloc;
+  i64 off;                /* File offset of the buffer */
+  int rc;                 /* First error */
+};
+
+#define OV_WRITE_BUFFER (256*1024)
+
+static void ovWriterFlush(OvWriter *w){
+  if( w->rc==SQLITE_OK && w->n>0 ){
+    w->rc = w->pFile->pMethods->xWrite(w->pFile, w->a, w->n, w->off);
+  }
+  w->off += w->n;
+  w->n = 0;
+}
+
+static void ovWriterAppend(OvWriter *w, const u8 *data, int n){
+  while( n>0 && w->rc==SQLITE_OK ){
+    int k = w->nAlloc-w->n;
+    if( k>n ) k = n;
+    memcpy(w->a+w->n, data, k);
+    w->n += k;
+    data += k;
+    n -= k;
+    if( w->n==w->nAlloc ) ovWriterFlush(w);
+  }
+}
+
+/*
+** Append a record of the chunks written since the last write-back to the
+** journal, and sync it: from then on the commit survives a crash.
+*/
+static int ovAppendJournal(Overlay *ov, i64 nChunk){
+  sqlite3_file *pJ = ov->pJournal;
+  u8 head[OV_REDO_HEADER], trail[OV_REDO_TRAILER], idx[8];
+  OvWriter w;
+  unsigned int cksum;
+  i64 k, nByte;
+  int nEntry = 0, rc;
+  for(k=0; k<ov->nDirty; k++){
+    i64 i = ov->aiDirty[k];
+    if( i<nChunk && i<ov->nPage && ov->apPage[i] ) nEntry++;
+  }
+  nByte = OV_REDO_HEADER + nEntry*(8+(i64)ov->szChunk) + OV_REDO_TRAILER;
+  memset(&w, 0, sizeof(w));
+  w.pFile = pJ;
+  w.off = ov->iJournal;
+  w.nAlloc = nByte<OV_WRITE_BUFFER ? (int)nByte : OV_WRITE_BUFFER;
+  w.a = sqlite3_malloc(w.nAlloc);
+  if( w.a==0 ) return SQLITE_NOMEM;
+  memcpy(head, "OVREDO02", 8);
+  ovPut32(head+8, ov->salt);
+  ovPut32(head+12, ov->nSeq);
+  ovPut32(head+16, (unsigned int)ov->szChunk);
+  ovPut32(head+20, (unsigned int)nEntry);
+  ovPut64(head+24, ov->szFile);
+  ovWriterAppend(&w, head, OV_REDO_HEADER);
+  cksum = ovChecksum(0, head, OV_REDO_HEADER);
+  for(k=0; k<ov->nDirty; k++){
+    i64 i = ov->aiDirty[k];
+    const u8 *a;
+    if( i>=nChunk || i>=ov->nPage || ov->apPage[i]==0 ) continue;
+    a = ov->apPage[i]->a;
+    ovPut64(idx, i);
+    ovWriterAppend(&w, idx, 8);
+    ovWriterAppend(&w, a, ov->szChunk);
+    cksum = ovChecksum(ovChecksum(cksum, idx, 8), a, ov->szChunk);
+  }
+  ovPut32(trail, cksum);
+  ovPut32(trail+4, (unsigned int)nEntry);
+  memcpy(trail+8, "OVCOMMIT", 8);
+  ovWriterAppend(&w, trail, OV_REDO_TRAILER);
+  ovWriterFlush(&w);
+  sqlite3_free(w.a);
+  rc = w.rc;
+  if( rc==SQLITE_OK ) rc = pJ->pMethods->xSync(pJ, SQLITE_SYNC_NORMAL);
+  if( rc==SQLITE_OK ){
+    ov->iJournal += nByte;
+    ov->nSeq++;
+  }
+  return rc;
+}
+
+/*
+** Sync the base file, after which the journal is no longer needed: clear
+** its first header and start a new generation. Only once every commit is
+** written to the base file. If clearing is lost, replaying the records
+** again does no harm.
+*/
+static int ovCheckpoint(Overlay *ov){
+  static const u8 zero[OV_REDO_HEADER];
+  sqlite3_file *pB = ov->pBase, *pJ = ov->pJournal;
+  int rc;
+  if( ov->iJournal==0 ) return SQLITE_OK;
+  if( ov->nDirty || ov->rcWrite!=SQLITE_OK ) return SQLITE_OK;
+  rc = pB->pMethods->xSync(pB, SQLITE_SYNC_NORMAL);
+  if( rc==SQLITE_OK ) rc = pJ->pMethods->xWrite(pJ, zero, OV_REDO_HEADER, 0);
+  if( rc==SQLITE_OK ) ovNewJournal(ov);
+  return rc;
+}
+
+/*
+** Store everything committed since the last write-back: append it to the
+** journal, write it to the base file, and drop the written chunks from
+** memory. On failure everything stays in memory and is written with the
+** next commit.
+*/
+static int ovWriteBack(Overlay *ov){
+  sqlite3_file *pB = ov->pBase;
+  i64 nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
+  i64 k;
+  int rc;
+  if( ov->nDirty==0 && ov->szFile==ov->szStored ) return ov->rcWrite = SQLITE_OK;
+  ovEnter();
+  /* Chunks past the end change only if the base file shrinks. */
+  rc = ovPreserveLocked(ov, ov->szFile<ov->szStored
+      ? ov->szFile/ov->szChunk : ((i64)1)<<62, 0);
+  ovLeave();
+  if( rc==SQLITE_OK ) rc = ovAppendJournal(ov, nChunk);
+  for(k=0; rc==SQLITE_OK && k<ov->nDirty; k++){
+    i64 i = ov->aiDirty[k];
+    i64 n = ov->szFile - i*ov->szChunk;
+    if( i>=nChunk || i>=ov->nPage || ov->apPage[i]==0 ) continue;
+    if( n>ov->szChunk ) n = ov->szChunk;
+    rc = pB->pMethods->xWrite(pB, ov->apPage[i]->a, (int)n, i*ov->szChunk);
+  }
+  if( rc==SQLITE_OK && ov->szFile<ov->szStored ){
+    rc = pB->pMethods->xTruncate(pB, ov->szFile);
+  }
+  if( rc==SQLITE_OK && nChunk>0 && ov->nPage>0 && ov->apPage[0] ){
+    /* Keep the first chunk in memory, as for any base file. */
+    OvPage *pHead = ov->pHead;
+    if( pHead==0 || pHead->nRef>1 ){
+      OvPage *pNew = ovPageAlloc(ov->szChunk);
+      if( pNew==0 ){
+        rc = SQLITE_NOMEM;
+      }else{
+        ovEnter();
+        if( pHead && --pHead->nRef==0 ) sqlite3_free(pHead);
+        ovLeave();
+        ov->pHead = pNew;
+      }
+    }
+    if( rc==SQLITE_OK ){
+      memcpy(ov->pHead->a, ov->apPage[0]->a, ov->szChunk);
+      ov->nHead = ov->szChunk;
+    }
+  }
+  if( rc==SQLITE_OK ){
+    ovEnter();
+    for(k=0; k<ov->nDirty; k++){
+      i64 i = ov->aiDirty[k];
+      OvPage *p = i<ov->nPage ? ov->apPage[i] : 0;
+      if( p==0 ) continue;
+      if( --p->nRef==0 ) sqlite3_free(p);
+      ov->apPage[i] = 0;
+      ov->nUsed--;
+    }
+    ovLeave();
+    ov->szVisible = ov->szStored = ov->szFile;
+    ovResetDirty(ov);
+  }
+  ov->rcWrite = rc;
+  /* The commit is stored either way: a failed checkpoint is tried again. */
+  if( rc==SQLITE_OK && ov->iJournal>OV_JOURNAL_LIMIT ) ovCheckpoint(ov);
+  return rc;
+}
+
+/*
+** Replay the journal into the base file after it was not checkpointed:
+** every complete record that follows the one before it, in order. Then
+** sync the base file and start the journal over.
+*/
+static int ovRecover(Overlay *ov){
+  static const u8 zero[OV_REDO_HEADER];
+  sqlite3_file *pJ = ov->pJournal, *pB = ov->pBase;
+  u8 head[OV_REDO_HEADER], trail[OV_REDO_TRAILER];
+  u8 *a = 0;
+  i64 szJournal = 0, off = 0;
+  unsigned int salt = 0, seq = 0;
+  int nApplied = 0, szAlloc = 0;
+  int rc = pJ->pMethods->xFileSize(pJ, &szJournal);
+  while( rc==SQLITE_OK && off+OV_REDO_HEADER+OV_REDO_TRAILER<=szJournal ){
+    i64 nEntry, end, k, pos, szFile, szBase = 0;
+    int szChunk, pass;
+    unsigned int cksum = 0;
+    rc = pJ->pMethods->xRead(pJ, head, OV_REDO_HEADER, off);
+    if( rc!=SQLITE_OK || memcmp(head, "OVREDO02", 8)!=0 ) break;
+    szChunk = (int)ovGet32(head+16);
+    nEntry = ovGet32(head+20);
+    szFile = ovGet64(head+24);
+    if( szChunk<512 || szChunk>65536 || (szChunk & (szChunk-1))!=0
+     || szFile<0 ){
+      break;
+    }
+    if( nApplied>0 && (ovGet32(head+8)!=salt || ovGet32(head+12)!=seq+1) ){
+      break;
+    }
+    end = off+OV_REDO_HEADER+nEntry*(8+szChunk)+OV_REDO_TRAILER;
+    if( end>szJournal ) break;
+    if( szAlloc<8+szChunk ){
+      sqlite3_free(a);
+      a = sqlite3_malloc(8+szChunk);
+      if( a==0 ){
+        rc = SQLITE_NOMEM;
+        break;
+      }
+      szAlloc = 8+szChunk;
+    }
+    /* Check the whole record before writing any of it. */
+    for(pass=0; rc==SQLITE_OK && pass<2; pass++){
+      if( pass==0 ) cksum = ovChecksum(0, head, OV_REDO_HEADER);
+      for(k=0, pos=off+OV_REDO_HEADER; rc==SQLITE_OK && k<nEntry;
+          k++, pos+=8+szChunk){
+        i64 i, n;
+        rc = pJ->pMethods->xRead(pJ, a, 8+szChunk, pos);
+        if( rc!=SQLITE_OK ) break;
+        if( pass==0 ){
+          cksum = ovChecksum(cksum, a, 8+szChunk);
+          continue;
+        }
+        i = ovGet64(a);
+        n = szFile - i*szChunk;
+        if( n>szChunk ) n = szChunk;
+        if( n>0 ) rc = pB->pMethods->xWrite(pB, a+8, (int)n, i*szChunk);
+      }
+      if( rc==SQLITE_OK && pass==0 ){
+        rc = pJ->pMethods->xRead(pJ, trail, OV_REDO_TRAILER, pos);
+        if( rc==SQLITE_OK
+         && (ovGet32(trail)!=cksum || ovGet32(trail+4)!=(unsigned int)nEntry
+          || memcmp(trail+8, "OVCOMMIT", 8)!=0) ){
+          break;
+        }
+      }
+    }
+    if( rc!=SQLITE_OK || pass<2 ) break;
+    rc = pB->pMethods->xFileSize(pB, &szBase);
+    if( rc==SQLITE_OK && szBase>szFile ) rc = pB->pMethods->xTruncate(pB, szFile);
+    salt = ovGet32(head+8);
+    seq = ovGet32(head+12);
+    nApplied++;
+    off = end;
+  }
+  sqlite3_free(a);
+  if( rc==SQLITE_OK && nApplied ) rc = pB->pMethods->xSync(pB, SQLITE_SYNC_NORMAL);
+  if( rc==SQLITE_OK && szJournal>=OV_REDO_HEADER ){
+    rc = pJ->pMethods->xWrite(pJ, zero, OV_REDO_HEADER, 0);
+  }
+  if( rc==SQLITE_OK ) ovNewJournal(ov);
+  return rc;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Main database file methods                                               */
 /* ------------------------------------------------------------------------ */
 
@@ -564,6 +1078,9 @@ static int ovClose(sqlite3_file *pFile){
   OvFile *p = (OvFile*)pFile;
   Overlay *ov = p->pOv;
   ovUnlock(pFile, SQLITE_LOCK_NONE);
+  /* The last connection: store commits whose write-back failed, if that
+  ** works now (outside gMutex, which ovWriteBack takes). */
+  if( ov->pBaseVfs && ov->nRef==1 ) ovWriteBack(ov);
   ovEnter();
   if( --ov->nRef==0 ) ovDestroyLocked(ov);
   ovLeave();
@@ -746,8 +1263,10 @@ static int ovFileControl(sqlite3_file *pFile, int op, void *pArg){
   }
   if( op==SQLITE_FCNTL_COMMIT_PHASETWO ){
     /* Committed, and still holding the write lock. The commit stands even
-    ** if the hook failed: its changes are reported with the next one. */
-    ovReportCommit(ov);
+    ** if the hook or the write-back failed: its changes are reported, or
+    ** written, with the next one (or sqlite3_overlay_flush). */
+    if( ov->pBaseVfs ) ovWriteBack(ov);
+    else ovReportCommit(ov);
     return SQLITE_OK;
   }
   if( op==SQLITE_FCNTL_MMAP_SIZE ){
@@ -809,7 +1328,9 @@ static int ovFetch(sqlite3_file *pFile, i64 iOfst, int iAmt, void **pp){
   i64 i = iOfst/ov->szChunk;
   int rc;
   *pp = 0;
-  if( pBase==0 || pBase->pMethods->iVersion<3 || pBase->pMethods->xFetch==0
+  /* A writable base changes with every write-back: never map it. */
+  if( pBase==0 || ov->bChanging || pBase->pMethods->iVersion<3
+   || pBase->pMethods->xFetch==0
    || p->eLock>SQLITE_LOCK_SHARED
    || iOfst<ov->nHead || iOfst+iAmt>ov->szVisible || iOfst+iAmt>p->szMmap
    || iOfst%ov->szChunk+iAmt>ov->szChunk
@@ -1180,6 +1701,13 @@ int sqlite3_overlay_commit_hook(
   sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, &pFile);
   if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return SQLITE_MISUSE;
   ov = ((OvFile*)pFile)->pOv;
+  if( xCommit && ov->pBaseVfs ) return SQLITE_MISUSE;
+  if( xCommit ){
+    /* A snapshot of a stored database is stored elsewhere: it no longer
+    ** reads from that file. */
+    int rc = ovUnborrow(ov);
+    if( rc!=SQLITE_OK ) return rc;
+  }
   ovResetDirty(ov);
   ov->xCommit = xCommit;
   ov->pCommitArg = pArg;
@@ -1214,6 +1742,117 @@ int sqlite3_overlay_report_all(sqlite3 *db, const char *zSchema){
   /* Report even an empty file, which still replaces the stored one. */
   ov->szCommitted = -1;
   return ovReportCommit(ov);
+}
+
+/* The overlay behind zSchema, or NULL if it is not an overlay. */
+static Overlay *ovOf(sqlite3 *db, const char *zSchema){
+  sqlite3_file *pFile = 0;
+  sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, &pFile);
+  if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return 0;
+  return ((OvFile*)pFile)->pOv;
+}
+
+/*
+** Store the overlay behind zSchema, which has no base file, in the file
+** zPath of VFS zVfs from now on, as if it had been opened with base=zVfs:
+** its committed state replaces what the file held, written as one
+** write-back (so the file holds either), after which every commit is
+** written back to it and the overlay drops its stored chunks from memory.
+** SQLITE_MISUSE for overlays with a base file or a commit hook, SQLITE_BUSY
+** during a write transaction. On failure the overlay is left as it was.
+*/
+int sqlite3_overlay_attach_base(
+  sqlite3 *db,
+  const char *zSchema,
+  const char *zVfs,
+  const char *zPath
+){
+  Overlay *ov = ovOf(db, zSchema);
+  sqlite3_vfs *pVfs = zVfs ? sqlite3_vfs_find(zVfs) : 0;
+  i64 i, nChunk, szBase = 0;
+  int rc;
+  if( ov==0 || ov->pBaseVfs || ov->xCommit ) return SQLITE_MISUSE;
+  if( pVfs==0 || strcmp(zVfs, OVERLAY_VFS_NAME)==0 ) return SQLITE_CANTOPEN;
+  if( ov->pWriter ) return SQLITE_BUSY;
+  /* A snapshot of a stored database first copies what it reads from it. */
+  rc = ovUnborrow(ov);
+  if( rc!=SQLITE_OK ) return rc;
+  if( ov->pBase ) return SQLITE_MISUSE;
+  /* Fill holes with zero chunks first: once there is a base file, missing
+  ** chunks would be read from it. */
+  nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
+  for(i=0; i<nChunk; i++){
+    OvPage *pg;
+    if( i<ov->nPage && ov->apPage[i] ) continue;
+    rc = ovPageForWrite(ov, i, 1, &pg);
+    if( rc!=SQLITE_OK ) return rc;
+    memset(pg->a, 0, ov->szChunk);
+  }
+  ov->szVisible = 0;
+  rc = ovOpenWritableBase(ov, pVfs, zPath, &szBase);
+  if( rc==SQLITE_OK ){
+    ov->bChanging = 1;
+    ov->szStored = szBase;
+    ovResetDirty(ov);
+    for(i=0; rc==SQLITE_OK && i<nChunk; i++) rc = ovMarkDirty(ov, i);
+  }
+  if( rc==SQLITE_OK ) rc = ovWriteBack(ov);
+  if( rc!=SQLITE_OK ){
+    ovCloseBase(ov);
+    ovResetDirty(ov);
+    ov->szVisible = 0;
+  }
+  return rc;
+}
+
+/*
+** Stop writing the overlay behind zSchema to its writable base file, and
+** keep it in memory from now on: first store the commits that are not
+** stored yet, then read every chunk it does not hold from the base file,
+** and close that. Snapshots that read the file copy what they read too.
+** Fails, staying as it was, if reading fails (SQLITE_NOMEM or an I/O
+** error), with SQLITE_MISUSE for overlays without a writable base and with
+** SQLITE_BUSY during a write transaction. Otherwise it detaches, and the
+** error of storing those commits, if that failed, is written to *pWrite;
+** the overlay holds them either way.
+*/
+int sqlite3_overlay_detach_base(sqlite3 *db, const char *zSchema, int *pWrite){
+  Overlay *ov = ovOf(db, zSchema);
+  i64 i, nChunk;
+  int rcWrite, rc = SQLITE_OK;
+  if( ov==0 || ov->pBaseVfs==0 ) return SQLITE_MISUSE;
+  if( ov->pWriter ) return SQLITE_BUSY;
+  rcWrite = ovWriteBack(ov);
+  nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
+  for(i=0; rc==SQLITE_OK && i<nChunk; i++) rc = ovPreserveChunk(ov, i);
+  ovEnter();
+  if( rc==SQLITE_OK ) rc = ovPreserveLocked(ov, 0, 1);
+  if( rc==SQLITE_OK ) ovReleaseBorrowersLocked(ov);
+  ovLeave();
+  if( rc!=SQLITE_OK ) return rc;
+  ovCheckpoint(ov);
+  ovCloseBase(ov);
+  ovResetDirty(ov);
+  ov->szVisible = 0;
+  if( pWrite ) *pWrite = rcWrite;
+  return SQLITE_OK;
+}
+
+/*
+** Write what is not stored yet to the writable base file behind zSchema:
+** commits whose write-back failed. Returns the error if it fails again, and
+** SQLITE_OK for overlays without a writable base. During a write
+** transaction nothing is written: it returns the last write-back's result.
+*/
+int sqlite3_overlay_flush(sqlite3 *db, const char *zSchema){
+  sqlite3_file *pFile = 0;
+  Overlay *ov;
+  sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, &pFile);
+  if( pFile==0 || pFile->pMethods!=&ovIoMethods ) return SQLITE_MISUSE;
+  ov = ((OvFile*)pFile)->pOv;
+  if( ov->pBaseVfs==0 ) return SQLITE_OK;
+  if( ov->pWriter ) return ov->rcWrite;
+  return ovWriteBack(ov);
 }
 
 /*

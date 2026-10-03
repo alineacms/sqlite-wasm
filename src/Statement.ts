@@ -37,6 +37,7 @@ export class Statement implements StatementI {
   private readonly db: Database
   private pos: number
   private readonly allocatedmem: Pointer[]
+  private columnNames?: string[]
 
   public constructor(stmt: Pointer, db: Database) {
     this.wasm = db.wasm
@@ -179,6 +180,8 @@ export class Statement implements StatementI {
       case ReturnCode.ROW:
         return true
       case ReturnCode.DONE:
+        // The statement may be prepared again before its next row.
+        this.columnNames = undefined
         return false
       default:
         this.db.handleError(ret)
@@ -195,45 +198,41 @@ export class Statement implements StatementI {
    * before it is executed
    */
   get(params?: BindParams): SqlValue[] {
-    const getNumber = (pos: number = this.pos++): number => {
-      return this.wasm.sqlite3_column_double(this.stmt, pos)
-    }
-
-    const getString = (pos: number = this.pos++): string => {
-      // [TODO] What does it return, pointer or string?
-      return this.wasm.sqlite3_column_text(this.stmt, pos)
-    }
-
-    const getBlob = (pos: number = this.pos++): Uint8Array => {
-      const ptr: Pointer = this.wasm.sqlite3_column_blob(this.stmt, pos)
-      const size: number = this.wasm.sqlite3_column_bytes(this.stmt, pos)
-      return this.wasm.HEAPU8.slice(ptr, ptr + size)
-    }
-
     if (typeof params !== 'undefined') {
       this.bind(params)
       this.step()
     }
     const results: SQLReturnType[] = []
-    const colSize = this.wasm.sqlite3_data_count(this.stmt)
-    for (let col = 0; col < colSize; col++) {
-      switch (this.wasm.sqlite3_column_type(this.stmt, col)) {
-        case ReturnCode.INTEGER:
-        case ReturnCode.FLOAT:
-          results.push(getNumber(col))
-          break
-        case ReturnCode.TEXT:
-          results.push(getString(col))
-          break
-        case ReturnCode.BLOB:
-          results.push(getBlob(col))
-          break
-        default:
-          results.push(null)
-          break
-      }
-    }
+    const colSize = this.wasm._sqlite3_data_count(this.stmt)
+    for (let col = 0; col < colSize; col++) results.push(this.column(col))
     return results
+  }
+
+  /**
+   * Read one column of the current row. Calls the Wasm exports directly:
+   * this runs for every value of every row, and the cwrap wrappers cost
+   * more than reading the value itself.
+   * @internal
+   */
+  private column(col: number): SQLReturnType {
+    const wasm = this.wasm
+    switch (wasm._sqlite3_column_type(this.stmt, col)) {
+      case ReturnCode.INTEGER:
+      case ReturnCode.FLOAT:
+        return wasm._sqlite3_column_double(this.stmt, col)
+      case ReturnCode.TEXT: {
+        // Ask for the text before its length, as SQLite documents
+        const ptr = wasm._sqlite3_column_text(this.stmt, col)
+        return decodeUTF8(wasm.HEAPU8, ptr, wasm._sqlite3_column_bytes(this.stmt, col))
+      }
+      case ReturnCode.BLOB: {
+        const ptr = wasm._sqlite3_column_blob(this.stmt, col)
+        const size = wasm._sqlite3_column_bytes(this.stmt, col)
+        return wasm.HEAPU8.slice(ptr, ptr + size)
+      }
+      default:
+        return null
+    }
   }
 
   /**
@@ -258,12 +257,21 @@ export class Statement implements StatementI {
    * it will be executed
    */
   getAsObject(params?: BindParams): ParamsObject {
-    const values = this.get(params)
-    const names = this.getColumnNames()
+    if (typeof params !== 'undefined') {
+      this.bind(params)
+      this.step()
+    }
+    // Names cannot change until the statement is reset: SQLite only
+    // prepares it again (after a schema change) when it starts over. They
+    // are only known once there is a row.
+    let names = this.columnNames
+    if (!names) {
+      names = this.getColumnNames()
+      if (names.length) this.columnNames = names
+    }
     const rowObject: ReturnMap = {}
-    names.forEach((name, i) => {
-      rowObject[name] = values[i]
-    })
+    for (let col = 0; col < names.length; col++)
+      rowObject[names[col]] = this.column(col)
     return rowObject
   }
 
@@ -287,6 +295,7 @@ export class Statement implements StatementI {
    * @see [https://sql.js.org/documentation/Statement.html#["reset"]](https://sql.js.org/documentation/Statement.html#%5B%22reset%22%5D)
    */
   reset(): boolean {
+    this.columnNames = undefined
     this.freemem()
     return (
       this.wasm.sqlite3_clear_bindings(this.stmt) === ReturnCode.OK &&
@@ -337,4 +346,25 @@ export class Statement implements StatementI {
   getSQL(): string {
     return this.wasm.sqlite3_sql(this.stmt)
   }
+}
+
+const decoder = new TextDecoder()
+
+/**
+ * Decode `length` bytes of UTF-8 text from the Wasm heap. Short ASCII
+ * strings, the most common column values, are faster to build directly
+ * than through TextDecoder.
+ */
+function decodeUTF8(heap: Uint8Array, ptr: number, length: number): string {
+  const end = ptr + length
+  if (length <= 32) {
+    let text = ''
+    for (let i = ptr; i < end; i++) {
+      const byte = heap[i]
+      if (byte > 0x7f) return decoder.decode(heap.subarray(ptr, end))
+      text += String.fromCharCode(byte)
+    }
+    return text
+  }
+  return decoder.decode(heap.subarray(ptr, end))
 }

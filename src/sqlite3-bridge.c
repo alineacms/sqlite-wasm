@@ -14,6 +14,51 @@ static sqlite3_int64 alinea_unix_time_ms(void) {
   return (sqlite3_int64)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
+// With SQLITE_OMIT_DATETIME_FUNCS, SQLite only calls strftime for
+// current_time, current_date and current_timestamp. The C library's
+// strftime pulls in its whole printf (about 11 KB of Wasm), so this one
+// formats only the fields those functions use and fails on any other.
+size_t strftime(
+  char *restrict output,
+  size_t output_size,
+  const char *restrict format,
+  const struct tm *restrict time
+) {
+  size_t length = 0;
+  if (output_size == 0) {
+    return 0;
+  }
+  for (; *format; format++) {
+    char field[12];
+    int field_length = 1;
+    if (*format != '%') {
+      field[0] = *format;
+    } else {
+      int value;
+      const char *layout = "%02d";
+      switch (*++format) {
+        case 'Y': value = time->tm_year + 1900; layout = "%04d"; break;
+        case 'm': value = time->tm_mon + 1; break;
+        case 'd': value = time->tm_mday; break;
+        case 'H': value = time->tm_hour; break;
+        case 'M': value = time->tm_min; break;
+        case 'S': value = time->tm_sec; break;
+        default: return 0;
+      }
+      sqlite3_snprintf(sizeof(field), field, layout, value);
+      field_length = (int)strlen(field);
+    }
+    // The result and its terminating NUL must fit.
+    if (length + field_length >= output_size) {
+      return 0;
+    }
+    memcpy(output + length, field, field_length);
+    length += field_length;
+  }
+  output[length] = 0;
+  return length;
+}
+
 static int alinea_vfs_open(
   sqlite3_vfs *vfs,
   sqlite3_filename filename,
@@ -119,8 +164,13 @@ static sqlite3_vfs alinea_vfs = {
   0
 };
 
+int jsvfs_register(void);
+
 int sqlite3_os_init(void) {
   int result = sqlite3_vfs_register(&alinea_vfs, 1);
+  if (result == SQLITE_OK) {
+    result = jsvfs_register();
+  }
   if (result != SQLITE_OK) {
     return result;
   }
@@ -133,7 +183,13 @@ int sqlite3_os_end(void) {
 
 // Every database is a named copy-on-write overlay (see overlay.c), so forks
 // share unchanged pages with their source.
-static int alinea_open_overlay(sqlite3 **db, const char *from) {
+// With file, a URI-escaped name, the overlay is stored in that file of the
+// "js" VFS (see jsvfs.c) instead of only in memory.
+static int alinea_open_overlay(
+  sqlite3 **db,
+  const char *from,
+  const char *file
+) {
   static unsigned int counter = 0;
   int result = sqlite3_initialize();
   if (result != SQLITE_OK) {
@@ -142,6 +198,8 @@ static int alinea_open_overlay(sqlite3 **db, const char *from) {
   unsigned int id = ++counter;
   char *uri = from
     ? sqlite3_mprintf("file:db%u?overlay=db%u&from=%s", id, id, from)
+    : file
+    ? sqlite3_mprintf("file:%s?overlay=db%u&base=js", file, id)
     : sqlite3_mprintf("file:db%u?overlay=db%u", id, id);
   if (uri == 0) {
     return SQLITE_NOMEM;
@@ -157,7 +215,35 @@ static int alinea_open_overlay(sqlite3 **db, const char *from) {
 }
 
 int alinea_open(sqlite3 **db) {
-  return alinea_open_overlay(db, 0);
+  return alinea_open_overlay(db, 0, 0);
+}
+
+// Opens the database stored in file, a URI-escaped name in the "js" VFS,
+// or starts one there. Every commit is written to it; only the pages of
+// the open transaction are kept in memory.
+int alinea_open_file(const char *file, sqlite3 **db) {
+  return alinea_open_overlay(db, 0, file);
+}
+
+// Stores db, an in-memory database, in file of the "js" VFS from now on, as
+// if it had been opened with alinea_open_file: its committed state replaces
+// what the file held.
+int alinea_attach_file(sqlite3 *db, const char *file) {
+  return sqlite3_overlay_attach_base(db, "main", "js", file);
+}
+
+// Stops storing db in its file and keeps it in memory, or returns why it
+// cannot. Once detached, the error of storing the last commits, if that
+// failed, is written to write_error; db holds them either way.
+int alinea_detach_file(sqlite3 *db, int *write_error) {
+  *write_error = SQLITE_OK;
+  return sqlite3_overlay_detach_base(db, "main", write_error);
+}
+
+// Writes the commits that could not be stored yet, for databases opened
+// with alinea_open_file. Returns their error if writing fails again.
+int alinea_flush(sqlite3 *db) {
+  return sqlite3_overlay_flush(db, "main");
 }
 
 // Opens a snapshot of the last committed state of source.
@@ -168,7 +254,7 @@ int alinea_fork(sqlite3 *source, sqlite3 **db) {
     *db = 0;
     return SQLITE_MISUSE;
   }
-  return alinea_open_overlay(db, name);
+  return alinea_open_overlay(db, name, 0);
 }
 
 unsigned char *alinea_malloc(int size) {

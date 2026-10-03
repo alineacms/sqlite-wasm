@@ -18,6 +18,8 @@
     },
     "./native": "./dist/native.js",
     "./indexeddb": "./dist/indexeddb.js",
+    "./opfs": "./dist/opfs.js",
+    "./shared": "./dist/shared.js",
     "./package.json": "./package.json",
     "./*": "./dist/*"
   },
@@ -25,7 +27,8 @@
     "build": "make build-dist && bun run build:native",
     "build:native": "bun script/build-native.ts && esbuild --format=esm --minify --platform=node src/native.ts --outdir=dist",
     "build:ts": "tsc && cp src/sqlite3-emscripten.d.ts dist/sqlite3-emscripten.d.ts",
-    "clean": "make clean"
+    "clean": "make clean",
+    "test:browser": "bun script/test-browser.ts"
   },
   "files": [
     "dist"
@@ -39,6 +42,7 @@
     "esbuild": "0.28.2",
     "fake-indexeddb": "6.2.5",
     "google-closure-compiler": "20260831.0.0",
+    "playwright-core": "1.63.0",
     "terser": "5.51.2",
     "typescript": "7.0.2"
   }

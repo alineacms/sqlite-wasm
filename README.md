@@ -19,7 +19,8 @@ The build includes SQLite JSON functions, FTS5, views, triggers, window
 functions, temporary tables, `VACUUM`, and `ATTACH` for additional in-memory
 databases. Databases live in memory;
 use `db.export()` and `new Database(bytes)` to persist and restore their file
-representation, or [sync them with IndexedDB](#indexeddb-storage).
+representation, [sync them with IndexedDB](#indexeddb-storage), or
+[store them in OPFS](#opfs-storage) without keeping them in memory.
 
 Databases are stored copy-on-write, so `db.fork()` creates an independent copy
 without duplicating any data. The fork shares every page with its source and
@@ -144,6 +145,88 @@ import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
 const storage = indexedDBStorage('notes', {indexedDB: new IDBFactory(), IDBKeyRange})
 ```
 
+## OPFS storage
+
+In a dedicated Worker, `Database.sync` can also keep a database in a file of
+the origin private file system (OPFS). Unlike IndexedDB storage, the database
+is not loaded into memory: pages are read from the file as queries need them.
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
+
+const {Database} = await init()
+const db = await Database.sync(opfsStorage('notes.sqlite3'))
+db.run('create table if not exists notes (text)')
+db.run('insert into notes values (?)', ['stored'])
+```
+
+- Only SQLite's page cache and the pages of the open transaction are held
+  in memory, so a database can be larger than the memory available to it.
+- Every commit is stored when it returns: it is appended to a journal next
+  to the file (`notes.sqlite3-journal`) and synced there, and written to
+  the file itself. The file is synced, and the journal started over, every
+  few megabytes and when the database closes. Opening the database replays
+  the journal after a crash, so it always holds the last commit. `await
+  db.flush()` stores commits that failed to write, and rejects if that
+  fails again.
+- OPFS files can only be opened this way in a dedicated Worker, by one
+  Worker at a time: syncing a database that another Worker or tab holds
+  fails with `SQLITE_BUSY`. Have one Worker own the database, and the other
+  tabs send it their queries, as [shareDatabase](#sharing-a-database-between-tabs)
+  does. No cross-origin isolation headers are needed.
+- `db.fork()` creates an in-memory snapshot, as for any database. It keeps
+  its content when the stored database changes or closes, copying the pages
+  it still read from the file first.
+- `await db.attach(opfsStorage(name))` stores a database that is in memory:
+  its committed state replaces what the file held, written as one commit,
+  and from then on it is no longer kept in memory. `db.detach()` stores the
+  last commits, reads every page into memory and closes the file; `await
+  db.flush()` rejects if storing those commits failed. Neither works during
+  a write transaction (`SQLITE_BUSY`).
+- `await storage.delete()` removes the file and its journal once the
+  database is closed or detached.
+
+`opfsStorage(name, {directory})` keeps the files in a directory of OPFS
+instead of its root. `fileStorage(name, fileSystem)` uses any other
+`FileSystem` that opens files for synchronous access.
+
+### Sharing a database between tabs
+
+Only one Worker can hold an OPFS file. `shareDatabase` from
+`@alinea/sqlite-wasm/shared` lets every tab use it anyway: call it in a
+dedicated Worker in each tab, and the Web Locks API elects one of them to
+open the database while the others send it their statements over a
+BroadcastChannel.
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
+import {shareDatabase} from '@alinea/sqlite-wasm/shared'
+
+const db = shareDatabase('notes', async () => {
+  const {Database} = await init()
+  return Database.sync(opfsStorage('notes.sqlite3'))
+})
+await db.exec('create table if not exists notes (text)')
+await db.transaction([['insert into notes values (?)', ['shared']]])
+console.log(await db.query('select * from notes'))
+```
+
+- `query(sql, params)` returns rows as objects, `exec(sql)` runs a script
+  without parameters, and `transaction(statements)` runs statements in one
+  transaction and returns the rows of each. They resolve once the
+  statements ran in the owning Worker and their commits are stored.
+- Requests run one at a time, so tabs never interleave inside a
+  transaction. A transaction must begin and end in one request: a request
+  that leaves one open is rolled back and fails with `SQLITE_MISUSE`.
+- When the owning tab closes, the next Worker in line opens the database
+  (finishing a commit that was interrupted) and the others send what was
+  not answered yet again. A request the previous owner ran but did not
+  answer runs twice, so make writes safe to repeat where that matters.
+- `isOwner` tells if this Worker holds the database; `close()` releases it.
+- `open` can return any database, also one stored in IndexedDB.
+
 ## Native extension
 
 The same copy-on-write storage ships as a prebuilt SQLite extension for native
@@ -199,6 +282,10 @@ bun run build
 bun test
 ```
 
+`bun run test:browser` runs the tests in `test/browser` in headless
+Chromium, which OPFS storage and shared databases need; install the browser
+it expects once with `bunx playwright-core install chromium`.
+
 `bun run build` also builds the native extension for the current platform
 into `dist/native`. `bun run build:native` rebuilds only that, and
 `node --test native.test.ts` runs its tests under Node.js. CI builds and
@@ -206,8 +293,9 @@ tests the extension on every supported platform, and releases publish all
 of the binaries.
 
 The toolchain is pinned in the devcontainer and package manifest. The build
-uses SQLite's in-memory pager with a minimal VFS, so it does not ship
-Emscripten's JavaScript filesystem implementation. The Makefile downloads and
+stores databases in the copy-on-write overlay VFS (`src/overlay.c`), and
+files only through a small VFS answered by JavaScript (`src/jsvfs.c`), so it
+does not ship Emscripten's JavaScript filesystem implementation. The Makefile downloads and
 checksums SQLite's canonical source archive, applies the small compatibility
 patch needed by this feature set, and generates the custom amalgamation before
 compiling it.

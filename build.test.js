@@ -93,6 +93,49 @@ for (const [name, initialize] of [
       }
     })
 
+    test('formats current_date, current_time and current_timestamp in UTC', () => {
+      const before = new Date().toISOString()
+      const [[date, time, timestamp]] = db.exec(
+        'select current_date, current_time, current_timestamp'
+      )[0].values
+      const after = new Date().toISOString()
+      expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+      expect(time).toMatch(/^\d{2}:\d{2}:\d{2}$/)
+      expect(timestamp).toBe(`${date} ${time}`)
+      const iso = `${date}T${time}`
+      expect(iso >= before.slice(0, 19)).toBe(true)
+      expect(iso <= after.slice(0, 19)).toBe(true)
+    })
+
+    test('decodes short and long text, ASCII or not', () => {
+      const values = ['', 'a', 'ascii', 'é', 'x'.repeat(32), 'é'.repeat(16), 'y'.repeat(33), 'z'.repeat(1000) + ' 日本語 🎉']
+      const stmt = db.prepare(`select ${values.map(() => '?').join(', ')}`)
+      try {
+        expect(stmt.get(values)).toEqual(values)
+      } finally {
+        stmt.free()
+      }
+    })
+
+    test('reads column names again after a schema change', () => {
+      db.run('create table items (id integer primary key, title text)')
+      db.run("insert into items values (1, 'first')")
+      const query = db.prepare('select * from items')
+      try {
+        expect(query.getAsObject()).toEqual({})
+        expect(query.step()).toBe(true)
+        expect(query.getAsObject()).toEqual({id: 1, title: 'first'})
+        query.reset()
+        db.run('drop table items')
+        db.run('create table items (key text, value integer)')
+        db.run("insert into items values ('second', 2)")
+        expect(query.step()).toBe(true)
+        expect(query.getAsObject()).toEqual({key: 'second', value: 2})
+      } finally {
+        query.free()
+      }
+    })
+
     test('keeps blobs returned by get stable after statement and database activity', () => {
       const expected = new Uint8Array([0, 1, 2, 3, 127, 128, 254, 255])
       db.run('create table blobs (value blob)')
