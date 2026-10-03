@@ -57,6 +57,11 @@ interface Pending {
 
 const SQLITE_ERROR = 1
 const SQLITE_MISUSE = 21
+// The longest wait before trying to open the database again after failing
+const MAX_RETRY_MS = 5_000
+// Prepared statements the owner keeps, by SQL text, the least recently used
+// going first
+const CACHED_STATEMENTS = 100
 // How long an answered request is remembered, to ignore it if it arrives
 // again: requests are sent again right after a new owner announces itself.
 const REMEMBER_MS = 60_000
@@ -106,9 +111,19 @@ export class SharedDatabase {
     }
     this.channel = new Channel(`@alinea/sqlite-wasm:${name}`)
     this.channel.onmessage = event => this.receive(event.data)
-    locks
+    this.locks = locks
+    this.requestLock()
+  }
+
+  private readonly locks: Pick<LockManager, 'request'>
+  private retryMs = 0
+
+  // Wait in line to open the database.
+  private requestLock() {
+    if (this.closed) return
+    this.locks
       .request(
-        `@alinea/sqlite-wasm:${name}`,
+        `@alinea/sqlite-wasm:${this.name}`,
         {signal: this.abort.signal},
         () => this.own()
       )
@@ -230,11 +245,16 @@ export class SharedDatabase {
     if (this.closed) return
     try {
       this.db = await this.open()
+      this.retryMs = 0
     } catch (error) {
-      // Not opened: reject what waits, and leave it to the next in line.
+      // Not opened: reject what this Worker waits for, leave it to the next
+      // in line, and line up again later: the failure may pass, such as an
+      // OPFS file the previous owner's Worker has not released yet.
       const failure = fromError(error)
       for (const {reject} of this.pending.values()) reject(toError(failure))
       this.pending.clear()
+      this.retryMs = Math.min(MAX_RETRY_MS, Math.max(50, this.retryMs * 2))
+      setTimeout(() => this.requestLock(), this.retryMs)
       return
     }
     if (this.closed) {
@@ -302,10 +322,17 @@ export class SharedDatabase {
 
   private rows(sql: string, params?: ReadonlyArray<unknown>): Array<Row> {
     let statement = this.statements.get(sql)
-    if (!statement) {
+    if (statement) {
+      this.statements.delete(sql)
+    } else {
       statement = this.db!.prepare(sql)
-      this.statements.set(sql, statement)
+      if (this.statements.size >= CACHED_STATEMENTS) {
+        const [oldest, unused] = this.statements.entries().next().value!
+        this.statements.delete(oldest)
+        unused.free()
+      }
     }
+    this.statements.set(sql, statement)
     try {
       if (params?.length) statement.bind(params as any)
       const rows: Array<Row> = []

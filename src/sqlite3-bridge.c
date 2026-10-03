@@ -24,38 +24,39 @@ size_t strftime(
   const char *restrict format,
   const struct tm *restrict time
 ) {
-  char *end = output;
-  char *limit = output + output_size;
+  size_t length = 0;
   if (output_size == 0) {
     return 0;
   }
   for (; *format; format++) {
-    int value;
-    const char *layout = "%02d";
+    char field[12];
+    int field_length = 1;
     if (*format != '%') {
-      if (end + 1 >= limit) {
-        return 0;
+      field[0] = *format;
+    } else {
+      int value;
+      const char *layout = "%02d";
+      switch (*++format) {
+        case 'Y': value = time->tm_year + 1900; layout = "%04d"; break;
+        case 'm': value = time->tm_mon + 1; break;
+        case 'd': value = time->tm_mday; break;
+        case 'H': value = time->tm_hour; break;
+        case 'M': value = time->tm_min; break;
+        case 'S': value = time->tm_sec; break;
+        default: return 0;
       }
-      *end++ = *format;
-      continue;
+      sqlite3_snprintf(sizeof(field), field, layout, value);
+      field_length = (int)strlen(field);
     }
-    switch (*++format) {
-      case 'Y': value = time->tm_year + 1900; layout = "%04d"; break;
-      case 'm': value = time->tm_mon + 1; break;
-      case 'd': value = time->tm_mday; break;
-      case 'H': value = time->tm_hour; break;
-      case 'M': value = time->tm_min; break;
-      case 'S': value = time->tm_sec; break;
-      default: return 0;
-    }
-    sqlite3_snprintf((int)(limit - end), end, layout, value);
-    end += strlen(end);
-    if (end + 1 >= limit) {
+    // The result and its terminating NUL must fit.
+    if (length + field_length >= output_size) {
       return 0;
     }
+    memcpy(output + length, field, field_length);
+    length += field_length;
   }
-  *end = 0;
-  return (size_t)(end - output);
+  output[length] = 0;
+  return length;
 }
 
 static int alinea_vfs_open(
@@ -231,10 +232,12 @@ int alinea_attach_file(sqlite3 *db, const char *file) {
   return sqlite3_overlay_attach_base(db, "main", "js", file);
 }
 
-// Stops storing db in its file and keeps it in memory. Returns the error of
-// storing the last commits, if that failed; db is detached anyway.
-int alinea_detach_file(sqlite3 *db) {
-  return sqlite3_overlay_detach_base(db, "main");
+// Stops storing db in its file and keeps it in memory, or returns why it
+// cannot. Once detached, the error of storing the last commits, if that
+// failed, is written to write_error; db holds them either way.
+int alinea_detach_file(sqlite3 *db, int *write_error) {
+  *write_error = SQLITE_OK;
+  return sqlite3_overlay_detach_base(db, "main", write_error);
 }
 
 // Writes the commits that could not be stored yet, for databases opened

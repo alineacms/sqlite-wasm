@@ -150,6 +150,17 @@ describe('A shared database', () => {
     expect(await tabsUsed[1].db.query('select n from counter')).toEqual([{n: 30}])
   })
 
+  test('keeps answering with many different statements', async () => {
+    const a = tab()
+    const b = tab()
+    await a.db.exec('create table t (x)')
+    for (let i = 0; i < 250; i++) {
+      await b.db.query(`insert into t values (${i})`)
+    }
+    expect(await b.db.query('select count(*) as n, sum(x) as s from t'))
+      .toEqual([{n: 250, s: 31125}])
+  })
+
   test('rolls back a failed transaction and reports the error', async () => {
     const a = tab()
     const b = tab()
@@ -216,6 +227,21 @@ describe('Handing over a shared database', () => {
     await expect(pending).rejects.toMatchObject({code: 'SQLITE_MISUSE'})
     await expect(b.db.query('select 1')).rejects.toMatchObject({code: 'SQLITE_MISUSE'})
     expect(owner.db.isOwner).toBe(false)
+  })
+
+  test('to the same tab again when opening failed before', async () => {
+    let attempts = 0
+    const a = tab({
+      open: async () => {
+        if (++attempts === 1) throw new Error('not yet')
+        return Database.sync(fileStorage('notes.sqlite3', fs))
+      }
+    })
+    // What waited for the failed attempt fails with it.
+    await expect(a.db.query('select 1 as one')).rejects.toThrow('not yet')
+    await until(() => a.db.isOwner)
+    expect(await a.db.query('select 1 as one')).toEqual([{one: 1}])
+    expect(attempts).toBe(2)
   })
 
   test('to the next tab when opening fails', async () => {
