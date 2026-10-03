@@ -227,6 +227,8 @@ static int ovBaseRead(Overlay *ov, u8 *buf, int n, i64 off){
     n -= k;
     off += k;
   }
+  /* Its base file was taken away before all of it could be copied. */
+  if( ov->pBase==0 ) return SQLITE_IOERR_READ;
   rc = ov->pBase->pMethods->xRead(ov->pBase, buf, n, off);
   if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
   return rc;
@@ -462,7 +464,6 @@ static void ovDestroyLocked(Overlay *ov){
   ** read from it copy what they read. Leave the base file synced, so the
   ** journal is not needed. */
   if( ov->pBaseVfs ){
-    ovPreserveLocked(ov, 0, 1);
     ovReleaseBorrowersLocked(ov);
     ovCheckpoint(ov);
   }
@@ -763,17 +764,22 @@ static int ovPreserveLocked(Overlay *ov, i64 iFirst, int bAll){
 }
 
 /*
-** Before the writable overlay ov closes its base file: the overlays that
-** borrowed it, which ovPreserveLocked(ov, 0, 1) gave a copy of every chunk
-** they read from it, no longer have a base. Caller holds gMutex, if any.
+** Before the writable overlay ov closes its base file: give the overlays
+** that borrowed it a copy of every chunk they read from it, and take the
+** base away from them. If copying fails, the chunks they lack fail to read
+** (see ovBaseRead) rather than read as zeros. Caller holds gMutex, if any.
 */
 static void ovReleaseBorrowersLocked(Overlay *ov){
   Overlay *o;
   for(o=gList; o; o=o->pNext){
+    i64 i, nVisible;
+    int rc = SQLITE_OK;
     if( o==ov || !o->bBorrowed || o->pBase!=ov->pBase ) continue;
+    nVisible = (o->szVisible+o->szChunk-1)/o->szChunk;
+    for(i=0; rc==SQLITE_OK && i<nVisible; i++) rc = ovPreserveChunk(o, i);
     o->pBase = 0;
     o->bBorrowed = o->bChanging = 0;
-    o->szVisible = 0;
+    if( rc==SQLITE_OK ) o->szVisible = 0;
   }
 }
 
