@@ -1,8 +1,8 @@
 // Runs test/browser in headless Chromium: file storage in OPFS and
 // databases shared between Workers need a browser's OPFS, Web Locks and
 // BroadcastChannel. Build first (bun run build). The Chromium build
-// matching playwright-core must be installed:
-// bunx playwright-core install chromium
+// matching playwright-core must be installed
+// (bunx playwright-core install chromium), or CHROMIUM_PATH set to another.
 import {mkdtemp, rm} from 'node:fs/promises'
 import {tmpdir} from 'node:os'
 import {join} from 'node:path'
