@@ -34,6 +34,8 @@ export interface Persistence {
   close(): void
   /** Stop storing, for storage that does not use the commit listener */
   detach?(): void
+  /** Called right before the database closes */
+  closing?(): void
 }
 
 /**
@@ -138,17 +140,20 @@ export class Database {
    */
   detachFile(): SQLiteError | undefined {
     if (!this.dbPtr || this.file === undefined) return
-    const result = this.wasm.alinea_detach_file(this.dbPtr)
-    if (result === ReturnCode.BUSY) {
+    const result = this.wasm.alinea_detach_file(this.dbPtr, this.wasm.tempInt32)
+    if (result !== ReturnCode.OK) {
       throw new SQLiteError(
-        'Cannot detach a database during a write transaction',
+        result === ReturnCode.BUSY
+          ? 'Cannot detach a database during a write transaction'
+          : this.wasm.sqlite3_errstr(result),
         result
       )
     }
     this.file = undefined
-    return result === ReturnCode.OK
+    const writeError = this.wasm.getValue(this.wasm.tempInt32, 'i32')
+    return writeError === ReturnCode.OK
       ? undefined
-      : new SQLiteError(this.wasm.sqlite3_errstr(result), result)
+      : new SQLiteError(this.wasm.sqlite3_errstr(writeError), writeError)
   }
 
   /** True while a transaction is open (after BEGIN). @internal */
@@ -534,6 +539,7 @@ export class Database {
     }
     this.functions = {}
     this.stopCommits()
+    this.persistence?.closing?.()
     try {
       this.handleError(this.wasm.sqlite3_close_v2(this.dbPtr))
     } finally {

@@ -168,6 +168,19 @@ function activeIn(fileSystem: FileSystem) {
   return names
 }
 
+/**
+ * The name of a file in the "js" VFS, which is shared by every file
+ * system: the file's name, prefixed with an id for its file system.
+ */
+const ids = new WeakMap<FileSystem, number>()
+let nextId = 0
+
+function fileKey(fileSystem: FileSystem, name: string) {
+  let id = ids.get(fileSystem)
+  if (id === undefined) ids.set(fileSystem, (id = nextId++))
+  return `${id}/${name}`
+}
+
 function busy(name: string) {
   return new SQLiteError(
     `File "${name}" stores another database; close it first`,
@@ -185,7 +198,7 @@ class FilePersistence implements Persistence {
   ) {}
 
   // Commits are stored before they return; this retries any that failed,
-  // or after detaching, reports if storing the last ones failed.
+  // or after closing or detaching, reports if storing the last ones failed.
   async flush() {
     if (!this.closed) this.db.storeFile()
     else if (this.error) throw this.error
@@ -193,8 +206,19 @@ class FilePersistence implements Persistence {
 
   detach() {
     if (this.closed) return
+    // Throws, staying attached, if the database cannot be read into memory.
     this.error = this.db.detachFile()
     this.close()
+  }
+
+  // A last try at storing commits that failed, which flush() reports.
+  closing() {
+    if (this.closed) return
+    try {
+      this.db.storeFile()
+    } catch (error) {
+      this.error = error as SQLiteError
+    }
   }
 
   close() {
@@ -267,7 +291,7 @@ export class FileStorage implements Storage {
   sync<T extends Database>(
     Database: new (data?: ArrayBufferView) => T
   ): Promise<T> {
-    return this.store(() => new Database(), db => db.openFile(this.name), true)
+    return this.store(() => new Database(), (db, key) => db.openFile(key), true)
   }
 
   /**
@@ -276,7 +300,7 @@ export class FileStorage implements Storage {
    * no longer kept in memory. See `opfsStorage`.
    */
   async attach(db: Database): Promise<void> {
-    await this.store(() => db, db => db.attachFile(this.name), false)
+    await this.store(() => db, (db, key) => db.attachFile(key), false)
   }
 
   /**
@@ -285,30 +309,33 @@ export class FileStorage implements Storage {
    */
   private async store<T extends Database>(
     create: () => T,
-    use: (db: T) => void,
+    use: (db: T, key: string) => void,
     owned: boolean
   ): Promise<T> {
     const names = activeIn(this.fileSystem)
     if (names.has(this.name)) throw busy(this.name)
     names.add(this.name)
-    const opened: Array<[string, SyncFile]> = []
+    const key = fileKey(this.fileSystem, this.name)
+    // The overlay names its journal after the file (see overlay.c).
+    const keys = [key, `${key}-journal`]
+    const opened: Array<SyncFile> = []
     let db: T | undefined
     let files: Files | undefined
     const release = () => {
-      for (const [name, file] of opened) {
-        files?.remove(name)
+      opened.forEach((file, i) => {
+        files?.remove(keys[i])
         file.close()
-      }
+      })
       names.delete(this.name)
     }
     try {
       for (const name of [this.name, this.journal]) {
-        opened.push([name, await this.fileSystem.open(name)])
+        opened.push(await this.fileSystem.open(name))
       }
       db = create()
       files = filesOf(db.wasm)
-      for (const [name, file] of opened) files.add(name, file)
-      use(db)
+      opened.forEach((file, i) => files!.add(keys[i], file))
+      use(db, key)
       db.persistence = new FilePersistence(db, release)
       return db
     } catch (error) {

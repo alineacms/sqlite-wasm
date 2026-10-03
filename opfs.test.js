@@ -1,6 +1,8 @@
 import {afterEach, beforeAll, beforeEach, describe, expect, test} from 'bun:test'
 import {init} from '@alinea/sqlite-wasm'
 import {fileStorage} from '@alinea/sqlite-wasm/opfs'
+import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
+import {indexedDBStorage} from '@alinea/sqlite-wasm/indexeddb'
 import {MemoryFileSystem} from './memory-file-system.js'
 
 // Exercise file storage on an in-memory file system (see
@@ -139,6 +141,40 @@ describe('Forks of a stored database', () => {
       .toEqual([[0]])
   })
 
+  test('of forks keep their snapshot too', async () => {
+    const db = await sync()
+    fill(db, 1000)
+    const fork = db.fork()
+    open.push(fork)
+    const forkOfFork = fork.fork()
+    open.push(forkOfFork)
+    db.run("update items set body = 'changed'")
+    expect(rows(forkOfFork, "select count(*), sum(body = 'changed') from items"))
+      .toEqual([[1000, 0]])
+    db.close()
+    await fileStorage('notes.sqlite3', fs).delete()
+    expect(rows(forkOfFork, 'select count(*), sum(length(body)) from items'))
+      .toEqual([[1000, 500_000]])
+  })
+
+  test('can be stored elsewhere', async () => {
+    const db = await sync()
+    fill(db, 300)
+    const fork = db.fork()
+    open.push(fork)
+    await fork.attach(fileStorage('copy.sqlite3', fs))
+    const other = db.fork()
+    open.push(other)
+    await other.attach(
+      indexedDBStorage('copy', {indexedDB: new IDBFactory(), IDBKeyRange})
+    )
+    db.run('delete from items')
+    fork.close()
+    const copy = await sync('copy.sqlite3')
+    expect(rows(copy, 'select count(*) from items')).toEqual([[300]])
+    expect(rows(other, 'select count(*) from items')).toEqual([[300]])
+  })
+
   test('stay readable after the stored database closes', async () => {
     const db = await sync()
     fill(db, 1000)
@@ -185,6 +221,19 @@ describe('Interrupted commits', () => {
     expect(rows(again, "select count(*) from items where body = 'lost'"))
       .toEqual([[0]])
     expect(rows(again, 'select count(*) from items')).toEqual([[100]])
+  })
+
+  test('are tried again when the database closes, and reported by flush', async () => {
+    const db = await sync()
+    fill(db, 10)
+    const file = fs.file('notes.sqlite3-journal')
+    file.failWrites = true
+    db.run('delete from items')
+    db.close()
+    await expect(db.flush()).rejects.toMatchObject({code: 'SQLITE_IOERR'})
+    file.failWrites = false
+    const again = await sync()
+    expect(rows(again, 'select count(*) from items')).toEqual([[10]])
   })
 
   test('are stored by flush once writing works again', async () => {
@@ -271,6 +320,20 @@ describe('One database per file', () => {
     expect([...fs.files.keys()]).toEqual([])
   })
 
+  test('keeps files of the same name in different file systems apart', async () => {
+    const other = new MemoryFileSystem()
+    const a = await sync()
+    const b = await Database.sync(fileStorage('notes.sqlite3', other))
+    open.push(b)
+    fill(a, 5)
+    fill(b, 7)
+    a.close()
+    fill(b, 1)
+    expect(rows(b, 'select count(*) from items')).toEqual([[8]])
+    expect(new Database(other.file('notes.sqlite3').bytes()).exec('select count(*) from items')[0].values)
+      .toEqual([[8]])
+  })
+
   test('keeps databases in different files apart', async () => {
     const a = await sync('a.sqlite3')
     const b = await sync('b.sqlite3')
@@ -355,6 +418,19 @@ describe('Detaching a database from its file', () => {
     await fileStorage('notes.sqlite3', fs).delete()
     expect(rows(fork, 'select count(*) from items')).toEqual([[1000]])
     expect(rows(db, 'select count(*) from items')).toEqual([[1000]])
+  })
+
+  test('stays attached when it cannot be read into memory', async () => {
+    const db = await sync()
+    fill(db, 1000)
+    const file = fs.file('notes.sqlite3')
+    file.failReads = true
+    expect(() => db.detach()).toThrow()
+    file.failReads = false
+    db.run('delete from items where id > 10')
+    db.close()
+    const again = await sync()
+    expect(rows(again, 'select count(*) from items')).toEqual([[10]])
   })
 
   test('reports when storing the last commits failed', async () => {

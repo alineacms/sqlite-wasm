@@ -15,7 +15,7 @@ export interface SQLite3Wasm extends EmscriptenModule {
   alinea_open_file: (file: string, db: number) => number
   alinea_flush: (db: number) => number
   alinea_attach_file: (db: number, file: string) => number
-  alinea_detach_file: (db: number) => number
+  alinea_detach_file: (db: number, writeError: number) => number
   alinea_load: (
     db: number,
     data: number,

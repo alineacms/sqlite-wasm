@@ -180,6 +180,8 @@ export class Statement implements StatementI {
       case ReturnCode.ROW:
         return true
       case ReturnCode.DONE:
+        // The statement may be prepared again before its next row.
+        this.columnNames = undefined
         return false
       default:
         this.db.handleError(ret)
