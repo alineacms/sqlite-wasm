@@ -198,14 +198,21 @@ export class Statement implements StatementI {
    * before it is executed
    */
   get(params?: BindParams): SqlValue[] {
-    if (typeof params !== 'undefined') {
-      this.bind(params)
-      this.step()
-    }
-    const results: SQLReturnType[] = []
-    const colSize = this.wasm._sqlite3_data_count(this.stmt)
-    for (let col = 0; col < colSize; col++) results.push(this.column(col))
-    return results
+    this.stepWith(params)
+    const count = this.wasm._sqlite3_data_count(this.stmt)
+    const row: SQLReturnType[] = new Array(count)
+    for (let col = 0; col < count; col++) row[col] = this.column(col)
+    return row
+  }
+
+  /**
+   * Bind params and step to the first row, when params are given.
+   * @internal
+   */
+  private stepWith(params: BindParams | undefined): void {
+    if (typeof params === 'undefined') return
+    this.bind(params)
+    this.step()
   }
 
   /**
@@ -223,7 +230,7 @@ export class Statement implements StatementI {
       case ReturnCode.TEXT: {
         // Ask for the text before its length, as SQLite documents
         const ptr = wasm._sqlite3_column_text(this.stmt, col)
-        return decodeUTF8(wasm.HEAPU8, ptr, wasm._sqlite3_column_bytes(this.stmt, col))
+        return decodeText(wasm.HEAPU8, ptr, wasm._sqlite3_column_bytes(this.stmt, col))
       }
       case ReturnCode.BLOB: {
         const ptr = wasm._sqlite3_column_blob(this.stmt, col)
@@ -257,22 +264,24 @@ export class Statement implements StatementI {
    * it will be executed
    */
   getAsObject(params?: BindParams): ParamsObject {
-    if (typeof params !== 'undefined') {
-      this.bind(params)
-      this.step()
-    }
-    // Names cannot change until the statement is reset: SQLite only
-    // prepares it again (after a schema change) when it starts over. They
-    // are only known once there is a row.
-    let names = this.columnNames
-    if (!names) {
-      names = this.getColumnNames()
-      if (names.length) this.columnNames = names
-    }
-    const rowObject: ReturnMap = {}
-    for (let col = 0; col < names.length; col++)
-      rowObject[names[col]] = this.column(col)
-    return rowObject
+    this.stepWith(params)
+    const names = this.cachedColumnNames()
+    const row: ReturnMap = {}
+    for (let col = 0; col < names.length; col++) row[names[col]] = this.column(col)
+    return row
+  }
+
+  /**
+   * The column names, decoded once per execution. They cannot change until
+   * the statement is reset: SQLite only prepares it again (after a schema
+   * change) when it starts over. They are only known once there is a row.
+   * @internal
+   */
+  private cachedColumnNames(): string[] {
+    if (this.columnNames) return this.columnNames
+    const names = this.getColumnNames()
+    if (names.length) this.columnNames = names
+    return names
   }
 
   /**
@@ -355,16 +364,14 @@ const decoder = new TextDecoder()
  * strings, the most common column values, are faster to build directly
  * than through TextDecoder.
  */
-function decodeUTF8(heap: Uint8Array, ptr: number, length: number): string {
+function decodeText(heap: Uint8Array, ptr: number, length: number): string {
   const end = ptr + length
-  if (length <= 32) {
-    let text = ''
-    for (let i = ptr; i < end; i++) {
-      const byte = heap[i]
-      if (byte > 0x7f) return decoder.decode(heap.subarray(ptr, end))
-      text += String.fromCharCode(byte)
-    }
-    return text
+  if (length > 32) return decoder.decode(heap.subarray(ptr, end))
+  let text = ''
+  for (let i = ptr; i < end; i++) {
+    const byte = heap[i]
+    if (byte > 0x7f) return decoder.decode(heap.subarray(ptr, end))
+    text += String.fromCharCode(byte)
   }
-  return decoder.decode(heap.subarray(ptr, end))
+  return text
 }
