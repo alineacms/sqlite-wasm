@@ -21,6 +21,7 @@
   "_sqlite3_errstr",
   "_sqlite3_txn_state",
   "_sqlite3_get_autocommit",
+  "_sqlite3_commit_hook",
   "_sqlite3_changes",
   "_sqlite3_prepare_v2",
   "_sqlite3_bind_text",

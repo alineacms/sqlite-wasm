@@ -69,6 +69,10 @@ export class Database {
   /** @internal */ private dbPtr!: Pointer
   /** @internal */ private functions!: Record<string, Pointer>
   /** @internal */ private commitListener?: Pointer
+  /** @internal */ private commitWatch?: {
+    pointer: Pointer
+    listeners: Set<() => void>
+  }
   /** @internal */ public persistence?: Persistence
   /** The file of the "js" VFS this database is stored in @internal */
   public file?: string
@@ -147,6 +151,33 @@ export class Database {
       this.wasm,
       this.wasm.alinea_open_base(encodeURIComponent(file), this.wasm.tempInt32)
     )
+  }
+
+  /**
+   * Call `listener` whenever a transaction commits, from inside the commit:
+   * it must not use the database (schedule work instead). Returns a
+   * function that stops calling it.
+   * @internal
+   */
+  watchCommits(listener: () => void): () => void {
+    if (!this.dbPtr) throw new Error('Database closed')
+    if (!this.commitWatch) {
+      const listeners = new Set<() => void>()
+      const pointer = this.wasm.addFunction(() => {
+        // An exception must not unwind through SQLite's commit.
+        for (const listen of listeners) {
+          try {
+            listen()
+          } catch {}
+        }
+        return 0
+      }, 'ii')
+      this.wasm.sqlite3_commit_hook(this.dbPtr, pointer, this.wasm.NULL)
+      this.commitWatch = {pointer, listeners}
+    }
+    const {listeners} = this.commitWatch
+    listeners.add(listener)
+    return () => listeners.delete(listener)
   }
 
   /** If the database was closed. @internal */
@@ -626,6 +657,11 @@ export class Database {
     }
     this.functions = {}
     this.stopCommits()
+    if (this.commitWatch) {
+      this.wasm.sqlite3_commit_hook(this.dbPtr, this.wasm.NULL, this.wasm.NULL)
+      this.wasm.removeFunction(this.commitWatch.pointer)
+      this.commitWatch = undefined
+    }
     this.persistence?.closing?.()
     try {
       this.handleError(this.wasm.sqlite3_close_v2(this.dbPtr))

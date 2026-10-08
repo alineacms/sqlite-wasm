@@ -474,6 +474,119 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
     })
 
+    describe('Automatic checkpoints', () => {
+      const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+      async function until(condition) {
+        for (let i = 0; i < 500; i++) {
+          if (await condition()) return
+          await wait(5)
+        }
+        throw new Error('timed out')
+      }
+      const keys = async () => (await storage().list()).map(base => base.key)
+
+      test('are off unless after or maxHeld is given', async () => {
+        const db = await openDb({checkpoint: {}})
+        fill(db, 100)
+        await wait(50)
+        expect(await keys()).toEqual([])
+      })
+
+      test('wait for commits to stop, after', async () => {
+        let n = 0
+        const db = await openDb({
+          group: 'g',
+          checkpoint: {after: 40, key: () => `v${++n}`, meta: db => ({rows: rows(db, 'select count(*) from items')[0][0]})}
+        })
+        for (let i = 0; i < 5; i++) {
+          fill(db, 10, 100, i * 10)
+          await wait(10)
+        }
+        expect(await keys()).toEqual([])
+        await until(async () => (await keys()).length === 1)
+        await wait(60)
+        const [base] = await storage().list()
+        expect(base).toMatchObject({key: 'v1', group: 'g', meta: {rows: 50}})
+        expect(baseOf(db).key).toBe('v1')
+        expect(held(db)).toBe(0)
+      })
+
+      test('bound the pages held, with maxHeld', async () => {
+        const reference = keep(new Database())
+        const db = await openDb({checkpoint: {maxHeld: 256 << 10}})
+        for (let i = 0; i < 20; i++) {
+          both(db, reference, db => fill(db, 100, 500, i * 100))
+          await tick()
+          await tick()
+        }
+        await until(async () => (await keys()).length > 1)
+        // Let the last checkpoint finish.
+        await wait(50)
+        const bases = await keys()
+        // Each with a key of its own
+        expect(new Set(bases).size).toBe(bases.length)
+        // Pages of 4 KB: below the limit plus one more commit
+        expect(held(db) * 4096).toBeLessThan(512 << 10)
+        expect(db.export()).toEqual(reference.export())
+      })
+
+      test('skip a checkpoint when key returns undefined', async () => {
+        let ready = false
+        const db = await openDb({checkpoint: {after: 10, key: () => (ready ? 'ready' : undefined)}})
+        fill(db, 10)
+        await wait(40)
+        expect(await keys()).toEqual([])
+        ready = true
+        db.run("insert into items (body) values ('more')")
+        await until(async () => (await keys()).length === 1)
+        expect(await keys()).toEqual(['ready'])
+      })
+
+      test('never start inside a transaction', async () => {
+        const db = await openDb({checkpoint: {after: 10}})
+        fill(db, 10)
+        db.run('begin')
+        await wait(1)
+        db.run('delete from items')
+        await wait(40)
+        // The wait ended inside the transaction: nothing was written.
+        expect(await keys()).toEqual([])
+        db.run('commit')
+        await until(async () => (await keys()).length === 1)
+        expect(rows(await openDb((await keys())[0]), 'select count(*) from items')).toEqual([[0]])
+      })
+
+      test('stop when the database closes, or when asked', async () => {
+        const db = await openDb({checkpoint: {after: 10}})
+        fill(db, 10)
+        db.close()
+        await wait(40)
+        expect(await keys()).toEqual([])
+        const other = await openDb()
+        const stop = storage().autoCheckpoint(other, {after: 10})
+        fill(other, 10)
+        stop()
+        await wait(40)
+        expect(await keys()).toEqual([])
+      })
+
+      test('report errors', async () => {
+        const errors = []
+        const db = await openDb({
+          checkpoint: {
+            after: 5,
+            key: () => {
+              throw new Error('no key')
+            },
+            onError: error => errors.push(error.message)
+          }
+        })
+        fill(db, 10)
+        await until(() => errors.length > 0)
+        expect(errors).toEqual(['no key'])
+      })
+    })
+
     describe('Forks', () => {
       test('keep reading their base after the database closes and moves on', async () => {
         const db = await openDb()

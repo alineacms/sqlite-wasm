@@ -17,11 +17,13 @@ db.close()
 
 The build includes SQLite JSON functions, FTS5, views, triggers, window
 functions, temporary tables, `VACUUM`, and `ATTACH` for additional in-memory
-databases. Databases live in memory;
-use `db.export()` and `new Database(bytes)` to persist and restore their file
-representation, [sync them with IndexedDB](#indexeddb-storage),
-[store them in OPFS](#opfs-storage) without keeping them in memory, or open
-them in many Workers at once on [snapshots in OPFS](#snapshot-storage).
+databases. Databases live in memory. In browsers,
+[snapshot storage](#snapshot-storage) lets any number of Workers open the
+same stored database at once without loading it into memory; where every
+commit must be stored and one Worker owns the database,
+[sync it with IndexedDB](#indexeddb-storage) or
+[store it in OPFS](#opfs-storage). `db.export()` and `new Database(bytes)`
+save and restore the file itself.
 
 Databases are stored copy-on-write, so `db.fork()` creates an independent copy
 without duplicating any data. The fork shares every page with its source and
@@ -40,158 +42,6 @@ draft.close()
 This is deliberately a size-oriented SQLite build. Date/time functions,
 `EXPLAIN`, `ALTER TABLE`, and `ANALYZE` are omitted. The complete compile-time
 option list is kept in the `SQLITE_OMIT_FLAGS` variable in the Makefile.
-
-## IndexedDB storage
-
-In browsers and workers, `Database.sync` loads a database from IndexedDB,
-or starts an empty one, and keeps storing its commits there:
-
-```ts
-import {init} from '@alinea/sqlite-wasm'
-import {indexedDBStorage} from '@alinea/sqlite-wasm/indexeddb'
-
-const {Database} = await init()
-const storage = indexedDBStorage('notes')
-const db = await Database.sync(storage)
-db.run('create table if not exists notes (text)')
-db.run('insert into notes values (?)', ['stored'])
-await db.flush()
-```
-
-- The whole database is loaded into memory, and queries run synchronously as
-  usual. After every commit, the pages it changed are written to IndexedDB
-  in the background.
-- Each IndexedDB transaction holds one or more whole commits, so the stored
-  database is always a committed state. Commits that were not written yet
-  are lost if the page closes or crashes.
-- `await db.flush()` resolves once every commit so far is stored and rejects
-  if writing failed (for example, over quota); failed writes are retried with
-  the next commit or flush. `db.flush()` resolves right away for in-memory
-  databases.
-- `db.close()` still writes the remaining commits, and storing a database
-  under the same name again waits for them. After closing,
-  `await storage.delete()` removes the stored database.
-- One database at a time is stored under a name: syncing, attaching or
-  deleting a name that is in use fails with `SQLITE_BUSY`. Store a database
-  in one place at a time, for example in a SharedWorker; nothing coordinates
-  writes between tabs or workers that use the same name.
-- `db.fork()` creates an in-memory copy, which is not stored unless you
-  attach it, and `db.export()` returns the file as usual.
-
-### Attaching and detaching
-
-`await db.attach(storage)` stores a database that is in memory already, such
-as a fork, without loading anything. Its committed state when storing starts
-replaces whatever the storage held, and every later commit is stored, as
-with `Database.sync`. `db.detach()` stops storing a database and keeps it in
-memory. Together they hand a database over to new storage without waiting
-for the old one:
-
-```ts
-const next = db.fork()
-await next.attach(indexedDBStorage('notes-v2'))
-db.detach()
-await next.flush() // the replacement is stored
-```
-
-- The replacement is written in a single IndexedDB transaction that deletes
-  the stored pages, then writes every page and the file size. IndexedDB
-  applies a transaction entirely or not at all, so until it completes the
-  storage keeps its previous database, and a crash or a closed page never
-  leaves a mix of both. If it fails, it is retried with the next commit or
-  flush.
-- The whole database is copied out of the Wasm heap for that transaction.
-- `attach` fails during a write transaction, and for a database that is
-  stored already; detach it first.
-- After `db.detach()`, the commits made so far are still written, and
-  `db.flush()` waits for them and rejects if that failed. Later commits are
-  not stored or kept for storing, and `db.close()` writes nothing. Storing a
-  database under the same name again waits for the final write, as after
-  `close()`.
-
-### Errors
-
-Errors from SQLite, and from storing a database, are `SQLiteError`s
-(exported by `@alinea/sqlite-wasm`) with the name of the result code in
-`error.code`, such as `'SQLITE_CONSTRAINT'` or `'SQLITE_BUSY'`, and its
-number in `error.resultCode`. Check `code` rather than the class, which
-differs between two copies of this package. Errors from IndexedDB itself,
-such as a `QuotaExceededError`, are passed on as they are.
-
-`Database.sync` rejects with `code` `'SQLITE_CORRUPT'` if the stored data is
-not a valid database: an invalid size record, header or page size, fewer
-pages than the header lists, or a schema that cannot be read. Delete it to
-start over:
-
-```ts
-const storage = indexedDBStorage('notes')
-const db = await Database.sync(storage).catch(async error => {
-  if (error.code !== 'SQLITE_CORRUPT') throw error
-  await storage.delete()
-  return Database.sync(storage)
-})
-```
-
-These checks cover the header and the schema, not every page: damage
-elsewhere surfaces when a query reads it. `PRAGMA integrity_check` is left
-out of this build.
-
-### Other IndexedDB implementations
-
-`indexedDBStorage(name, {indexedDB, IDBKeyRange})` uses the given
-implementation instead of the globals, for example fake-indexeddb in tests:
-
-```ts
-import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
-
-const storage = indexedDBStorage('notes', {indexedDB: new IDBFactory(), IDBKeyRange})
-```
-
-## OPFS storage
-
-In a dedicated Worker, `Database.sync` can also keep a database in a file of
-the origin private file system (OPFS). Unlike IndexedDB storage, the database
-is not loaded into memory: pages are read from the file as queries need them.
-
-```ts
-import {init} from '@alinea/sqlite-wasm'
-import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
-
-const {Database} = await init()
-const db = await Database.sync(opfsStorage('notes.sqlite3'))
-db.run('create table if not exists notes (text)')
-db.run('insert into notes values (?)', ['stored'])
-```
-
-- Only SQLite's page cache and the pages of the open transaction are held
-  in memory, so a database can be larger than the memory available to it.
-- Every commit is stored when it returns: it is appended to a journal next
-  to the file (`notes.sqlite3-journal`) and synced there, and written to
-  the file itself. The file is synced, and the journal started over, every
-  few megabytes and when the database closes. Opening the database replays
-  the journal after a crash, so it always holds the last commit. `await
-  db.flush()` stores commits that failed to write, and rejects if that
-  fails again.
-- OPFS files can only be opened this way in a dedicated Worker, by one
-  Worker at a time: syncing a database that another Worker or tab holds
-  fails with `SQLITE_BUSY`. Have one Worker own the database and the other
-  tabs send it their queries, or use [snapshot storage](#snapshot-storage).
-  No cross-origin isolation headers are needed.
-- `db.fork()` creates an in-memory snapshot, as for any database. It keeps
-  its content when the stored database changes or closes, copying the pages
-  it still read from the file first.
-- `await db.attach(opfsStorage(name))` stores a database that is in memory:
-  its committed state replaces what the file held, written as one commit,
-  and from then on it is no longer kept in memory. `db.detach()` stores the
-  last commits, reads every page into memory and closes the file; `await
-  db.flush()` rejects if storing those commits failed. Neither works during
-  a write transaction (`SQLITE_BUSY`).
-- `await storage.delete()` removes the file and its journal once the
-  database is closed or detached.
-
-`opfsStorage(name, {directory})` keeps the files in a directory of OPFS
-instead of its root. `fileStorage(name, fileSystem)` uses any other
-`FileSystem` that opens files for synchronous access.
 
 ## Snapshot storage
 
@@ -268,6 +118,41 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
 - `checkpoint` fails during a write transaction (`SQLITE_BUSY`), and for a
   database stored elsewhere (`SQLITE_MISUSE`).
 
+### Automatic checkpoints
+
+Checkpoints are written when you call `checkpoint`, or, if you ask for it,
+by the database itself:
+
+```ts
+const db = await storage.open(Database, {
+  group: configHash,
+  checkpoint: {
+    maxHeld: 32 << 20, // once 32 MB of changed pages are held
+    after: 5000, // 5 seconds after the last commit
+    key: db => contentKey(db), // or undefined to skip this checkpoint
+    meta: db => ({tree: treeOf(db)})
+  }
+})
+```
+
+- `maxHeld` checkpoints as soon as the database holds that many bytes of
+  changed pages: a large import or reindex no longer holds the whole
+  database in memory. `after` checkpoints once commits stop for that many
+  milliseconds; each commit restarts the wait. Neither is on by default.
+- A checkpoint never starts inside a transaction (the commit that ends it
+  counts), and one runs at a time.
+- `key` names each base. Key bases by content where you can, so Workers
+  that reach the same content share one base; return `undefined` while the
+  database is between consistent states, such as halfway through a sync of
+  several transactions. Without `key`, every checkpoint gets a key of its
+  own.
+- `storage.autoCheckpoint(db, options)` does the same for a database you
+  already have, and returns a function that stops it; it also stops when
+  the database closes. Errors go to `onError` (default: `reportError`).
+- Checkpoints are not free (see [BENCHMARKS.md](BENCHMARKS.md), notably
+  IndexedDB in WebKit), so keep `after` at seconds rather than
+  milliseconds.
+
 ### Bases in IndexedDB
 
 `indexedDBSnapshotStorage(name)` keeps each base as a record of IndexedDB
@@ -307,6 +192,166 @@ Workers; `storage.supported()` tells if the APIs they need are there.
 `readOnlyFile(blobOrBytes)` reads a `File`, `Blob` or `Uint8Array` as a
 read-only `SyncFile`, and `new SnapshotStorage(store)` takes any other
 `BaseStore`.
+
+## Storing every commit
+
+Snapshot storage keeps changes in memory until a checkpoint. When every
+commit must be stored when it returns, and one Worker can own the database,
+use IndexedDB storage, which keeps the database in memory and writes each
+commit to IndexedDB, or OPFS storage, which keeps it in a file and reads
+pages as needed.
+
+### IndexedDB storage
+
+In browsers and workers, `Database.sync` loads a database from IndexedDB,
+or starts an empty one, and keeps storing its commits there:
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {indexedDBStorage} from '@alinea/sqlite-wasm/indexeddb'
+
+const {Database} = await init()
+const storage = indexedDBStorage('notes')
+const db = await Database.sync(storage)
+db.run('create table if not exists notes (text)')
+db.run('insert into notes values (?)', ['stored'])
+await db.flush()
+```
+
+- The whole database is loaded into memory, and queries run synchronously as
+  usual. After every commit, the pages it changed are written to IndexedDB
+  in the background.
+- Each IndexedDB transaction holds one or more whole commits, so the stored
+  database is always a committed state. Commits that were not written yet
+  are lost if the page closes or crashes.
+- `await db.flush()` resolves once every commit so far is stored and rejects
+  if writing failed (for example, over quota); failed writes are retried with
+  the next commit or flush. `db.flush()` resolves right away for in-memory
+  databases.
+- `db.close()` still writes the remaining commits, and storing a database
+  under the same name again waits for them. After closing,
+  `await storage.delete()` removes the stored database.
+- One database at a time is stored under a name: syncing, attaching or
+  deleting a name that is in use fails with `SQLITE_BUSY`. Store a database
+  in one place at a time, for example in a SharedWorker; nothing coordinates
+  writes between tabs or workers that use the same name.
+- `db.fork()` creates an in-memory copy, which is not stored unless you
+  attach it, and `db.export()` returns the file as usual.
+
+#### Attaching and detaching
+
+`await db.attach(storage)` stores a database that is in memory already, such
+as a fork, without loading anything. Its committed state when storing starts
+replaces whatever the storage held, and every later commit is stored, as
+with `Database.sync`. `db.detach()` stops storing a database and keeps it in
+memory. Together they hand a database over to new storage without waiting
+for the old one:
+
+```ts
+const next = db.fork()
+await next.attach(indexedDBStorage('notes-v2'))
+db.detach()
+await next.flush() // the replacement is stored
+```
+
+- The replacement is written in a single IndexedDB transaction that deletes
+  the stored pages, then writes every page and the file size. IndexedDB
+  applies a transaction entirely or not at all, so until it completes the
+  storage keeps its previous database, and a crash or a closed page never
+  leaves a mix of both. If it fails, it is retried with the next commit or
+  flush.
+- The whole database is copied out of the Wasm heap for that transaction.
+- `attach` fails during a write transaction, and for a database that is
+  stored already; detach it first.
+- After `db.detach()`, the commits made so far are still written, and
+  `db.flush()` waits for them and rejects if that failed. Later commits are
+  not stored or kept for storing, and `db.close()` writes nothing. Storing a
+  database under the same name again waits for the final write, as after
+  `close()`.
+
+#### Errors
+
+Errors from SQLite, and from storing a database, are `SQLiteError`s
+(exported by `@alinea/sqlite-wasm`) with the name of the result code in
+`error.code`, such as `'SQLITE_CONSTRAINT'` or `'SQLITE_BUSY'`, and its
+number in `error.resultCode`. Check `code` rather than the class, which
+differs between two copies of this package. Errors from IndexedDB itself,
+such as a `QuotaExceededError`, are passed on as they are.
+
+`Database.sync` rejects with `code` `'SQLITE_CORRUPT'` if the stored data is
+not a valid database: an invalid size record, header or page size, fewer
+pages than the header lists, or a schema that cannot be read. Delete it to
+start over:
+
+```ts
+const storage = indexedDBStorage('notes')
+const db = await Database.sync(storage).catch(async error => {
+  if (error.code !== 'SQLITE_CORRUPT') throw error
+  await storage.delete()
+  return Database.sync(storage)
+})
+```
+
+These checks cover the header and the schema, not every page: damage
+elsewhere surfaces when a query reads it. `PRAGMA integrity_check` is left
+out of this build.
+
+#### Other IndexedDB implementations
+
+`indexedDBStorage(name, {indexedDB, IDBKeyRange})` uses the given
+implementation instead of the globals, for example fake-indexeddb in tests:
+
+```ts
+import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
+
+const storage = indexedDBStorage('notes', {indexedDB: new IDBFactory(), IDBKeyRange})
+```
+
+### OPFS storage
+
+In a dedicated Worker, `Database.sync` can also keep a database in a file of
+the origin private file system (OPFS). Unlike IndexedDB storage, the database
+is not loaded into memory: pages are read from the file as queries need them.
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
+
+const {Database} = await init()
+const db = await Database.sync(opfsStorage('notes.sqlite3'))
+db.run('create table if not exists notes (text)')
+db.run('insert into notes values (?)', ['stored'])
+```
+
+- Only SQLite's page cache and the pages of the open transaction are held
+  in memory, so a database can be larger than the memory available to it.
+- Every commit is stored when it returns: it is appended to a journal next
+  to the file (`notes.sqlite3-journal`) and synced there, and written to
+  the file itself. The file is synced, and the journal started over, every
+  few megabytes and when the database closes. Opening the database replays
+  the journal after a crash, so it always holds the last commit. `await
+  db.flush()` stores commits that failed to write, and rejects if that
+  fails again.
+- OPFS files can only be opened this way in a dedicated Worker, by one
+  Worker at a time: syncing a database that another Worker or tab holds
+  fails with `SQLITE_BUSY`. Have one Worker own the database and the other
+  tabs send it their queries, or use [snapshot storage](#snapshot-storage).
+  No cross-origin isolation headers are needed.
+- `db.fork()` creates an in-memory snapshot, as for any database. It keeps
+  its content when the stored database changes or closes, copying the pages
+  it still read from the file first.
+- `await db.attach(opfsStorage(name))` stores a database that is in memory:
+  its committed state replaces what the file held, written as one commit,
+  and from then on it is no longer kept in memory. `db.detach()` stores the
+  last commits, reads every page into memory and closes the file; `await
+  db.flush()` rejects if storing those commits failed. Neither works during
+  a write transaction (`SQLITE_BUSY`).
+- `await storage.delete()` removes the file and its journal once the
+  database is closed or detached.
+
+`opfsStorage(name, {directory})` keeps the files in a directory of OPFS
+instead of its root. `fileStorage(name, fileSystem)` uses any other
+`FileSystem` that opens files for synchronous access.
 
 ## Native extension
 

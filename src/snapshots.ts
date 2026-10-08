@@ -742,10 +742,37 @@ export function baseOf(db: Database): BaseInfo | undefined {
 /**
  * Which base to open: by key, or the newest of a group, or of all. With
  * `fallback: 'any'`, a group without bases opens the newest base of any.
+ * With `checkpoint`, the database checkpoints by itself, see
+ * `autoCheckpoint`; its group defaults to `group`.
  */
 export type OpenOptions =
   | string
-  | {key?: string; group?: string; fallback?: 'any'}
+  | {
+      key?: string
+      group?: string
+      fallback?: 'any'
+      checkpoint?: AutoCheckpointOptions
+    }
+
+/** When and how a database checkpoints by itself, see `autoCheckpoint`. */
+export interface AutoCheckpointOptions {
+  /** Checkpoint this many milliseconds after the last commit */
+  after?: number
+  /** Checkpoint once the database holds this many bytes of changed pages */
+  maxHeld?: number
+  /**
+   * The key of the new base, or `undefined` to skip this checkpoint, for
+   * example while the database is between two consistent states. Default:
+   * a key of its own for every checkpoint. Keys by content let Workers
+   * that reach the same content share one base.
+   */
+  key?: (db: Database) => string | undefined
+  /** Default: the group of the base the database reads */
+  group?: string
+  meta?: (db: Database) => BaseMeta
+  /** Called with the errors of checkpoints (default: `reportError`) */
+  onError?: (error: unknown) => void
+}
 
 export interface CleanupOptions {
   /** How many groups keep a base, the ones with the newest (default: all) */
@@ -893,15 +920,20 @@ export class SnapshotStorage {
     Database: new () => T,
     which: OpenOptions = {}
   ): Promise<T> {
-    const {key, group, fallback} = typeof which === 'string' ? {key: which} : which
+    const {key, group, fallback, checkpoint} =
+      typeof which === 'string' ? {key: which, checkpoint: undefined} : which
     const newest = async () =>
       (await this.newest(group)) ??
       (fallback === 'any' && group !== undefined ? await this.newest() : undefined)
+    const auto = <D extends Database>(db: D) => {
+      if (checkpoint) this.autoCheckpoint(db, {group, ...checkpoint})
+      return db
+    }
     for (let attempt = 0; ; attempt++) {
       const base = key ?? (await newest())?.key
-      if (base === undefined) return new Database()
+      if (base === undefined) return auto(new Database())
       try {
-        return await this.openBase(Database, base)
+        return auto(await this.openBase(Database, base))
       } catch (error) {
         // The newest base was deleted after it was found: a newer one
         // replaced it.
@@ -1017,6 +1049,94 @@ export class SnapshotStorage {
       })
     state.queue = next
     return next
+  }
+
+  /**
+   * Checkpoint `db` by itself from now on: `after` milliseconds after the
+   * last commit (each commit restarts the wait), and/or as soon as it holds
+   * `maxHeld` bytes of changed pages, which bounds the memory a large
+   * import or reindex holds. Off unless one of them is given. A checkpoint
+   * never starts inside a transaction (the commit that ends it counts),
+   * and one runs at a time. `key` names each base, or skips a checkpoint by
+   * returning `undefined`. Stops when the database closes, or when the
+   * returned function is called.
+   */
+  autoCheckpoint(db: Database, options: AutoCheckpointOptions): () => void {
+    const {after, maxHeld} = options
+    const report =
+      options.onError ??
+      ((error: unknown) =>
+        typeof reportError === 'function'
+          ? reportError(error)
+          : console.error(error))
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let checking = false
+    let running = false
+    let again = false
+    const active = () => {
+      if (stopped || db.isClosed()) stop()
+      return !stopped
+    }
+    const run = () => {
+      clearTimeout(timer)
+      timer = undefined
+      if (!active()) return
+      if (running) {
+        again = true
+        return
+      }
+      if (db.inTransaction()) return
+      let key: string | undefined
+      let meta: BaseMeta | undefined
+      try {
+        key = options.key ? options.key(db) : autoKey()
+        if (key === undefined) return
+        meta = options.meta?.(db)
+      } catch (error) {
+        report(error)
+        return
+      }
+      running = true
+      this.checkpoint(db, key, {group: options.group, meta})
+        .catch(report)
+        .finally(() => {
+          running = false
+          if (again) {
+            again = false
+            run()
+          }
+        })
+    }
+    const held = () => {
+      const [[pages]] = db.exec('pragma overlay_pages')[0].values
+      const [[pageSize]] = db.exec('pragma page_size')[0].values
+      return Number(pages) * Number(pageSize)
+    }
+    // Called inside each commit: only schedule.
+    const committed = () => {
+      if (after !== undefined) {
+        clearTimeout(timer)
+        timer = setTimeout(run, after)
+      }
+      if (maxHeld !== undefined && !checking) {
+        checking = true
+        setTimeout(() => {
+          checking = false
+          if (active() && !db.inTransaction() && held() >= maxHeld) run()
+        }, 0)
+      }
+    }
+    const unwatch =
+      after === undefined && maxHeld === undefined
+        ? () => {}
+        : db.watchCommits(committed)
+    const stop = () => {
+      stopped = true
+      clearTimeout(timer)
+      unwatch()
+    }
+    return stop
   }
 
   /**
@@ -1160,6 +1280,11 @@ export class SnapshotStorage {
     }
     return deleted
   }
+}
+
+/** A key no other checkpoint uses */
+function autoKey() {
+  return `auto-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
 function once(action: () => void) {
