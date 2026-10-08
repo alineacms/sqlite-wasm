@@ -79,13 +79,28 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
 - There is no writable shared data: snapshots are never changed once
   written, so two Workers can never corrupt each other's data. No journal or
   WAL is written; nothing is loaded into memory up front.
-- A branch is a line of snapshots; the newest is its head. `storage.open(
-  Database)` opens the head of all branches, `{branch}` the head of a
-  branch, and `{key}` a given snapshot. With `{branch, fallback:
-  'any-branch'}`, a branch without snapshots opens the head of all. Without
-  a snapshot to open, the database starts empty. Opening a missing snapshot
-  fails with `SQLITE_CANTOPEN`, one that is not a database with
-  `SQLITE_CORRUPT`.
+- A branch is a line of snapshots; the newest is its head. A session saves
+  to one branch: `storage.open(Database, {branch})` opens its head, and
+  without `branch`, the head of all snapshots and its branch. `choose`
+  picks another snapshot to start from, out of the readable ones, newest
+  first, such as the newest of any branch when this one has none (the
+  session still saves to `branch`):
+
+  ```ts
+  const session = await storage.open(Database, {
+    branch: configHash,
+    choose: snapshots =>
+      snapshots.find(s => s.branch === configHash) ?? snapshots[0]
+  })
+  if (session.snapshot && session.snapshot.branch !== configHash)
+    reindex(session.db) // content of another config
+  ```
+
+  A snapshot that turns out unreadable (deleted meanwhile, or lying over a
+  missing one) is left out and `choose` asked again. Without a snapshot to
+  open, the database starts empty. `{key}` opens a given snapshot, and
+  fails with `SQLITE_CANTOPEN` if it cannot be read; a snapshot that is not
+  a database fails with `SQLITE_CORRUPT`.
 - The session has the database as `session.db`, the snapshot it reads (after
   a save, the one it wrote or joined) as `session.snapshot`, the branch it
   saves to as `session.branch`, and the bytes of changed pages it holds in
@@ -96,14 +111,13 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
 - Changes are kept in memory until a save: commits since the last one are
   lost when the session closes or its Worker ends. `await session.close()`
   closes it, and `close({save: {key}})` saves first.
-- `await session.save({key, branch, meta})` writes snapshot `key` (by
+- `await session.save({key, meta})` writes snapshot `key` (by
   default a key of its own): the snapshot the database reads with the pages
   it holds written over it. Then the database reads the new snapshot and
   drops those pages from memory; changes made meanwhile stay. The database
   keeps working: the save captures the committed state when it is called,
-  and saves of a session run one at a time. `branch` defaults to the
-  session's, and becomes it; `meta` is any data that survives structured
-  cloning.
+  and saves of a session run one at a time, to its branch. `meta` is any
+  data that survives structured cloning.
 - A save writes only the pages that changed, as a delta over the snapshot
   the database reads (`parent` in its info), while that keeps at most 8
   deltas on a full snapshot, the new pages are at most half the database,
@@ -130,8 +144,8 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   storage did not open, such as one loaded from bytes: its first save
   writes all of it.
 - `await storage.retain()` deletes every snapshot that is not the head of
-  its branch, or one a kept snapshot lies over, and resolves to their keys. `retain({perBranch: n})` keeps the
-  newest `n` of each branch, `retain({branches: n})` deletes every snapshot
+  its branch, or one a kept snapshot lies over, and resolves to their
+  keys. `retain({perBranch: n})` keeps the newest `n` of each branch, `retain({branches: n})` deletes every snapshot
   of all but the `n` branches with the newest heads (with OPFS and no Web
   Locks, also ones Workers still read), and `retain({pinned: keys})` never
   deletes those keys.

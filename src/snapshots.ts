@@ -1142,14 +1142,19 @@ function layerContent(layer: Layer): BaseSource {
 /** Which snapshot to open, and how the session saves. */
 export interface OpenOptions {
   /**
-   * Open the head (newest snapshot) of this branch, and save to it.
-   * Default: the head of all branches, and its branch.
+   * The branch the session saves to. Default: the branch of the snapshot
+   * it opens, or `''`.
    */
   branch?: string
-  /** Open this snapshot instead of a head */
+  /**
+   * The snapshot to open, out of the readable ones, newest first, or
+   * undefined to start empty. Default: the head (newest) of `branch`, or
+   * of all without one. Called again without a snapshot that turns out
+   * unreadable (deleted meanwhile, or lying over a missing one).
+   */
+  choose?: (snapshots: Array<SnapshotInfo>) => SnapshotInfo | undefined
+  /** Open this snapshot, and fail if it cannot be read */
   key?: string
-  /** With `branch`: if it has no snapshots, open the head of all branches */
-  fallback?: 'any-branch'
   /** Save by itself, see `AutoSaveOptions` */
   autoSave?: AutoSaveOptions
 }
@@ -1192,8 +1197,6 @@ export interface SaveOptions {
    * can: a key that exists is not written again, see `SaveResult`.
    */
   key?: string
-  /** Default: the session's branch, which becomes this one */
-  branch?: string
   meta?: SnapshotMeta
 }
 
@@ -1438,48 +1441,64 @@ export class SnapshotStorage {
   }
 
   /**
-   * Open a session on snapshot `key`, or on the head of `branch` (of all
-   * branches if it has none and `fallback` is `'any-branch'`), or on the
-   * head of all; `session.snapshot` tells which. Pages are read from the
-   * snapshot as queries need them, and every change is kept in memory:
-   * `session.save()` writes them to a new snapshot, and they are lost when
-   * the session closes without saving or the Worker ends. SQLite keeps up
-   * to 8 MB of the pages it read in its page cache (`PRAGMA cache_size`,
-   * also for forks). Without a snapshot to open, the database starts empty.
-   * Rejects with `SQLITE_CANTOPEN` if snapshot `key` does not exist, and
-   * with `SQLITE_CORRUPT` if it is not a database.
+   * Open a session on a snapshot: by default the head (newest) of
+   * `branch`, or of all snapshots without one; `choose` picks another, and
+   * `key` a given one. `session.snapshot` tells which. Pages are read from
+   * the snapshot as queries need them, and every change is kept in memory:
+   * `session.save()` writes them to a new snapshot on the session's branch,
+   * and they are lost when the session closes without saving or the Worker
+   * ends. SQLite keeps up to 8 MB of the pages it read in its page cache
+   * (`PRAGMA cache_size`, also for forks). Without a snapshot to open, or
+   * when none opens, the database starts empty. With `key`, rejects with
+   * `SQLITE_CANTOPEN` if it cannot be read; any snapshot that is not a
+   * database rejects with `SQLITE_CORRUPT`.
+   *
+   * ```ts
+   * // The head of this config's branch, else the newest of any config
+   * const session = await storage.open(Database, {
+   *   branch: config,
+   *   choose: snapshots =>
+   *     snapshots.find(s => s.branch === config) ?? snapshots[0]
+   * })
+   * ```
    */
   async open<T extends Database>(
     Database: new () => T,
     options: OpenOptions = {}
   ): Promise<Session<T>> {
-    const {key, branch, fallback, autoSave} = options
-    if (key !== undefined)
-      return this.session(await this.openSnapshot(Database, key), {branch, autoSave})
-    const scopes = fallback === 'any-branch' && branch !== undefined ? [branch, undefined] : [branch]
-    const tried = new Set<string>()
-    for (const scope of scopes) {
-      const head = await this.head(scope)
-      const order = head ? [head.key] : []
-      let listed = false
-      for (let i = 0; i < order.length; i++) {
-        if (tried.has(order[i])) continue
-        tried.add(order[i])
-        try {
-          return this.session(await this.openSnapshot(Database, order[i]), {branch, autoSave})
-        } catch (error) {
-          // Deleted after it was found, or a snapshot it lies over was: try
-          // the newer ones that replaced it, then the older ones.
-          if ((error as SQLiteError)?.resultCode !== SQLITE_CANTOPEN) throw error
-          if (!listed) {
-            listed = true
-            for (const snapshot of await this.list({branch: scope}))
-              if (snapshot.size > 0) order.push(snapshot.key)
-          }
-        }
+    const {key, branch, choose, autoSave} = options
+    const session = (db: T) => this.session(db, {branch, autoSave})
+    if (key !== undefined) return session(await this.openSnapshot(Database, key))
+    const unreadable = new Set<string>()
+    const attempt = async (chosen: SnapshotInfo) => {
+      try {
+        return await this.openSnapshot(Database, chosen.key)
+      } catch (error) {
+        // Deleted after it was listed, or a snapshot it lies over was
+        if ((error as SQLiteError)?.resultCode !== SQLITE_CANTOPEN) throw error
+        unreadable.add(chosen.key)
+        return undefined
       }
     }
-    return this.session(new Database(), {branch, autoSave})
+    // The head is found without listing every snapshot.
+    if (!choose) {
+      const head = await this.head(branch)
+      if (!head) return session(new Database())
+      const db = await attempt(head)
+      if (db) return session(db)
+    }
+    const pick =
+      choose ??
+      ((snapshots: Array<SnapshotInfo>) =>
+        branch === undefined ? snapshots[0] : snapshots.find(s => s.branch === branch))
+    for (;;) {
+      const readable = (await this.list()).filter(s => s.size > 0 && !unreadable.has(s.key))
+      const chosen = pick(readable)
+      if (!chosen) return session(new Database())
+      if (unreadable.has(chosen.key)) return session(new Database())
+      const db = await attempt(chosen)
+      if (db) return session(db)
+    }
   }
 
   /**
@@ -1730,7 +1749,7 @@ export class Session<D extends Database = Database> {
     if (options.autoSave) this.#stopAutoSave = this.#autoSave(options.autoSave)
   }
 
-  /** The branch saves go to, unless they name another */
+  /** The branch saves go to */
   get branch(): string {
     return this.#branch
   }
@@ -1768,7 +1787,6 @@ export class Session<D extends Database = Database> {
         new SQLiteError((error as Error).message, SQLITE_BUSY, {cause: error})
       )
     }
-    if (options.branch !== undefined) this.#branch = options.branch
     const target = {
       key: options.key ?? uniqueKey(),
       branch: this.#branch,
