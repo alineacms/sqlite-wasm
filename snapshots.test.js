@@ -108,8 +108,11 @@ const variants = {
       return {
         directory,
         locks,
-        storage: (options = {locks}) =>
-          new SnapshotStorage(directorySnapshotStore('entries', directory), options)
+        storage: (options = {}) =>
+          new SnapshotStorage(directorySnapshotStore('entries', directory), {
+            locks,
+            ...options
+          })
       }
     }
   },
@@ -118,8 +121,8 @@ const variants = {
     setup() {
       const indexedDB = new IDBFactory()
       return {
-        storage: () =>
-          indexedDBSnapshots('entries', {indexedDB, IDBKeyRange})
+        storage: (options = {}) =>
+          indexedDBSnapshots('entries', {indexedDB, IDBKeyRange, ...options})
       }
     }
   },
@@ -127,7 +130,7 @@ const variants = {
     locking: false,
     setup() {
       const store = memorySnapshotStore()
-      return {storage: () => memorySnapshots(store)}
+      return {storage: options => memorySnapshots(store, options)}
     }
   }
 }
@@ -137,10 +140,20 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
     let storage
     let env
 
+    // Storage options of the current test, see fullSnapshots
+    let defaults
+
     beforeEach(() => {
       env = setup()
-      storage = env.storage
+      defaults = {}
+      storage = (options = {}) => env.storage({...defaults, ...options})
     })
+
+    // Write every snapshot in full in this test, which is about rules that
+    // deltas add to (snapshots keep those they lie over)
+    function fullSnapshots() {
+      defaults = {maxDepth: 0}
+    }
 
     async function openDb(which) {
       const options = typeof which === 'string' ? {key: which} : which
@@ -164,8 +177,14 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
     }
 
+    // The database snapshot `key` holds, as stored, also for a delta
     async function content(key) {
-      return bytes((await storage().store.get(key)).source)
+      const session = await storage().open(Database, {key})
+      try {
+        return session.db.export()
+      } finally {
+        await session.close()
+      }
     }
 
     describe('Opening', () => {
@@ -426,6 +445,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
 
       test('move onto a key that exists from the same base', async () => {
+        fullSnapshots()
         const first = await openDb()
         fill(first, 2000)
         await save(first, 'v1')
@@ -570,6 +590,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
 
       test('write the base of a database closed meanwhile', async () => {
+        fullSnapshots()
         const db = await openDb()
         fill(db, 100)
         await save(db, 'v1')
@@ -583,6 +604,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
 
       test('keep a database right when moving a later snapshot fails', async () => {
+        fullSnapshots()
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 1000))
@@ -638,6 +660,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
 
       test('release every base of a database closed with checkpoints queued', async () => {
+        fullSnapshots()
         const db = await openDb()
         fill(db, 100)
         await save(db, 'v1')
@@ -801,6 +824,147 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
     })
 
+    describe('Deltas', () => {
+      // What is stored for `key`: a delta's pages, or the whole database
+      async function stored(key) {
+        const found = await storage().store.get(key)
+        return {...found, bytes: (await bytes(found.source)).byteLength}
+      }
+
+      test('store only the pages that changed, over the snapshot below', async () => {
+        const session = await storage().open(Database)
+        const db = register(session)
+        fill(db, 3000)
+        await session.save({key: 'v1'})
+        const full = await stored('v1')
+        expect(full.delta).toBeUndefined()
+        db.run("update items set body = 'changed' where id < 20")
+        const pages = held(db)
+        await session.save({key: 'v2'})
+        const delta = await stored('v2')
+        expect(delta.info.parent).toBe('v1')
+        expect(delta.delta).toMatchObject({parent: 'v1', depth: 1, chainBytes: pages * 4096})
+        expect(delta.delta.pages.length).toBe(pages)
+        expect(delta.bytes).toBe(pages * 4096)
+        expect(delta.info.size).toBe(full.info.size)
+        expect(session.snapshot).toMatchObject({key: 'v2', parent: 'v1'})
+        expect((await storage().list())[0]).toMatchObject({key: 'v2', parent: 'v1'})
+        // Read back through both
+        const reopened = await openDb('v2')
+        expect(reopened.export()).toEqual(db.export())
+        expect(rows(reopened, "select count(*) from items where body = 'changed'"))
+          .toEqual([[20]])
+      })
+
+      test('write in full past maxDepth, or once deltas outweigh the database', async () => {
+        const session = await storage({maxDepth: 2}).open(Database)
+        const db = register(session)
+        fill(db, 2000)
+        const parents = []
+        for (let i = 1; i <= 4; i++) {
+          db.run(`update items set body = 'v${i}' where id = ${i * 300}`)
+          await session.save({key: `v${i}`})
+          parents.push((await stored(`v${i}`)).info.parent ?? null)
+        }
+        // v1 has no snapshot below; v2 and v3 are deltas; v4 would be the
+        // third delta.
+        expect(parents).toEqual([null, 'v1', 'v2', null])
+        // Changing every page writes in full too.
+        db.run("update items set body = replace(body, 'x', 'y')")
+        await session.save({key: 'all'})
+        expect((await stored('all')).delta).toBeUndefined()
+        expect(dump(await openDb('all'))).toEqual(dump(db))
+        expect(() => storage({maxDepth: -1})).toThrow(RangeError)
+      })
+
+      test('read a chain the database grew and changed along', async () => {
+        const session = await storage().open(Database)
+        const db = register(session)
+        const reference = keep(new Database())
+        both(db, reference, db => fill(db, 3000))
+        await session.save({key: 'v1'})
+        both(db, reference, db => db.run('delete from items where id >= 2500'))
+        await session.save({key: 'v2'})
+        both(db, reference, db => fill(db, 300, 1000, 10_000))
+        await session.save({key: 'v3'})
+        both(db, reference, db => db.run('delete from items where id < 100'))
+        await session.save({key: 'v4'})
+        const [v1, v3, v4] = [await stored('v1'), await stored('v3'), await stored('v4')]
+        expect(v3.info.parent).toBe('v2')
+        expect(v4.info.parent).toBe('v3')
+        expect(v4.delta.depth).toBe(3)
+        // v3 grew past the end of v1.
+        expect(v3.info.size).toBeGreaterThan(v1.info.size)
+        for (const [key, count] of [['v1', 3000], ['v2', 2500], ['v3', 2800], ['v4', 2700]])
+          expect(rows(await openDb(key), 'select count(*) from items')).toEqual([[count]])
+        // Bytes of free pages may differ from a plain database's, whose
+        // page cache can hold what SQLite never wrote.
+        const v4db = await openDb('v4')
+        expect(dump(v4db)).toEqual(dump(reference))
+        expect(rows(v4db, 'pragma page_count')).toEqual(rows(reference, 'pragma page_count'))
+        expect(rows(v4db, 'pragma freelist_count')).toEqual(rows(reference, 'pragma freelist_count'))
+      })
+
+      test('fail to open when a snapshot below is missing', async () => {
+        const session = await storage().open(Database)
+        register(session)
+        fill(session.db, 100)
+        await session.save({key: 'v1'})
+        session.db.run('delete from items where id = 1')
+        await session.save({key: 'v2'})
+        await storage().store.remove('v1')
+        await expect(storage().open(Database, {key: 'v2'}))
+          .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
+        // The session read v2 before: it keeps working.
+        expect(rows(session.db, 'select count(*) from items')).toEqual([[99]])
+      })
+
+      test('keep the snapshots that kept ones lie over', async () => {
+        const session = await storage().open(Database, {branch: 'main'})
+        const db = register(session)
+        fill(db, 500)
+        for (const key of ['v1', 'v2', 'v3']) {
+          db.run(`insert into items (body) values ('${key}')`)
+          await session.save({key})
+        }
+        // v3 lies over v2 over v1: nothing can go.
+        expect(await storage().retain()).toEqual([])
+        db.close()
+        // Once a full snapshot is newest, the chain below it can.
+        const full = storage({maxDepth: 0})
+        const next = await full.open(Database, {branch: 'main'})
+        register(next)
+        next.db.run("insert into items (body) values ('v4')")
+        await next.save({key: 'v4'})
+        await next.close()
+        expect((await full.retain()).sort()).toEqual(['v1', 'v2', 'v3'])
+        expect(rows(await openDb({branch: 'main'}), 'select count(*) from items'))
+          .toEqual([[504]])
+      })
+
+      if (locking) {
+        test('hold the snapshots below the one a database reads', async () => {
+          const session = await storage().open(Database, {branch: 'main'})
+          register(session)
+          fill(session.db, 500)
+          await session.save({key: 'v1'})
+          session.db.run('delete from items where id = 1')
+          await session.save({key: 'v2'})
+          const reader = await openDb('v2')
+          await session.close()
+          // A full snapshot replaces the chain, but reader still reads it.
+          const full = storage({maxDepth: 0})
+          const next = await full.open(Database, {branch: 'main'})
+          register(next)
+          next.db.run('delete from items where id = 2')
+          await next.save({key: 'v3'})
+          expect(await full.retain()).toEqual([])
+          reader.close()
+          expect((await full.retain()).sort()).toEqual(['v1', 'v2'])
+        })
+      }
+    })
+
     describe('Sessions', () => {
       test('tell the snapshot, branch and bytes held', async () => {
         const session = await storage().open(Database, {branch: 'main'})
@@ -876,6 +1040,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
 
     describe('Forks', () => {
       test('keep reading their base after the database closes and moves on', async () => {
+        fullSnapshots()
         const db = await openDb()
         fill(db, 1000)
         await save(db, 'v1')
@@ -916,6 +1081,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
 
     describe('Cleanup', () => {
       test('keeps the head of each branch', async () => {
+        fullSnapshots()
         const db = await openDb()
         fill(db, 10)
         for (const key of ['a1', 'a2', 'a3']) {
@@ -941,6 +1107,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
 
       test('keeps more per branch, and pinned keys', async () => {
+        fullSnapshots()
         const db = await openDb()
         fill(db, 10)
         for (const key of ['v1', 'v2', 'v3', 'v4']) {
@@ -969,6 +1136,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
 
       if (locking) {
         test('keeps bases a database reads', async () => {
+        fullSnapshots()
           const a = await openDb()
           fill(a, 10)
           await save(a, 'v1')
@@ -987,6 +1155,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         })
 
         test('does not delete a base while a checkpoint writes it', async () => {
+        fullSnapshots()
           const db = await openDb()
           fill(db, 100)
           await save(db, 'v1')
@@ -1012,6 +1181,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         })
 
         test('keeps the newest two of a branch without Web Locks', async () => {
+        fullSnapshots()
           const unlocked = storage({locks: null})
           const db = register(await unlocked.open(Database))
           fill(db, 10)
@@ -1053,6 +1223,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         })
       } else {
         test('deletes bases databases read, which keep reading them', async () => {
+        fullSnapshots()
           const a = await openDb()
           fill(a, 1000)
           await save(a, 'v1')

@@ -36,6 +36,12 @@ const CACHE_KIB = 8192
 // kept, see readOnlyFile
 const BLOCK_BYTES = 1 << 20
 const CACHED_BLOCKS = 4
+// Saves write the pages that changed over the snapshot they read, as a
+// delta, while at most this many deltas lie on a full snapshot (see
+// maxDepth), its pages take at most half the bytes of the database, and
+// those of all of them no more than the database: reads look through every
+// delta, and deltas keep pages the ones above replace.
+const MAX_DEPTH = 8
 // Without locks, how old an empty base is before cleanup deletes it: one
 // that is still being written after this long has failed.
 const STALE_MS = 60 * 60_000
@@ -149,36 +155,75 @@ function slice(source: BaseSource, start: number, end: number): BaseSource {
 /** Information stored with a base, which must survive structured cloning */
 export type SnapshotMeta = Record<string, unknown>
 
-/** A stored base. */
+/** A stored snapshot. */
 export interface SnapshotInfo {
   key: string
-  /** Bases of one branch replace each other; cleanup keeps the newest */
+  /** A line of snapshots; retain keeps the newest (the head) */
   branch: string
   meta: SnapshotMeta
   /** When it was written, in milliseconds since 1970 */
   createdAt: number
-  /** In bytes; 0 while it is written, or if writing it failed */
+  /** Of the database, in bytes; 0 while it is written, or if writing failed */
   size: number
+  /**
+   * For a snapshot stored as the pages that changed since another, the key
+   * of that one, which it needs to be read
+   */
+  parent?: string
 }
 
-/** A base to write: pages over (part of) an existing base. */
+/**
+ * How a snapshot stored as changed pages lies over its parent: page
+ * `pages[i]` (of `chunkSize` bytes) is the i-th page of its content, the
+ * first `visible` bytes of the parent show where it has no page, and what
+ * lies past them reads as zero.
+ */
+export interface DeltaLayout {
+  parent: string
+  chunkSize: number
+  visible: number
+  /** Ascending */
+  pages: Array<number>
+  /** How many deltas lie on the full snapshot below, this one included */
+  depth: number
+  /** Bytes of pages stored by those deltas */
+  chainBytes: number
+}
+
+/** A stored snapshot, its content and, for a delta, its layout. */
+export interface StoredSnapshot {
+  info: SnapshotInfo
+  /** The whole database, or for a delta its pages one after the other */
+  source: BaseSource
+  delta?: DeltaLayout
+}
+
+/** A snapshot to write: pages over (part of) an existing one. */
 export interface NewSnapshot {
   key: string
   branch: string
   meta: SnapshotMeta
-  /** The base the pages go over, of which the first `visible` bytes stay */
-  base?: BaseSource
+  /**
+   * The content the pages go over, of which the first `visible` bytes stay.
+   * Not needed to write a delta: read it only to write a full snapshot.
+   */
+  readonly base?: BaseSource
   visible: number
   /** The size of the new base; past `visible`, what no page covers is zero */
   size: number
   chunkSize: number
-  /** Indexes of the pages, ascending */
+  /** Indexes of the pages, ascending, each starting before `size` */
   pages: Array<number>
   /**
    * The content of `pages[i]`: a view of Wasm memory, valid until the next
    * await.
    */
   page(i: number): Uint8Array
+  /**
+   * If set, store only the pages, as a delta over snapshot `delta.parent`
+   * (see `DeltaLayout`, whose `pages` are `pages`)
+   */
+  delta?: Omit<DeltaLayout, 'pages' | 'chunkSize' | 'visible'>
 }
 
 /** Where a `SnapshotStorage` keeps its bases. */
@@ -198,8 +243,8 @@ export interface SnapshotStore {
   list(): Promise<Array<SnapshotInfo>>
   /** The newest base of `branch` (of all bases without), if it has one */
   head?(branch?: string): Promise<SnapshotInfo | undefined>
-  /** Base `key` and its content, which stays as it is, if it exists */
-  get(key: string): Promise<{info: SnapshotInfo; source: BaseSource} | undefined>
+  /** Snapshot `key` and its content, which stays as it is, if it exists */
+  get(key: string): Promise<StoredSnapshot | undefined>
   /**
    * Write `base`, unless its key exists, and return its content, or
    * undefined if the key exists. A new base appears in full at once.
@@ -347,6 +392,8 @@ export function opfsSnapshotDirectory(
 // Base `key` is the file named by encodeKey(key), which never contains a
 // dot, and its branch and meta are JSON in that name plus `.json`.
 const META_SUFFIX = '.json'
+// What a delta file starts with, so it is never empty
+const DELTA_MARKER = new TextEncoder().encode('SQLite delta\0\0\0\0')
 
 function encodeKey(key: string) {
   return encodeURIComponent(key).replaceAll('.', '%2E')
@@ -374,10 +421,17 @@ export function directorySnapshotStore(
   name: string,
   directory: SnapshotDirectory
 ): SnapshotStore {
-  // The metadata of base `key`, with its time, or else `lastModified`
+  // The metadata of snapshot `key`: its time, or else `lastModified`, and
+  // for a delta its size and layout
   async function readMeta(key: string, lastModified: number) {
     const source = await directory.get(encodeKey(key) + META_SUFFIX)
-    let stored: {branch?: unknown; meta?: SnapshotMeta; createdAt?: unknown} = {}
+    let stored: {
+      branch?: unknown
+      meta?: SnapshotMeta
+      createdAt?: unknown
+      size?: unknown
+      delta?: DeltaLayout
+    } = {}
     try {
       if (source) stored = JSON.parse(await readText(source)) ?? {}
     } catch {}
@@ -385,8 +439,22 @@ export function directorySnapshotStore(
       branch: String(stored.branch ?? ''),
       meta: stored.meta ?? {},
       createdAt:
-        typeof stored.createdAt === 'number' ? stored.createdAt : lastModified
+        typeof stored.createdAt === 'number' ? stored.createdAt : lastModified,
+      size: typeof stored.size === 'number' ? stored.size : undefined,
+      delta: stored.delta
     }
+  }
+  // A file of `bytes` that was written in full: empty ones are still being
+  // written, or writing them failed
+  async function infoOf(key: string, bytes: number, lastModified: number) {
+    const {size, delta, ...rest} = await readMeta(key, lastModified)
+    const info: SnapshotInfo = {
+      key,
+      ...rest,
+      size: bytes === 0 ? 0 : (size ?? bytes)
+    }
+    if (delta) info.parent = delta.parent
+    return {info, delta}
   }
   async function writeFile(file: string, data: Uint8Array) {
     const writer = await directory.create(file)
@@ -396,6 +464,30 @@ export function directorySnapshotStore(
     } catch (error) {
       await writer.abort().catch(() => {})
       throw error
+    }
+  }
+  // Write `pages` of `snapshot` in runs of consecutive ones, page `i` at
+  // `position(i)`
+  async function writePages(
+    writer: FileWriter,
+    snapshot: NewSnapshot,
+    position: (i: number) => number
+  ) {
+    const {chunkSize, pages} = snapshot
+    const perWrite = Math.max(1, Math.floor(WRITE_BYTES / chunkSize))
+    for (let i = 0; i < pages.length; ) {
+      let end = i + 1
+      while (
+        end < pages.length &&
+        end - i < perWrite &&
+        position(end) === position(end - 1) + chunkSize
+      )
+        end++
+      const run = new Uint8Array((end - i) * chunkSize)
+      for (let k = i; k < end; k++)
+        run.set(snapshot.page(k), (k - i) * chunkSize)
+      await writer.write(run, position(i))
+      i = end
     }
   }
   return {
@@ -408,14 +500,11 @@ export function directorySnapshotStore(
       return Promise.all(
         files
           .filter(file => !file.name.endsWith(META_SUFFIX))
-          .map(async file => {
-            const key = decodeKey(file.name)
-            return {
-              key,
-              ...(await readMeta(key, file.lastModified)),
-              size: file.size
-            }
-          })
+          .map(
+            async file =>
+              (await infoOf(decodeKey(file.name), file.size, file.lastModified))
+                .info
+          )
       )
     },
     async get(key) {
@@ -425,56 +514,55 @@ export function directorySnapshotStore(
         source instanceof Blob && 'lastModified' in source
           ? (source as File).lastModified
           : 0
-      return {
-        info: {key, ...(await readMeta(key, lastModified)), size: sizeOf(source)},
-        source
-      }
+      const {info, delta} = await infoOf(key, sizeOf(source), lastModified)
+      if (!delta) return {info, source}
+      // Pages follow the marker of a delta file.
+      return {info, source: slice(source, DELTA_MARKER.length, sizeOf(source)), delta}
     },
-    async write(base) {
-      const file = encodeKey(base.key)
+    async write(snapshot) {
+      const file = encodeKey(snapshot.key)
       const existing = await directory.get(file)
       if (existing && sizeOf(existing) > 0) return undefined
-      // The empty base file appears first, so the metadata is never left
-      // without one.
+      // The empty snapshot file appears first, so the metadata is never
+      // left without one.
       const writer = await directory.create(file)
       try {
+        const {chunkSize, pages, visible, size, delta} = snapshot
         const meta = JSON.stringify({
-          branch: base.branch,
-          meta: base.meta,
-          createdAt: now()
+          branch: snapshot.branch,
+          meta: snapshot.meta,
+          createdAt: now(),
+          ...(delta && {
+            size,
+            delta: {...delta, chunkSize, visible, pages} satisfies DeltaLayout
+          })
         })
         await writeFile(file + META_SUFFIX, new TextEncoder().encode(meta))
-        if (base.base && base.visible > 0) {
-          if (sizeOf(base.base) < base.visible)
-            throw new SQLiteError('Base is too short', SQLITE_IOERR_READ)
-          await writer.copy(slice(base.base, 0, base.visible))
+        if (delta) {
+          // A marker, so the file is never empty, then the pages in order
+          await writer.write(DELTA_MARKER, 0)
+          await writePages(writer, snapshot, i => DELTA_MARKER.length + i * chunkSize)
+        } else {
+          const base = snapshot.base
+          if (base && visible > 0) {
+            if (sizeOf(base) < visible)
+              throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
+            await writer.copy(slice(base, 0, visible))
+          }
+          await writer.truncate(visible)
+          await writePages(writer, snapshot, i => pages[i] * chunkSize)
+          await writer.truncate(size)
         }
-        await writer.truncate(base.visible)
-        // Write runs of consecutive pages at once.
-        const {chunkSize, pages} = base
-        const perWrite = Math.max(1, Math.floor(WRITE_BYTES / chunkSize))
-        for (let i = 0; i < pages.length; ) {
-          let end = i + 1
-          while (
-            end < pages.length &&
-            end - i < perWrite &&
-            pages[end] === pages[end - 1] + 1
-          )
-            end++
-          const run = new Uint8Array((end - i) * chunkSize)
-          for (let k = i; k < end; k++)
-            run.set(base.page(k), (k - i) * chunkSize)
-          await writer.write(run, pages[i] * chunkSize)
-          i = end
-        }
-        await writer.truncate(base.size)
         await writer.close()
       } catch (error) {
         await writer.abort().catch(() => {})
         await directory.remove(file + META_SUFFIX).catch(() => {})
         throw error
       }
-      return directory.get(file)
+      const written = await directory.get(file)
+      return written && snapshot.delta
+        ? slice(written, DELTA_MARKER.length, sizeOf(written))
+        : written
     },
     async remove(key) {
       await directory.remove(encodeKey(key))
@@ -493,9 +581,11 @@ const BASES = 'bases'
 const BY_BRANCH = 'branch'
 const BY_TIME = 'createdAt'
 
-/** A base as IndexedDB stores it. */
+/** A snapshot as IndexedDB stores it. */
 interface BaseRecord extends SnapshotInfo {
+  /** The database, or for a delta its pages one after the other */
   blob: Blob
+  delta?: DeltaLayout
 }
 
 /**
@@ -604,13 +694,11 @@ export function indexedDBSnapshotStore(
     }))
   const store = async (mode: IDBTransactionMode) =>
     (await database()).transaction(BASES, mode).objectStore(BASES)
-  const info = ({key, branch, meta, createdAt, size}: BaseRecord): SnapshotInfo => ({
-    key,
-    branch,
-    meta,
-    createdAt,
-    size
-  })
+  const info = ({key, branch, meta, createdAt, size, delta}: BaseRecord) => {
+    const info: SnapshotInfo = {key, branch, meta, createdAt, size}
+    if (delta) info.parent = delta.parent
+    return info
+  }
   return {
     name,
     locking: false,
@@ -646,11 +734,15 @@ export function indexedDBSnapshotStore(
       const record = await request<BaseRecord | undefined>(
         (await store('readonly')).get(key)
       )
-      return record && {info: info(record), source: record.blob}
+      return record && {info: info(record), source: record.blob, delta: record.delta}
     },
     async write(base) {
       if (await request((await store('readonly')).count(base.key))) return
-      const blob = composeBlob(base)
+      const {chunkSize, visible, pages, delta} = base
+      // The Blob copies the pages out of Wasm memory.
+      const blob = delta
+        ? new Blob(pages.map((_, i) => base.page(i) as Uint8Array<ArrayBuffer>))
+        : composeBlob(base)
       const record: BaseRecord = {
         key: base.key,
         branch: base.branch,
@@ -659,6 +751,7 @@ export function indexedDBSnapshotStore(
         size: base.size,
         blob
       }
+      if (delta) record.delta = {...delta, chunkSize, visible, pages}
       const bases = await store('readwrite')
       try {
         // add() fails if another Worker added the key meanwhile.
@@ -696,7 +789,10 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
     ...info,
     meta: structuredClone(info.meta)
   })
-  const bases = new Map<string, {info: SnapshotInfo; data: Uint8Array}>()
+  const bases = new Map<
+    string,
+    {info: SnapshotInfo; data: Uint8Array; delta?: DeltaLayout}
+  >()
   let last = 0
   return {
     name,
@@ -708,34 +804,44 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
     },
     async get(key) {
       const base = bases.get(key)
-      // The bytes are shared: bases are never written.
-      return base && {info: copy(base.info), source: base.data}
+      // The bytes are shared: snapshots are never written.
+      return base && {info: copy(base.info), source: base.data, delta: base.delta}
     },
-    async write(base) {
-      if (bases.has(base.key)) return undefined
-      const data = new Uint8Array(base.size)
-      const keep = Math.min(base.visible, base.size)
-      if (base.base && keep > 0) {
-        const part = slice(base.base, 0, keep)
-        data.set(
-          part instanceof Uint8Array
-            ? part
-            : new Uint8Array(await part.arrayBuffer())
-        )
+    async write(snapshot) {
+      if (bases.has(snapshot.key)) return undefined
+      const {chunkSize, visible, size, pages, delta} = snapshot
+      let data: Uint8Array
+      if (delta) {
+        data = new Uint8Array(pages.length * chunkSize)
+        pages.forEach((_, i) => data.set(snapshot.page(i), i * chunkSize))
+      } else {
+        data = new Uint8Array(size)
+        const keep = Math.min(visible, size)
+        const base = snapshot.base
+        if (base && keep > 0) {
+          const part = slice(base, 0, keep)
+          data.set(
+            part instanceof Uint8Array
+              ? part
+              : new Uint8Array(await part.arrayBuffer())
+          )
+        }
+        // Bytes past `visible` that no page covers stay zero.
+        pages.forEach((index, i) => {
+          const start = index * chunkSize
+          data.set(snapshot.page(i).subarray(0, size - start), start)
+        })
       }
-      // Bytes past `visible` that no page covers stay zero.
-      base.pages.forEach((index, i) => {
-        const start = index * base.chunkSize
-        if (start >= base.size) return
-        data.set(base.page(i).subarray(0, base.size - start), start)
-      })
-      if (bases.has(base.key)) return undefined
+      if (bases.has(snapshot.key)) return undefined
       // Times that differ, also within a millisecond
       const createdAt = (last = Math.max(now(), last + 0.001))
-      const {key, branch, meta, size} = base
+      const {key, branch, meta} = snapshot
+      const info: SnapshotInfo = {key, branch, meta, createdAt, size}
+      if (delta) info.parent = delta.parent
       bases.set(key, {
-        info: copy({key, branch, meta, createdAt, size}),
-        data
+        info: copy(info),
+        data,
+        delta: delta && {...delta, chunkSize, visible, pages}
       })
       return data
     },
@@ -756,6 +862,14 @@ export interface SnapshotStorageOptions {
    * for stores that use locks, none otherwise)
    */
   locks?: Pick<LockManager, 'request'> | null
+  /**
+   * How many deltas may lie on a full snapshot (default: 8). A save writes
+   * only the pages that changed, over the snapshot the database reads,
+   * while that keeps at most this many deltas, its pages are at most half
+   * the database, and those of all of them no more than the database; else
+   * it writes the whole database. 0 writes every snapshot in full.
+   */
+  maxDepth?: number
 }
 
 /**
@@ -794,20 +908,151 @@ export function indexedDBSnapshots(
  * snapshots. See `SnapshotStorage`.
  */
 export function memorySnapshots(
-  store: SnapshotStore = memorySnapshotStore()
+  store: SnapshotStore = memorySnapshotStore(),
+  options?: SnapshotStorageOptions
 ): SnapshotStorage {
-  return new SnapshotStorage(store)
+  return new SnapshotStorage(store, options)
+}
+
+/** A stored snapshot and, for a delta, the one it lies over. */
+interface Layer extends StoredSnapshot {
+  below?: Layer
 }
 
 /** The snapshot a database reads, kept as `db.base`. */
 interface Base extends SnapshotInfo {
-  source: BaseSource
+  layer: Layer
+  /** Of this snapshot and those it lies over, top first */
+  keys: Array<string>
+  /** Deltas from the full snapshot below, and the bytes they store */
+  depth: number
+  chainBytes: number
+  /** The whole database, composed of the layers where needed */
+  content(): BaseSource
+  /** A file that reads it */
+  file(): SyncFile
+}
+
+function baseOf(layer: Layer): Base {
+  const keys: Array<string> = []
+  for (let at: Layer | undefined = layer; at; at = at.below) keys.push(at.info.key)
+  let content: BaseSource | undefined
+  return {
+    ...layer.info,
+    layer,
+    keys,
+    depth: layer.delta?.depth ?? 0,
+    chainBytes: layer.delta?.chainBytes ?? 0,
+    content: () => (content ??= layerContent(layer)),
+    file: () => layerFile(layer)
+  }
 }
 
 function infoOf(base: Base | undefined): SnapshotInfo | undefined {
   if (!base) return undefined
-  const {key, branch, meta, createdAt, size} = base
-  return {key, branch, meta, createdAt, size}
+  const {key, branch, meta, createdAt, size, parent} = base
+  const info: SnapshotInfo = {key, branch, meta, createdAt, size}
+  if (parent !== undefined) info.parent = parent
+  return info
+}
+
+/** A run of bytes of a delta: its own pages, the layer below, or zeros */
+type Run =
+  | {kind: 'own'; from: number; to: number; at: number}
+  | {kind: 'below' | 'zero'; from: number; to: number}
+
+const slotsOf = new WeakMap<DeltaLayout, Map<number, number>>()
+
+/** The runs bytes `start` to `end` of a delta are read from */
+function* runs(delta: DeltaLayout, start: number, end: number): Generator<Run> {
+  let slots = slotsOf.get(delta)
+  if (!slots) {
+    slots = new Map(delta.pages.map((page, slot) => [page, slot]))
+    slotsOf.set(delta, slots)
+  }
+  const {chunkSize, visible} = delta
+  for (let p = start; p < end; ) {
+    const chunk = Math.floor(p / chunkSize)
+    const slot = slots.get(chunk)
+    let next = chunk + 1
+    let to: number
+    if (slot !== undefined) {
+      // Consecutive pages that are stored one after the other
+      while (next * chunkSize < end && slots.get(next) === slot + next - chunk) next++
+      to = Math.min(next * chunkSize, end)
+      yield {kind: 'own', from: p, to, at: slot * chunkSize + p - chunk * chunkSize}
+    } else if (p < visible) {
+      while (next * chunkSize < Math.min(end, visible) && !slots.has(next)) next++
+      to = Math.min(next * chunkSize, end, visible)
+      yield {kind: 'below', from: p, to}
+    } else {
+      while (next * chunkSize < end && !slots.has(next)) next++
+      to = Math.min(next * chunkSize, end)
+      yield {kind: 'zero', from: p, to}
+    }
+    p = to
+  }
+}
+
+/** A read-only file of the database a layer holds */
+function layerFile(layer: Layer): SyncFile {
+  const own = readOnlyFile(layer.source)
+  const {delta, below} = layer
+  if (!delta || !below) return own
+  const under = layerFile(below)
+  const size = layer.info.size
+  // Read `to - from` bytes at `at` of `file` into `buffer` at `offset`,
+  // with zeros past its end
+  const fill = (file: SyncFile, buffer: Uint8Array, offset: number, length: number, at: number) => {
+    const part = buffer.subarray(offset, offset + length)
+    const read = file.read(part, {at})
+    if (read < length) part.fill(0, Math.max(0, read))
+  }
+  return {
+    ...own,
+    read(buffer, {at}) {
+      const end = Math.min(at + buffer.length, size)
+      if (end <= at) return 0
+      for (const run of runs(delta, at, end)) {
+        const length = run.to - run.from
+        const offset = run.from - at
+        if (run.kind === 'own') fill(own, buffer, offset, length, run.at)
+        else if (run.kind === 'below') fill(under, buffer, offset, length, run.from)
+        else buffer.fill(0, offset, offset + length)
+      }
+      return end - at
+    },
+    getSize: () => size
+  }
+}
+
+/** The database a layer holds, as one Blob, or bytes for bytes */
+function layerContent(layer: Layer): BaseSource {
+  const parts: Array<BaseSource> = []
+  const add = (source: BaseSource, start: number, end: number) => {
+    const stored = Math.min(end, sizeOf(source))
+    if (stored > start) parts.push(slice(source, start, stored))
+    if (end > Math.max(start, stored)) parts.push(new Uint8Array(end - Math.max(start, stored)))
+  }
+  const collect = (layer: Layer, start: number, end: number) => {
+    const {delta, below} = layer
+    if (!delta || !below) return add(layer.source, start, end)
+    for (const run of runs(delta, start, end)) {
+      if (run.kind === 'own') add(layer.source, run.at, run.at + run.to - run.from)
+      else if (run.kind === 'below') collect(below, run.from, run.to)
+      else parts.push(new Uint8Array(run.to - run.from))
+    }
+  }
+  collect(layer, 0, layer.info.size)
+  if (!layer.delta) return layer.source
+  if (parts.some(part => part instanceof Blob)) return new Blob(parts as Array<BlobPart>)
+  const bytes = new Uint8Array(layer.info.size)
+  let at = 0
+  for (const part of parts as Array<Uint8Array>) {
+    bytes.set(part, at)
+    at += part.byteLength
+  }
+  return bytes
 }
 
 /** Which snapshot to open, and how the session saves. */
@@ -981,11 +1226,14 @@ function wholeNumber(name: string, value: number, min: number) {
  */
 export class SnapshotStorage {
   private locks: Pick<LockManager, 'request'> | null
+  private maxDepth: number
 
   constructor(
     public readonly store: SnapshotStore,
     options?: SnapshotStorageOptions
   ) {
+    this.maxDepth = options?.maxDepth ?? MAX_DEPTH
+    wholeNumber('maxDepth', this.maxDepth, 0)
     this.locks =
       options?.locks !== undefined
         ? options.locks
@@ -1037,6 +1285,63 @@ export class SnapshotStorage {
         )
         .catch(reject)
     })
+  }
+
+  /** Hold `hold` on each of `keys`, see `hold`. */
+  private async holdAll(keys: Array<string>): Promise<() => void> {
+    const releases: Array<() => void> = []
+    try {
+      for (const key of keys) releases.push(await this.hold(key))
+    } catch (error) {
+      for (const release of releases) release()
+      throw error
+    }
+    return once(() => {
+      for (const release of releases) release()
+    })
+  }
+
+  /**
+   * Snapshot `key` with the snapshots it lies over, holding them (see
+   * `hold`) until the returned function is called; undefined if `key` does
+   * not exist or is being written. Fails with `SQLITE_CANTOPEN` if one it
+   * lies over is missing.
+   */
+  private async resolve(
+    key: string
+  ): Promise<{base: Base; release: () => void} | undefined> {
+    const releases: Array<() => void> = []
+    const release = once(() => {
+      for (const release of releases) release()
+    })
+    try {
+      const found: Array<StoredSnapshot> = []
+      for (let at = key; ; ) {
+        releases.push(await this.hold(at))
+        const stored = await this.store.get(at)
+        if (!stored || stored.info.size === 0) {
+          if (at === key) {
+            release()
+            return undefined
+          }
+          throw new SQLiteError(
+            `Snapshot "${key}" lies over "${at}", which is missing`,
+            SQLITE_CANTOPEN
+          )
+        }
+        found.push(stored)
+        if (!stored.delta) break
+        at = stored.delta.parent
+        if (found.length > 64)
+          throw new SQLiteError(`Snapshot "${key}" lies over too many`, SQLITE_CORRUPT)
+      }
+      let layer: Layer | undefined
+      for (const stored of found.reverse()) layer = {...stored, below: layer}
+      return {base: baseOf(layer!), release}
+    } catch (error) {
+      release()
+      throw error
+    }
   }
 
   /** Run `write` while no other Worker writes snapshot `key`. @internal */
@@ -1098,22 +1403,23 @@ export class SnapshotStorage {
     Database: new () => T,
     key: string
   ): Promise<T> {
-    const release = once(await this.hold(key))
+    const resolved = await this.resolve(key)
+    if (!resolved) throw new SQLiteError(`No snapshot "${key}"`, SQLITE_CANTOPEN)
+    const {base, release} = resolved
     let db: T | undefined
     try {
-      const found = await this.store.get(key)
-      if (!found || sizeOf(found.source) === 0)
-        throw new SQLiteError(`No snapshot "${key}"`, SQLITE_CANTOPEN)
-      const {info, source} = found
-      checkHeader(await read(source, 0, 100), sizeOf(source), key)
+      const reader = base.file()
+      const header = new Uint8Array(100)
+      reader.read(header, {at: 0})
+      checkHeader(header, base.size, key)
       db = new Database()
       const opened = db
       const files = filesOf(opened.wasm)
       const file = `snapshots/${nextFile++}/${key}`
-      files.add(file, readOnlyFile(source), release)
+      files.add(file, reader, release)
       try {
         opened.openBase(file)
-        opened.base = {...info, key, source} satisfies Base
+        opened.base = base
       } finally {
         // Opening failed before SQLite opened the file.
         if (files.openHandles(file) === 0) files.remove(file)
@@ -1153,39 +1459,52 @@ export class SnapshotStorage {
     waiting: Set<Database>,
     {key, branch, meta}: {key: string; branch: string; meta: SnapshotMeta}
   ): Promise<SaveResult> {
-    const release = once(await this.hold(key))
+    const lock = once(await this.hold(key))
+    let release = lock
     let registered = false
     try {
-      const written = await this.exclusive(key, () =>
-        this.store.write(newSnapshot(snapshot, key, branch, meta))
-      )
-      let target: Base | undefined
+      const content = newSnapshot(snapshot, key, branch, meta, this.maxDepth)
+      const written = await this.exclusive(key, () => this.store.write(content))
+      let target: Base
       if (written) {
+        const from = snapshot.base as Base | undefined
+        const {chunkSize, visible, pages, delta} = content
+        const layout = delta && {...delta, chunkSize, visible, pages}
         // Only for its time: the fallback is close enough if reading fails.
         const stored = await this.store.get(key).catch(() => undefined)
-        target = {
-          ...(stored?.info ?? {
-            key,
-            branch,
-            meta,
-            createdAt: now(),
-            size: sizeOf(written)
-          }),
-          source: written
+        const info: SnapshotInfo = stored?.info ?? {
+          key,
+          branch,
+          meta,
+          createdAt: now(),
+          size: content.size,
+          ...(delta && {parent: delta.parent})
+        }
+        target = baseOf({info, source: written, delta: layout, below: layout && from?.layer})
+        if (layout && from) {
+          // The new snapshot needs the ones it lies over.
+          const below = await this.holdAll(from.keys)
+          release = once(() => {
+            lock()
+            below()
+          })
         }
       } else {
         const found = await this.existing(snapshot, key)
         if (found.status !== 'move') {
-          release()
+          lock()
           return {status: found.status, snapshot: found.info} as SaveResult
         }
         target = found.base
+        // Resolving it holds the key too.
+        lock()
+        release = found.release
       }
       const from = snapshot.base
       const files = filesOf(db.wasm)
       const file = `snapshots/${nextFile++}/${key}`
-      // From here on, the lock is released once nothing reads the file.
-      files.add(file, readOnlyFile(target.source), release)
+      // From here on, the locks are released once nothing reads the file.
+      files.add(file, target.file(), release)
       registered = true
       try {
         if (!db.isClosed() && db.base === from) {
@@ -1220,27 +1539,32 @@ export class SnapshotStorage {
     snapshot: Database,
     key: string
   ): Promise<
-    | {status: 'move'; base: Base; info?: undefined}
+    | {status: 'move'; base: Base; release: () => void; info?: undefined}
     | {status: 'joined' | 'mismatch'; info: SnapshotInfo | undefined}
   > {
     const current = snapshot.base as Base | undefined
+    let release = () => {}
     try {
       // A key names content, but other Workers may have stored the same
       // rows in other pages, under which the pages a database holds would
       // not fit.
-      const content = newSnapshot(snapshot, key, '', {})
+      const content = newSnapshot(snapshot, key, '', {}, 0)
       if (current?.key === key) {
         const unchanged =
-          content.pages.length === 0 && content.size === sizeOf(current.source)
+          content.pages.length === 0 && content.size === current.size
         return {status: unchanged ? 'joined' : 'mismatch', info: infoOf(current)}
       }
-      const found = await this.store.get(key)
+      const found = await this.resolve(key)
       if (!found) return {status: 'mismatch', info: undefined}
-      if (!(await holds(found.source, content)))
-        return {status: 'mismatch', info: found.info}
-      return {status: 'move', base: {...found.info, source: found.source}}
+      release = found.release
+      if (!(await holds(found.base.content(), content))) {
+        release()
+        return {status: 'mismatch', info: infoOf(found.base)}
+      }
+      return {status: 'move', base: found.base, release}
     } catch {
       // Deleted while it was read: the database stays where it is.
+      release()
       return {status: 'mismatch', info: undefined}
     }
   }
@@ -1270,18 +1594,29 @@ export class SnapshotStorage {
     const kept = new Set(ranked.slice(0, branches))
     const seen = new Map<string, number>()
     const keep = perBranch + (this.locks || this.store.keepsRemoved ? 0 : 1)
-    const deleted: Array<string> = []
+    const keys = new Set<string>()
     for (const snapshot of all) {
-      if (pinned.has(snapshot.key)) continue
-      if (snapshot.size > 0) {
+      if (pinned.has(snapshot.key)) {
+        keys.add(snapshot.key)
+      } else if (snapshot.size > 0) {
         const count = (seen.get(snapshot.branch) ?? 0) + 1
         seen.set(snapshot.branch, count)
-        if (count <= keep && kept.has(snapshot.branch)) continue
+        if (count <= keep && kept.has(snapshot.branch)) keys.add(snapshot.key)
       } else if (!this.locks && now() - snapshot.createdAt < STALE_MS) {
         // Empty snapshots are being written, which locks them, or writing
         // them failed. Without locks, only the ones that are old have failed.
-        continue
+        keys.add(snapshot.key)
       }
+    }
+    // And the snapshots that those lie over
+    const parents = new Map(all.map(s => [s.key, s.parent]))
+    for (const key of [...keys]) {
+      for (let at = parents.get(key); at !== undefined && !keys.has(at); at = parents.get(at))
+        keys.add(at)
+    }
+    const deleted: Array<string> = []
+    for (const snapshot of all) {
+      if (keys.has(snapshot.key)) continue
       if (!this.locks) {
         await this.store.remove(snapshot.key)
         deleted.push(snapshot.key)
@@ -1482,26 +1817,44 @@ export class Session<D extends Database = Database> {
   }
 }
 
+/**
+ * What saving `snapshot` writes: its pages over the snapshot it reads, as
+ * a delta while the deltas below it are few and small (see MAX_DEPTH),
+ * else in full.
+ */
 function newSnapshot(
   snapshot: Database,
   key: string,
   branch: string,
-  meta: SnapshotMeta
+  meta: SnapshotMeta,
+  maxDepth: number
 ): NewSnapshot {
-  const {chunkSize, size, visible, pages} = snapshot.pages()
+  const {chunkSize, size, visible, pages: all} = snapshot.pages()
   const base = snapshot.base as Base | undefined
   if (visible > 0 && !base)
     throw new SQLiteError(
       'Database reads a snapshot it was not opened on',
       SQLITE_MISUSE
     )
+  // Pages past the end were truncated away.
+  const pages = all.filter(([index]) => index * chunkSize < size)
+  let delta: NewSnapshot['delta']
+  if (base && visible > 0) {
+    const bytes = pages.length * chunkSize
+    const depth = base.depth + 1
+    const chainBytes = base.chainBytes + bytes
+    if (depth <= maxDepth && bytes * 2 <= size && chainBytes <= size)
+      delta = {parent: base.key, depth, chainBytes}
+  }
   // The snapshot is not used meanwhile, so its pages stay where they are,
   // but the Wasm heap may grow: take HEAPU8 afresh.
   return {
     key,
     branch,
     meta,
-    base: base?.source,
+    get base() {
+      return base?.content()
+    },
     visible,
     size,
     chunkSize,
@@ -1509,7 +1862,8 @@ function newSnapshot(
     page(i) {
       const pointer = pages[i][1]
       return snapshot.wasm.HEAPU8.subarray(pointer, pointer + chunkSize)
-    }
+    },
+    delta
   }
 }
 

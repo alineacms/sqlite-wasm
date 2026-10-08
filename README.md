@@ -104,6 +104,15 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   and saves of a session run one at a time. `branch` defaults to the
   session's, and becomes it; `meta` is any data that survives structured
   cloning.
+- A save writes only the pages that changed, as a delta over the snapshot
+  the database reads (`parent` in its info), while that keeps at most 8
+  deltas on a full snapshot, the new pages are at most half the database,
+  and all those deltas together no more than the database; else it writes
+  the whole database. In Chromium, saving 10 changed rows of a 47 MB database
+  takes 12–27 ms instead of 120–210 ms (see [BENCHMARKS.md](BENCHMARKS.md)). Reads look
+  through the deltas to the full snapshot below. `opfsSnapshots(name,
+  {maxDepth})` changes how many deltas may lie on one; `0` writes every
+  snapshot in full.
 - Key snapshots by their content, such as a content hash: a key that exists
   is not written again. The result's `status` tells what happened:
   `'written'`, a new snapshot; `'joined'`, the key holds the committed state
@@ -121,7 +130,7 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   storage did not open, such as one loaded from bytes: its first save
   writes all of it.
 - `await storage.retain()` deletes every snapshot that is not the head of
-  its branch, and resolves to their keys. `retain({perBranch: n})` keeps the
+  its branch, or one a kept snapshot lies over, and resolves to their keys. `retain({perBranch: n})` keeps the
   newest `n` of each branch, `retain({branches: n})` deletes every snapshot
   of all but the `n` branches with the newest heads (with OPFS and no Web
   Locks, also ones Workers still read), and `retain({pinned: keys})` never
@@ -168,9 +177,9 @@ const session = await storage.open(Database, {
 
 `indexedDBSnapshots(name)` keeps each snapshot as a record of IndexedDB
 database `name`, with its key, branch, meta, time and size, and its content
-as a Blob. A save composes a new Blob from slices of the old one and the
-changed pages, so the browser copies the old snapshot itself, and adds it in
-one transaction. Workers read Blobs synchronously with `FileReaderSync`. A
+as a Blob: for a delta, its pages and their layout. A full save composes a
+new Blob from slices of the old snapshot and the changed pages, so the
+browser copies the old one itself; either is added in one transaction. Workers read Blobs synchronously with `FileReaderSync`. A
 Blob stays readable after its record is deleted, so `retain` needs no
 locks: it deletes old snapshots even while Workers read them. Pass
 `{indexedDB, IDBKeyRange}` to use another implementation, such as
@@ -179,12 +188,13 @@ fake-indexeddb.
 ### Snapshots in OPFS
 
 `opfsSnapshots(name)` keeps each snapshot as a file in directory `name` of
-OPFS (or of `{directory}`), with its branch and meta in a file next to it. A
-save streams the old snapshot into a `createWritable()` of the new file,
-writes the changed pages over it, and closes it, which shows the file at
-once. A file stops being readable once it is deleted, so Workers hold a
-shared Web Lock on each snapshot they read (also through forks), and
-`retain` keeps the snapshots a Worker reads. Saves to one key lock it, so
+OPFS (or of `{directory}`), with its branch and meta (and for a delta, the
+layout of its pages) in a file next to it. A save writes the new file with
+`createWritable()`: a delta's pages, or for a full save the old snapshot
+streamed in with the changed pages written over it. Closing the writer
+shows the file at once. A file stops being readable once it is deleted, so Workers hold a
+shared Web Lock on each snapshot they read (also through forks), and on
+those it lies over, and `retain` keeps the snapshots a Worker reads. Saves to one key lock it, so
 one Worker writes it. Without Web Locks (`{locks: null}`) `retain` keeps
 one more snapshot per branch, and snapshots still being written until they
 are an hour old; every browser with `createWritable()` has Web Locks. `new

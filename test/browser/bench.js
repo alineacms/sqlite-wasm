@@ -64,20 +64,26 @@ async function benchmark(variant, seconds) {
     const opened = await checker.call('open', {variant, storage: twoStorage}, LONG)
     const [[logged]] = await checker.call('rows', {sql: 'select count(*) from log'})
     await writer.call('cleanup')
-    const bases = (await writer.call('list')).map(base => base.key)
-    // With locks (OPFS), the reader keeps v1; IndexedDB keeps the newest.
-    const expected = variant === 'opfs' ? 2 : 1
+    const list = await writer.call('list')
+    const bases = list.map(base => base.key)
+    // The newest and the snapshots it lies over are kept; with locks
+    // (OPFS), also v1, which the reader reads.
+    const parents = new Map(list.map(base => [base.key, base.parent]))
+    const expected = new Set(variant === 'opfs' ? ['v1'] : [])
+    for (let key = written.base; key !== undefined; key = parents.get(key))
+      expected.add(key)
     await Promise.all([writer, other, checker].map(w => w.call('close').catch(() => {})))
     const ok =
       opened.base === written.base &&
       logged === written.checkpoints &&
-      bases.length === expected
+      bases.length === expected.size &&
+      bases.every(key => expected.has(key))
     return {
       seconds,
       checkpoints: written.checkpoints,
       readerRounds: read.rounds,
       bases: bases.length,
-      expectedBases: expected,
+      expectedBases: expected.size,
       ok
     }
   })
