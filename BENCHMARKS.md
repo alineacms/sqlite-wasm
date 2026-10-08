@@ -202,3 +202,28 @@ Section 3 again, in Chromium 141 only, before and after (ms, cold / warm):
 Full scans are 6–8 times faster. The range reads table pages in index
 order, which is random, so it still reads page by page: the page cache
 remains what makes it fast. Firefox and WebKit were not measured again.
+
+### Saving only the pages that changed
+
+A save now writes the changed pages as a delta over the snapshot the
+database reads, while few and small deltas lie below it (see the README).
+Section 4 again, in Chromium 141 only (ms):
+
+| Bases | Rows changed | Changed pages (MB) | Before | After |
+| --- | --- | --- | --- | --- |
+| OPFS files | 10 | 1.2 | 211 | 27 |
+| OPFS files | 1000 | 46.3 | 370 | 362 |
+| OPFS files | 20000 | 50.4 | 373 | 364 |
+| IndexedDB Blobs | 10 | 1.2 | 123 | 14 |
+| IndexedDB Blobs | 1000 | 46.3 | 425 | 201 |
+| IndexedDB Blobs | 20000 | 50.4 | 500 | 197 |
+
+1,000 and 20,000 rows spread over the table change nearly every page, so
+those saves still write the whole database: their times differ between
+runs (with IndexedDB, 200–615 ms across the runs made for this), not
+because of deltas. In section 5 (two
+SharedWorkers, 10 s in this run), the writer saved 63 times with files and
+73 times with IndexedDB, 6 to 7 a second, against about 2 a second before.
+Firefox and WebKit were not measured again; WebKit's slow IndexedDB
+saves came from composing large Blobs, which a delta of a few pages
+avoids, but that is not measured.
