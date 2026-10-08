@@ -194,25 +194,34 @@ instead of its root. `fileStorage(name, fileSystem)` uses any other
 
 ## Snapshot storage
 
-`@alinea/sqlite-wasm/snapshots` keeps a database in immutable base files in
-OPFS, which any number of Workers open at the same time, dedicated or
-shared, and of different builds of an app. Each opens a copy-on-write
-overlay on a base file: SQLite reads pages from the file as queries need
-them, and every change stays in that Worker's memory. A checkpoint writes a
-new base file with the changes, which other Workers open from then on.
+`@alinea/sqlite-wasm/snapshots` keeps a database in immutable bases, which
+any number of Workers open at the same time, dedicated or shared, and of
+different builds of an app. Each opens a copy-on-write overlay on a base:
+SQLite reads pages from it as queries need them, and every change stays in
+that Worker's memory. A checkpoint writes a new base with the changes,
+which other Workers open from then on. Bases are kept as files in OPFS or
+as Blobs in IndexedDB; both have the same API, so either can be swapped in
+(see [BENCHMARKS.md](BENCHMARKS.md) to compare them).
 
 ```ts
 import {init} from '@alinea/sqlite-wasm'
-import {snapshotStorage} from '@alinea/sqlite-wasm/snapshots'
+import {
+  indexedDBSnapshotStorage,
+  opfsSnapshotStorage
+} from '@alinea/sqlite-wasm/snapshots'
 
 const {Database} = await init()
-const storage = snapshotStorage('entries')
+const storage = indexedDBSnapshotStorage('entries') // or opfsSnapshotStorage
 if (storage.supported()) {
-  const db = await storage.open(Database) // on the newest base, or empty
+  // The newest base of the group, or an empty database
+  const db = await storage.open(Database, {group: configHash})
   db.run('create table if not exists notes (text)')
   db.run('insert into notes values (?)', ['stored'])
-  await storage.checkpoint(db, contentHash) // writes base file contentHash
-  await storage.cleanup() // deletes base files nobody reads
+  await storage.checkpoint(db, contentHash, {
+    group: configHash,
+    meta: {tree: treeHash}
+  })
+  await storage.cleanup() // keeps the newest base of each group
 }
 ```
 
@@ -221,52 +230,69 @@ Workers read and change, where losing recent changes costs a reload. For a
 database whose commits must all be stored, use [OPFS storage](#opfs-storage)
 with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
 
-- There is no writable shared file: base files are never changed once
-  written, so two Workers can never corrupt each other's data. No
-  journal or WAL is written to OPFS; nothing is loaded into memory up
-  front.
-- `storage.open(Database)` opens the newest base file (by modification
-  time), and `storage.open(Database, name)` a given one. Without base
-  files the database starts empty. Opening a missing base fails with
-  `SQLITE_CANTOPEN`, a base that is not a database with `SQLITE_CORRUPT`.
+- There is no writable shared data: bases are never changed once written,
+  so two Workers can never corrupt each other's data. No journal or WAL is
+  written; nothing is loaded into memory up front.
+- `storage.open(Database)` opens the newest base, `storage.open(Database,
+  {group})` the newest of a group, and `storage.open(Database, key)` a
+  given one. Without a base to open, the database starts empty. Opening a
+  missing base fails with `SQLITE_CANTOPEN`, a base that is not a database
+  with `SQLITE_CORRUPT`. `await storage.list()` lists the bases, newest
+  first, with their `key`, `group`, `meta`, `createdAt` and `size`.
 - Changes are kept in memory until a checkpoint: commits since the last
   one are lost when the database closes or its Worker ends.
   `PRAGMA overlay_pages` tells how many pages a database holds in memory.
-- `await storage.checkpoint(db, name)` writes base file `name`: a copy of
-  the base file the database reads, streamed by the browser, with the
-  pages the database holds written over it, in one `createWritable()`
-  that appears at once when it closes. Then the database reads the new
-  file and drops the pages it wrote from memory; changes made while the
-  file was written stay. The database keeps working meanwhile: the
-  checkpoint captures the committed state when it is called.
-- Name base files by their content, such as a content hash: a checkpoint
-  to a name that exists writes nothing, leaves the database as it is, and
-  resolves to `false`. The newest checkpoint wins: new Workers open it, and
-  Workers on older bases keep reading those, with their own changes.
+- `await storage.checkpoint(db, key, {group, meta})` writes base `key`: the
+  base the database reads with the pages it holds written over it. Then
+  the database reads the new base and drops those pages from memory;
+  changes made meanwhile stay. The database keeps working: the checkpoint
+  captures the committed state when it is called. The group defaults to
+  the group of the base the database reads; `meta` is any data that
+  survives structured cloning.
+- Key bases by their content, such as a content hash: a checkpoint to a key
+  that exists writes nothing, leaves the database as it is, and resolves
+  to `false`. The newest checkpoint wins: new Workers open it, and Workers
+  on older bases keep reading those, with their own changes.
 - `db.fork()` works as usual; a fork keeps reading the base it was forked
-  on. `storage.checkpoint(fork, name)` writes a fork too.
-- Workers hold a shared Web Lock on each base file they read (also through
-  forks). `await storage.cleanup()` deletes the base files nobody reads,
-  except the newest, and resolves to their names. Without Web Locks it
-  keeps the newest two, which a Worker may still read, and two Workers
-  that checkpoint to the same name at once may both write it, leaving one
-  reading the other's file: every browser with `createWritable()` has Web
-  Locks.
-- SQLite keeps up to 8 MB of the pages it read in its page cache. Reading a
-  page from a base file takes from half a millisecond to two for 64 KB
-  pages; writing a 50 MB checkpoint less than a second (in Chromium).
+  on. `storage.checkpoint(fork, key)` writes a fork too.
+- `await storage.cleanup()` deletes every base that is not the newest of
+  its group, and resolves to their keys.
+- SQLite keeps up to 8 MB of the pages it read in its page cache
+  (`PRAGMA cache_size` changes it).
 - `checkpoint` fails during a write transaction (`SQLITE_BUSY`), and for a
   database stored elsewhere (`SQLITE_MISUSE`).
 
-Base files are read synchronously with `FileReaderSync` and written with
-`FileSystemFileHandle.createWritable()`, in dedicated and shared Workers;
-`storage.supported()` tells if both are there. It is tested in Chromium.
-`snapshotStorage(name, {directory})` keeps base files in a directory of
-OPFS other than its root, `{locks}` passes another Web Locks
-implementation (or `null` for none), and `new SnapshotStorage(name,
-directory)` keeps them in any other `SnapshotDirectory`.
+### Bases in IndexedDB
+
+`indexedDBSnapshotStorage(name)` keeps each base as a record of IndexedDB
+database `name`, with its key, group, meta, time and size, and its content
+as a Blob. A checkpoint composes a new Blob from slices of the old one and
+the changed pages, so the browser copies the old base itself, and adds it
+in one transaction. Workers read Blobs synchronously with `FileReaderSync`.
+A Blob stays readable after its record is deleted, so cleanup needs no
+locks: it deletes old bases even while Workers read them. Pass
+`{indexedDB, IDBKeyRange}` to use another implementation, such as
+fake-indexeddb.
+
+### Bases in OPFS
+
+`opfsSnapshotStorage(name)` keeps each base as a file in directory `name`
+of OPFS (or of `{directory}`), with its group and meta in a file next to
+it. A checkpoint streams the old base into a `createWritable()` of the new
+file, writes the changed pages over it, and closes it, which shows the file
+at once. A file stops being readable once it is deleted, so Workers hold a
+shared Web Lock on each base they read (also through forks), and cleanup
+keeps the bases a Worker reads. Checkpoints to one key lock it, so one
+Worker writes it. Without Web Locks (`{locks: null}`) cleanup keeps the
+newest two bases of each group; every browser with `createWritable()` has
+Web Locks. `new SnapshotStorage(directoryBaseStore(name, directory))` keeps
+files in any other `SnapshotDirectory`.
+
+Both are tested in Chromium, Firefox and WebKit, in dedicated and shared
+Workers; `storage.supported()` tells if the APIs they need are there.
 `readOnlyFile(blobOrBytes)` reads a `File`, `Blob` or `Uint8Array` as a
-read-only `SyncFile`.
+read-only `SyncFile`, and `new SnapshotStorage(store)` takes any other
+`BaseStore`.
 
 ## Native extension
 
@@ -325,7 +351,12 @@ bun test
 
 `bun run test:browser` runs the tests in `test/browser` in headless
 Chromium, which OPFS and snapshot storage need; install the browser
-it expects once with `bunx playwright-core install chromium`.
+it expects once with `bunx playwright-core install chromium`. Add
+`--browser firefox` or `--browser webkit` to run them in another browser.
+`bun script/test-browser.ts --bench` runs the snapshot storage benchmarks
+and writes their results to `bench-results/`, and
+`bun script/benchmark-report.ts` turns those into the tables of
+[BENCHMARKS.md](BENCHMARKS.md).
 
 `bun run build` also builds the native extension for the current platform
 into `dist/native`. `bun run build:native` rebuilds only that, and

@@ -199,3 +199,13 @@ export class MemoryLocks {
     }
   }
 }
+
+// FileReaderSync, which Bun lacks, for Blobs in memory: Bun resolves
+// reading them right away, which Bun.peek returns synchronously.
+export class MemoryFileReaderSync {
+  readAsArrayBuffer(blob) {
+    const result = Bun.peek(blob.arrayBuffer())
+    if (result instanceof Promise) throw new Error('Blob is not in memory')
+    return result
+  }
+}

@@ -51,7 +51,10 @@ export function opfsFileSystem(
       try {
         return await handle.createSyncAccessHandle()
       } catch (error) {
-        if ((error as DOMException)?.name === 'NoModificationAllowedError') {
+        // Chromium and Firefox: NoModificationAllowedError, WebKit:
+        // InvalidStateError
+        const name = (error as DOMException)?.name
+        if (name === 'NoModificationAllowedError' || name === 'InvalidStateError') {
           throw new SQLiteError(
             `OPFS file "${name}" is open in another Worker`,
             SQLITE_BUSY,

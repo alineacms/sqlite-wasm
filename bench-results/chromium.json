@@ -1,0 +1,181 @@
+{
+  "browser": "chromium",
+  "date": "2026-10-08T13:33:57.432Z",
+  "machine": {
+    "os": "Linux 6.18.44-fc-v80",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 4,
+    "memory": 16876494848
+  },
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/141.0.0.0 Safari/537.36",
+  "variants": {
+    "opfs": {
+      "firstBase": {
+        "ms": 245.1999999997206,
+        "size": 47448064,
+        "held": 47448064,
+        "wasmHeap": 50724864,
+        "wasmGrowth": 0
+      },
+      "open": {
+        "base": "base-0",
+        "openMs": 15.800000000279397,
+        "ms": 23.600000000093132
+      },
+      "queries": {
+        "point": {
+          "cold": 10.400000000372529,
+          "warm": 0.19999999972060323
+        },
+        "range": {
+          "cold": 2246.4000000003725,
+          "warm": 2372.399999999907
+        },
+        "full": {
+          "cold": 1526.6000000000931,
+          "warm": 1673
+        }
+      },
+      "queriesLargeCache": {
+        "point": {
+          "cold": 15.100000000093132,
+          "warm": 0.6000000000931323
+        },
+        "range": {
+          "cold": 1432.1000000000931,
+          "warm": 4.100000000093132
+        },
+        "full": {
+          "cold": 1416.5,
+          "warm": 54.39999999990687
+        }
+      },
+      "checkpoints": {
+        "10": {
+          "ms": 251.60000000009313,
+          "written": true,
+          "held": 1245184,
+          "wasmHeap": 50724864,
+          "wasmGrowth": 0
+        },
+        "1000": {
+          "ms": 483.60000000009313,
+          "written": true,
+          "held": 46333952,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        },
+        "20000": {
+          "ms": 455,
+          "written": true,
+          "held": 50397184,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        }
+      },
+      "twoWorkers": {
+        "seconds": 30,
+        "checkpoints": 28,
+        "readerRounds": 5532,
+        "bases": 2,
+        "expectedBases": 2,
+        "ok": true
+      },
+      "deletedRead": {
+        "error": "disk I/O error"
+      }
+    },
+    "indexeddb": {
+      "firstBase": {
+        "ms": 180,
+        "size": 47448064,
+        "held": 47448064,
+        "wasmHeap": 50724864,
+        "wasmGrowth": 0
+      },
+      "open": {
+        "base": "base-0",
+        "openMs": 37.799999999813735,
+        "ms": 45
+      },
+      "queries": {
+        "point": {
+          "cold": 6.5,
+          "warm": 0.10000000009313226
+        },
+        "range": {
+          "cold": 1648,
+          "warm": 2010.5
+        },
+        "full": {
+          "cold": 1560.2000000001863,
+          "warm": 1159.6999999997206
+        }
+      },
+      "queriesLargeCache": {
+        "point": {
+          "cold": 7.7000000001862645,
+          "warm": 0.20000000018626451
+        },
+        "range": {
+          "cold": 1033.3000000002794,
+          "warm": 3.5
+        },
+        "full": {
+          "cold": 903.0999999996275,
+          "warm": 31.40000000037253
+        }
+      },
+      "checkpoints": {
+        "10": {
+          "ms": 155.89999999990687,
+          "written": true,
+          "held": 1245184,
+          "wasmHeap": 50724864,
+          "wasmGrowth": 0
+        },
+        "1000": {
+          "ms": 254.79999999981374,
+          "written": true,
+          "held": 46333952,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        },
+        "20000": {
+          "ms": 784.1000000000931,
+          "written": true,
+          "held": 50397184,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        }
+      },
+      "twoWorkers": {
+        "seconds": 30,
+        "checkpoints": 30,
+        "readerRounds": 5562,
+        "bases": 1,
+        "expectedBases": 1,
+        "ok": true
+      },
+      "deletedRead": {
+        "ok": true,
+        "count": 20000,
+        "length": 41826237
+      }
+    }
+  },
+  "support": {
+    "shared opfs": {
+      "ok": true
+    },
+    "shared indexeddb": {
+      "ok": true
+    },
+    "dedicated opfs": {
+      "ok": true
+    },
+    "dedicated indexeddb": {
+      "ok": true
+    }
+  }
+}
