@@ -1,10 +1,10 @@
 # Snapshot storage benchmarks
 
 Snapshot storage (`@alinea/sqlite-wasm/snapshots`, see the README) keeps
-immutable bases either as files in OPFS (`opfsSnapshotStorage`) or as Blobs
-in IndexedDB (`indexedDBSnapshotStorage`). Everything above the store (the
-overlay over a read-only base, the changed pages, rebase, the API) is the
-same. These are measurements of both, to pick one for alinea's dashboard,
+immutable bases (snapshots) either as files in OPFS (`opfsSnapshots`) or as
+Blobs in IndexedDB (`indexedDBSnapshots`); a checkpoint below is what
+`session.save()` does. Everything above the store (the overlay over a
+read-only base, the changed pages, rebase, the API) is the same. These are measurements of both, to pick one for alinea's dashboard,
 where one SharedWorker per build opens an overlay over a shared base.
 
 ## Recommendation

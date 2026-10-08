@@ -45,34 +45,29 @@ list is kept in the `SQLITE_OMIT_FLAGS` variable in the Makefile.
 
 ## Snapshot storage
 
-`@alinea/sqlite-wasm/snapshots` keeps a database in immutable bases, which
-any number of Workers open at the same time, dedicated or shared, and of
-different builds of an app. Each opens a copy-on-write overlay on a base:
-SQLite reads pages from it as queries need them, and every change stays in
-that Worker's memory. A checkpoint writes a new base with the changes,
-which other Workers open from then on. Bases are kept as files in OPFS or
-as Blobs in IndexedDB; both have the same API, so either can be swapped in
-(see [BENCHMARKS.md](BENCHMARKS.md) to compare them).
+`@alinea/sqlite-wasm/snapshots` keeps a database as immutable snapshots,
+which any number of Workers open at the same time, dedicated or shared, and
+of different builds of an app. Each opens a session: a copy-on-write layer
+over a snapshot, from which SQLite reads pages as queries need them, while
+every change stays in that Worker's memory. Saving writes a new snapshot
+with the changes, which other Workers open from then on. Snapshots are kept
+as files in OPFS or as Blobs in IndexedDB; both have the same API, so either
+can be swapped in (see [BENCHMARKS.md](BENCHMARKS.md) to compare them).
 
 ```ts
 import {init} from '@alinea/sqlite-wasm'
-import {
-  indexedDBSnapshotStorage,
-  opfsSnapshotStorage
-} from '@alinea/sqlite-wasm/snapshots'
+import {indexedDBSnapshots, opfsSnapshots} from '@alinea/sqlite-wasm/snapshots'
 
 const {Database} = await init()
-const storage = indexedDBSnapshotStorage('entries') // or opfsSnapshotStorage
+const storage = indexedDBSnapshots('entries') // or opfsSnapshots
 if (storage.supported()) {
-  // The newest base of the group, or an empty database
-  const db = await storage.open(Database, {group: configHash})
-  db.run('create table if not exists notes (text)')
-  db.run('insert into notes values (?)', ['stored'])
-  await storage.checkpoint(db, contentHash, {
-    group: configHash,
-    meta: {tree: treeHash}
-  })
-  await storage.cleanup() // keeps the newest base of each group
+  // The head (newest snapshot) of the branch, or an empty database
+  const session = await storage.open(Database, {branch: configHash})
+  session.db.run('create table if not exists notes (text)')
+  session.db.run('insert into notes values (?)', ['stored'])
+  const saved = await session.save({key: contentHash, meta: {tree: treeHash}})
+  await storage.retain() // keeps the head of each branch
+  await session.close()
 }
 ```
 
@@ -81,129 +76,138 @@ Workers read and change, where losing recent changes costs a reload. For a
 database whose commits must all be stored, use [OPFS storage](#opfs-storage)
 with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
 
-- There is no writable shared data: bases are never changed once written,
-  so two Workers can never corrupt each other's data. No journal or WAL is
-  written; nothing is loaded into memory up front.
-- `storage.open(Database)` opens the newest base, `storage.open(Database,
-  {group})` the newest of a group, and `storage.open(Database, key)` a
-  given one. With `{group, fallback: 'any'}`, a group without bases opens
-  the newest base of any group. Without a base to open, the database
-  starts empty. Opening a missing base fails with `SQLITE_CANTOPEN`, a
-  base that is not a database with `SQLITE_CORRUPT`. `await
-  storage.list()` lists the bases, newest first, with their `key`,
-  `group`, `meta`, `createdAt` and `size`, and `baseOf(db)` returns the
-  one a database reads (after a checkpoint, the one it wrote), or
-  `undefined`.
-- Changes are kept in memory until a checkpoint: commits since the last
-  one are lost when the database closes or its Worker ends.
-  `PRAGMA overlay_pages` tells how many pages a database holds in memory.
-- `await storage.checkpoint(db, key, {group, meta})` writes base `key`: the
-  base the database reads with the pages it holds written over it. Then
-  the database reads the new base and drops those pages from memory;
-  changes made meanwhile stay. The database keeps working: the checkpoint
-  captures the committed state when it is called. The group defaults to
-  the one the database was opened for or last checkpointed to, else the
-  group of the base it reads; `meta` is any data that survives structured
+- There is no writable shared data: snapshots are never changed once
+  written, so two Workers can never corrupt each other's data. No journal or
+  WAL is written; nothing is loaded into memory up front.
+- A branch is a line of snapshots; the newest is its head. `storage.open(
+  Database)` opens the head of all branches, `{branch}` the head of a
+  branch, and `{key}` a given snapshot. With `{branch, fallback:
+  'any-branch'}`, a branch without snapshots opens the head of all. Without
+  a snapshot to open, the database starts empty. Opening a missing snapshot
+  fails with `SQLITE_CANTOPEN`, one that is not a database with
+  `SQLITE_CORRUPT`.
+- The session has the database as `session.db`, the snapshot it reads (after
+  a save, the one it wrote or joined) as `session.snapshot`, the branch it
+  saves to as `session.branch`, and the bytes of changed pages it holds in
+  memory as `session.held`. `await storage.list()` lists the snapshots,
+  newest first (`{branch}` for one branch), with their `key`, `branch`,
+  `meta`, `createdAt` and `size`; `await storage.head(branch)` returns the
+  head.
+- Changes are kept in memory until a save: commits since the last one are
+  lost when the session closes or its Worker ends. `await session.close()`
+  closes it, and `close({save: {key}})` saves first.
+- `await session.save({key, branch, meta})` writes snapshot `key` (by
+  default a key of its own): the snapshot the database reads with the pages
+  it holds written over it. Then the database reads the new snapshot and
+  drops those pages from memory; changes made meanwhile stay. The database
+  keeps working: the save captures the committed state when it is called,
+  and saves of a session run one at a time. `branch` defaults to the
+  session's, and becomes it; `meta` is any data that survives structured
   cloning.
-- Key bases by their content, such as a content hash: a checkpoint to a key
-  that exists writes nothing and resolves to `false`. If that base holds
-  the committed state of the database byte for byte, the database reads it
-  from then on and drops the pages it holds, as if it had written it; else
-  it stays as it is. Bytes only match when the same commits were made on
-  the same base: reaching the same content another way stores it
+- Key snapshots by their content, such as a content hash: a key that exists
+  is not written again. The result's `status` tells what happened:
+  `'written'`, a new snapshot; `'joined'`, the key holds the committed state
+  of the database byte for byte, so it reads that snapshot from then on as
+  if it had written it; `'mismatch'`, the key holds other content, and the
+  database stays as it is. Bytes only match when the same commits were made
+  on the same snapshot: reaching the same content another way stores it
   differently (the header counts commits, and free pages keep old bytes).
-  The newest checkpoint wins: new Workers open it, and Workers on older
-  bases keep reading those, with their own changes.
-- `db.fork()` works as usual; a fork keeps reading the base it was forked
-  on. `storage.checkpoint(fork, key)` writes a fork too.
-- `await storage.cleanup()` deletes every base that is not the newest of
-  its group, and resolves to their keys. `cleanup({keepGroups: n})` also
-  deletes the bases of all but the `n` groups with the newest bases (with
-  OPFS and no Web Locks, also ones Workers still read).
+  The newest save wins: new Workers open it, and Workers on older snapshots
+  keep reading those, with their own changes.
+- `session.fork()` is a new session on a fork of the database, with the same
+  snapshot, changes and branch, which saves on its own. `db.fork()` works
+  as usual too.
+- `storage.session(db, {branch})` makes a session for a database the
+  storage did not open, such as one loaded from bytes: its first save
+  writes all of it.
+- `await storage.retain()` deletes every snapshot that is not the head of
+  its branch, and resolves to their keys. `retain({perBranch: n})` keeps the
+  newest `n` of each branch, `retain({branches: n})` deletes every snapshot
+  of all but the `n` branches with the newest heads (with OPFS and no Web
+  Locks, also ones Workers still read), and `retain({pinned: keys})` never
+  deletes those keys.
 - SQLite keeps up to 8 MB of the pages it read in its page cache
   (`PRAGMA cache_size` changes it).
-- `checkpoint` fails during a write transaction (`SQLITE_BUSY`), and for a
-  database stored elsewhere (`SQLITE_MISUSE`).
+- `save` fails during a write transaction (`SQLITE_BUSY`), and `session`
+  for a database stored elsewhere (`SQLITE_MISUSE`).
 
-### Automatic checkpoints
+### Automatic saves
 
-Checkpoints are written when you call `checkpoint`, or, if you ask for it,
-by the database itself:
+Sessions save when you call `save`, or, if you ask for it, by themselves:
 
 ```ts
-const db = await storage.open(Database, {
-  group: configHash,
-  checkpoint: {
+const session = await storage.open(Database, {
+  branch: configHash,
+  autoSave: {
     maxHeld: 32 << 20, // once 32 MB of changed pages are held
     after: 5000, // 5 seconds after the last commit
-    key: db => contentKey(db), // or undefined to skip this checkpoint
+    key: db => contentKey(db), // or undefined to skip this save
     meta: db => ({tree: treeOf(db)})
   }
 })
 ```
 
-- `maxHeld` checkpoints as soon as the database holds that many bytes of
-  changed pages: a large import or reindex no longer holds the whole
-  database in memory. `after` checkpoints once commits stop for that many
-  milliseconds; each commit restarts the wait. Neither is on by default.
-- A checkpoint never starts inside a transaction (the commit that ends it
+- `maxHeld` saves as soon as the database holds that many bytes of changed
+  pages: a large import or reindex no longer holds the whole database in
+  memory. `after` saves once commits stop for that many milliseconds; each
+  commit restarts the wait. Neither is on by default.
+- A save never starts inside a transaction (the commit that ends it
   counts), and one runs at a time.
-- `key` names each base. Key bases by content where you can, so Workers
-  that reach the same content share one base; return `undefined` while the
-  database is between consistent states, such as halfway through a sync of
-  several transactions. Without `key`, every checkpoint gets a key of its
-  own.
-- `storage.autoCheckpoint(db, options)` does the same for a database you
-  already have, and returns a function that stops it; it also stops when
-  the database closes. Errors go to `onError` (default: `reportError`).
-- Checkpoints are not free (see [BENCHMARKS.md](BENCHMARKS.md), notably
-  IndexedDB in WebKit), so keep `after` at seconds rather than
-  milliseconds.
+- `key` names each snapshot. Key snapshots by content where you can, so
+  Workers that reach the same content share one snapshot; return
+  `undefined` while the database is between consistent states, such as
+  halfway through a sync of several transactions. Without `key`, every save
+  gets a key of its own.
+- `storage.session(db, {autoSave})` does the same for a database you
+  already have. Automatic saves stop when the session or its database
+  closes. Errors go to `onError` (default: `reportError`).
+- Saves are not free (see [BENCHMARKS.md](BENCHMARKS.md), notably IndexedDB
+  in WebKit), so keep `after` at seconds rather than milliseconds.
 
-### Bases in IndexedDB
+### Snapshots in IndexedDB
 
-`indexedDBSnapshotStorage(name)` keeps each base as a record of IndexedDB
-database `name`, with its key, group, meta, time and size, and its content
-as a Blob. A checkpoint composes a new Blob from slices of the old one and
-the changed pages, so the browser copies the old base itself, and adds it
-in one transaction. Workers read Blobs synchronously with `FileReaderSync`.
-A Blob stays readable after its record is deleted, so cleanup needs no
-locks: it deletes old bases even while Workers read them. Pass
+`indexedDBSnapshots(name)` keeps each snapshot as a record of IndexedDB
+database `name`, with its key, branch, meta, time and size, and its content
+as a Blob. A save composes a new Blob from slices of the old one and the
+changed pages, so the browser copies the old snapshot itself, and adds it in
+one transaction. Workers read Blobs synchronously with `FileReaderSync`. A
+Blob stays readable after its record is deleted, so `retain` needs no
+locks: it deletes old snapshots even while Workers read them. Pass
 `{indexedDB, IDBKeyRange}` to use another implementation, such as
 fake-indexeddb.
 
-### Bases in OPFS
+### Snapshots in OPFS
 
-`opfsSnapshotStorage(name)` keeps each base as a file in directory `name`
-of OPFS (or of `{directory}`), with its group and meta in a file next to
-it. A checkpoint streams the old base into a `createWritable()` of the new
-file, writes the changed pages over it, and closes it, which shows the file
-at once. A file stops being readable once it is deleted, so Workers hold a
-shared Web Lock on each base they read (also through forks), and cleanup
-keeps the bases a Worker reads. Checkpoints to one key lock it, so one
-Worker writes it. Without Web Locks (`{locks: null}`) cleanup keeps the
-newest two bases of each group, and bases still being written until they
+`opfsSnapshots(name)` keeps each snapshot as a file in directory `name` of
+OPFS (or of `{directory}`), with its branch and meta in a file next to it. A
+save streams the old snapshot into a `createWritable()` of the new file,
+writes the changed pages over it, and closes it, which shows the file at
+once. A file stops being readable once it is deleted, so Workers hold a
+shared Web Lock on each snapshot they read (also through forks), and
+`retain` keeps the snapshots a Worker reads. Saves to one key lock it, so
+one Worker writes it. Without Web Locks (`{locks: null}`) `retain` keeps
+one more snapshot per branch, and snapshots still being written until they
 are an hour old; every browser with `createWritable()` has Web Locks. `new
-SnapshotStorage(directoryBaseStore(name, directory))` keeps files in any
-other `SnapshotDirectory`.
+SnapshotStorage(directorySnapshotStore(name, directory))` keeps files in
+any other `SnapshotDirectory`.
 
-### Bases in memory
+### Snapshots in memory
 
-`memorySnapshotStorage(store)` keeps bases as bytes in a
-`memoryBaseStore()`, for tests and for Node and Bun, which have neither
-OPFS nor `FileReaderSync`. Storages given the same store share its bases,
-as Workers share OPFS or IndexedDB.
+`memorySnapshots(store)` keeps snapshots as bytes in a
+`memorySnapshotStore()`, for tests and for Node and Bun, which have neither
+OPFS nor `FileReaderSync`. Storages given the same store share its
+snapshots, as Workers share OPFS or IndexedDB.
 
-Bases in IndexedDB and in OPFS are tested in Chromium, Firefox and
+Snapshots in IndexedDB and in OPFS are tested in Chromium, Firefox and
 WebKit, in dedicated and shared Workers; `storage.supported()` tells if the
 APIs they need are there.
 `readOnlyFile(blobOrBytes)` reads a `File`, `Blob` or `Uint8Array` as a
 read-only `SyncFile`, and `new SnapshotStorage(store)` takes any other
-`BaseStore`.
+`SnapshotStore`.
 
 ## Storing every commit
 
-Snapshot storage keeps changes in memory until a checkpoint. When every
+Snapshot storage keeps changes in memory until a save. When every
 commit must be stored when it returns, and one Worker can own the database,
 use IndexedDB storage, which keeps the database in memory and writes each
 commit to IndexedDB, or OPFS storage, which keeps it in a file and reads

@@ -2,11 +2,10 @@ import {afterEach, beforeAll, beforeEach, describe, expect, test} from 'bun:test
 import {init} from '@alinea/sqlite-wasm'
 import {
   SnapshotStorage,
-  baseOf,
-  directoryBaseStore,
-  indexedDBSnapshotStorage,
-  memoryBaseStore,
-  memorySnapshotStorage,
+  directorySnapshotStore,
+  indexedDBSnapshots,
+  memorySnapshotStore,
+  memorySnapshots,
   readOnlyFile
 } from '@alinea/sqlite-wasm/snapshots'
 import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
@@ -16,7 +15,7 @@ import {
   MemorySnapshotDirectory
 } from './memory-file-system.js'
 
-// Exercise snapshot storage with bases as files (in an in-memory directory
+// Exercise snapshot storage with snapshots as files (in an in-memory directory
 // like OPFS, with in-memory Web Locks) and as Blobs in IndexedDB
 // (fake-indexeddb), see memory-file-system.js. Storages that share a
 // directory or IndexedDB stand in for Workers that share them.
@@ -41,6 +40,31 @@ afterEach(() => {
 function keep(db) {
   open.push(db)
   return db
+}
+
+// The session of each database: tests change databases directly and save
+// through their sessions. Databases a storage did not open get one from
+// the storage that saves them first.
+const sessions = new WeakMap()
+
+function register(session) {
+  sessions.set(session.db, session)
+  return keep(session.db)
+}
+
+function sessionOf(db, storage) {
+  let session = sessions.get(db)
+  if (!session) sessions.set(db, (session = storage.session(db)))
+  return session
+}
+
+const snapshotOf = db => sessions.get(db)?.snapshot
+
+// Save `db` to `key`, and resolve to the status
+function saveTo(storage, db, key, options = {}) {
+  return sessionOf(db, storage)
+    .save({key, ...options})
+    .then(result => result.status)
 }
 
 function rows(db, sql) {
@@ -85,7 +109,7 @@ const variants = {
         directory,
         locks,
         storage: (options = {locks}) =>
-          new SnapshotStorage(directoryBaseStore('entries', directory), options)
+          new SnapshotStorage(directorySnapshotStore('entries', directory), options)
       }
     }
   },
@@ -95,15 +119,15 @@ const variants = {
       const indexedDB = new IDBFactory()
       return {
         storage: () =>
-          indexedDBSnapshotStorage('entries', {indexedDB, IDBKeyRange})
+          indexedDBSnapshots('entries', {indexedDB, IDBKeyRange})
       }
     }
   },
   memory: {
     locking: false,
     setup() {
-      const store = memoryBaseStore()
-      return {storage: () => memorySnapshotStorage(store)}
+      const store = memorySnapshotStore()
+      return {storage: () => memorySnapshots(store)}
     }
   }
 }
@@ -119,14 +143,17 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
     })
 
     async function openDb(which) {
-      return keep(await storage().open(Database, which))
+      const options = typeof which === 'string' ? {key: which} : which
+      return register(await storage().open(Database, options))
     }
 
+    const save = (db, key, options) => saveTo(storage(), db, key, options)
+
     // Put `data` in base `key` as it is, damaged or not.
-    function put(key, data, group = '') {
+    function put(key, data, branch = '') {
       return storage().store.write({
         key,
-        group,
+        branch,
         meta: {},
         base: data,
         visible: data.byteLength,
@@ -151,7 +178,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('reads pages from the base and keeps changes in memory', async () => {
         const db = await openDb()
         fill(db, 2000)
-        expect(await storage().checkpoint(db, 'v1')).toBe(true)
+        expect(await save(db, 'v1')).toBe('written')
         const written = await content('v1')
         const other = await openDb('v1')
         expect(held(other)).toBe(0)
@@ -169,61 +196,61 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(await content('v1')).toEqual(written)
       })
 
-      test('picks the newest base, of all or of a group, or one by key', async () => {
+      test('picks the head, of all or of a branch, or a snapshot by key', async () => {
         const db = await openDb()
         fill(db, 10)
-        await storage().checkpoint(db, 'b', {group: 'one'})
+        await save(db, 'b', {branch: 'one'})
         db.run('delete from items where id >= 5')
-        await storage().checkpoint(db, 'a', {group: 'two', meta: {tree: 'x'}})
+        await save(db, 'a', {branch: 'two', meta: {tree: 'x'}})
         db.run('delete from items where id >= 3')
-        // Inherits the group of the base the database reads.
-        await storage().checkpoint(db, 'c')
+        // Saves to the branch of the last save.
+        await save(db, 'c')
         const list = await storage().list()
-        expect(list.map(({key, group, meta}) => ({key, group, meta}))).toEqual([
-          {key: 'c', group: 'two', meta: {}},
-          {key: 'a', group: 'two', meta: {tree: 'x'}},
-          {key: 'b', group: 'one', meta: {}}
+        expect(list.map(({key, branch, meta}) => ({key, branch, meta}))).toEqual([
+          {key: 'c', branch: 'two', meta: {}},
+          {key: 'a', branch: 'two', meta: {tree: 'x'}},
+          {key: 'b', branch: 'one', meta: {}}
         ])
         expect(list[0].size).toBe((await content('c')).byteLength)
         expect(list[0].createdAt).toBeGreaterThan(list[1].createdAt)
         const count = async which =>
           rows(await openDb(which), 'select count(*) from items')[0][0]
         expect(await count()).toBe(3)
-        expect(await count({group: 'one'})).toBe(10)
-        expect(await count({group: 'two'})).toBe(3)
+        expect(await count({branch: 'one'})).toBe(10)
+        expect(await count({branch: 'two'})).toBe(3)
         expect(await count({key: 'a'})).toBe(5)
         expect(await count('b')).toBe(10)
-        expect(db.base.group).toBe('two')
-        // A group without bases starts empty, or with fallback, on the
-        // newest base; baseOf tells which.
-        expect(baseOf(await openDb({group: 'three'}))).toBeUndefined()
-        const fallback = await openDb({group: 'three', fallback: 'any'})
-        expect(baseOf(fallback)).toEqual(list[0])
-        expect(baseOf(await openDb({group: 'one', fallback: 'any'})).key).toBe('b')
-        // A database follows its checkpoints.
-        expect(baseOf(db)).toEqual(list[0])
-        expect(baseOf(keep(new Database()))).toBeUndefined()
+        expect(db.base.branch).toBe('two')
+        // A branch without snapshots starts empty, or with fallback, on the
+        // head of all; session.snapshot tells which.
+        expect(snapshotOf(await openDb({branch: 'three'}))).toBeUndefined()
+        const fallback = await openDb({branch: 'three', fallback: 'any-branch'})
+        expect(snapshotOf(fallback)).toEqual(list[0])
+        expect(snapshotOf(await openDb({branch: 'one', fallback: 'any-branch'})).key).toBe('b')
+        // A database follows its saves.
+        expect(snapshotOf(db)).toEqual(list[0])
+        expect(snapshotOf(keep(new Database()))).toBeUndefined()
       })
 
       test('skips empty bases, which are being written', async () => {
         const db = await openDb()
         fill(db, 10)
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         await put('v2', new Uint8Array(0))
         expect(rows(await openDb(), 'select count(*) from items')).toEqual([[10]])
-        await expect(storage().open(Database, 'v2'))
+        await expect(storage().open(Database, {key: 'v2'}))
           .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
       })
 
       test('fails with SQLITE_CANTOPEN for a missing base', async () => {
-        await expect(storage().open(Database, 'missing'))
+        await expect(storage().open(Database, {key: 'missing'}))
           .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
       })
 
       test('fails with SQLITE_CORRUPT for a damaged base', async () => {
         const db = await openDb()
         fill(db, 1000)
-        await storage().checkpoint(db, 'good')
+        await save(db, 'good')
         const good = await content('good')
         await put('garbage', new Uint8Array(8192).fill(7))
         await put('truncated', good.slice(0, good.byteLength / 2))
@@ -237,7 +264,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         // Nothing stays locked: only db holds a lock, on good. The newest
         // base is kept, damaged or not.
         if (locking) expect(env.locks.held.size).toBe(1)
-        expect((await storage().cleanup()).sort()).toEqual(
+        expect((await storage().retain()).sort()).toEqual(
           locking ? ['garbage', 'truncated'] : ['garbage', 'good', 'truncated']
         )
         expect(rows(db, 'select count(*) from items')).toEqual([[1000]])
@@ -249,7 +276,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 3000))
-        expect(await storage().checkpoint(db, 'v1')).toBe(true)
+        expect(await save(db, 'v1')).toBe('written')
         // Every page is in the base now.
         expect(held(db)).toBe(0)
         expect(db.export()).toEqual(reference.export())
@@ -262,7 +289,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(held(db)).toBeGreaterThan(0)
         const fork = keep(db.fork())
         const atFork = dump(fork)
-        expect(await storage().checkpoint(db, 'v2')).toBe(true)
+        expect(await save(db, 'v2')).toBe('written')
         expect(held(db)).toBe(0)
         expect(db.export()).toEqual(reference.export())
         // The fork still reads the first base, unchanged.
@@ -281,13 +308,13 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 3000))
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         both(db, reference, db => {
           db.run('delete from items where id >= 200')
           db.run('vacuum')
         })
         expect(dump(db)).toEqual(dump(reference))
-        await storage().checkpoint(db, 'v2')
+        await save(db, 'v2')
         expect((await content('v2')).byteLength)
           .toBeLessThan((await content('v1')).byteLength / 5)
         // Shrink below the new base and grow past it before the next one.
@@ -297,7 +324,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           fill(db, 1000, 700, 10_000)
         })
         expect(db.export()).toEqual(reference.export())
-        await storage().checkpoint(db, 'v3')
+        await save(db, 'v3')
         expect(db.export()).toEqual(reference.export())
         const reopened = await openDb('v3')
         expect(reopened.export()).toEqual(reference.export())
@@ -307,11 +334,11 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 3000))
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         both(db, reference, db => db.run("update items set body = 'before' where id < 1000"))
         const atCheckpoint = keep(reference.fork())
         let done = false
-        const checkpoint = storage().checkpoint(db, 'v2').finally(() => (done = true))
+        const checkpoint = save(db, 'v2').finally(() => (done = true))
         let writes = 0
         while (!done) {
           both(db, reference, db =>
@@ -320,7 +347,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           writes++
           await tick()
         }
-        expect(await checkpoint).toBe(true)
+        expect(await checkpoint).toBe('written')
         // At least one, made after checkpoint was called
         expect(writes).toBeGreaterThan(0)
         // The base holds the state the checkpoint started from, the
@@ -335,12 +362,12 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('run one at a time per database, each from when it was called', async () => {
         const db = await openDb()
         fill(db, 100)
-        const first = storage().checkpoint(db, 'v1')
+        const first = save(db, 'v1')
         db.run('delete from items where id >= 50')
-        const second = storage().checkpoint(db, 'v2')
+        const second = save(db, 'v2')
         db.run('delete from items where id >= 20')
-        const third = storage().checkpoint(db, 'v3')
-        expect(await Promise.all([first, second, third])).toEqual([true, true, true])
+        const third = save(db, 'v3')
+        expect(await Promise.all([first, second, third])).toEqual(['written', 'written', 'written'])
         expect(rows(await openDb('v1'), 'select count(*) from items')).toEqual([[100]])
         expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[50]])
         expect(rows(await openDb('v3'), 'select count(*) from items')).toEqual([[20]])
@@ -351,12 +378,12 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('skip a key that exists, leaving the database as it is', async () => {
         const a = await openDb()
         fill(a, 100)
-        await storage().checkpoint(a, 'v1')
+        await save(a, 'v1')
         const written = await content('v1')
         const b = await openDb('v1')
         b.run('delete from items where id >= 10')
         const pages = held(b)
-        expect(await storage().checkpoint(b, 'v1')).toBe(false)
+        expect(await save(b, 'v1')).toBe('mismatch')
         expect(await content('v1')).toEqual(written)
         expect(held(b)).toBe(pages)
         expect(rows(b, 'select count(*) from items')).toEqual([[10]])
@@ -369,10 +396,10 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         fill(a, 100)
         fill(b, 100)
         const results = await Promise.all([
-          storage().checkpoint(a, 'same'),
-          storage().checkpoint(b, 'same')
+          save(a, 'same'),
+          save(b, 'same')
         ])
-        expect([...results].sort()).toEqual([false, true])
+        expect([...results].sort()).toEqual(['joined', 'written'])
         // The other finds the same content there, and reads it too.
         for (const db of [a, b]) {
           expect(db.base.key).toBe('same')
@@ -385,13 +412,13 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const b = await openDb()
         fill(a, 100)
         fill(b, 100)
-        expect(await storage().checkpoint(a, 'same')).toBe(true)
+        expect(await save(a, 'same')).toBe('written')
         const written = await content('same')
         expect(held(b)).toBeGreaterThan(0)
-        expect(await storage().checkpoint(b, 'same')).toBe(false)
+        expect(await save(b, 'same')).toBe('joined')
         expect(await content('same')).toEqual(written)
         expect(held(b)).toBe(0)
-        expect(baseOf(b).key).toBe('same')
+        expect(snapshotOf(b).key).toBe('same')
         expect(dump(b)).toEqual(dump(a))
         b.run('delete from items where id >= 10')
         expect(rows(b, 'select count(*) from items')).toEqual([[10]])
@@ -401,19 +428,19 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('move onto a key that exists from the same base', async () => {
         const first = await openDb()
         fill(first, 2000)
-        await storage().checkpoint(first, 'v1')
+        await save(first, 'v1')
         first.close()
         const a = await openDb('v1')
         const b = await openDb('v1')
         for (const db of [a, b])
           db.run("update items set body = 'changed' where id % 100 = 0")
-        expect(await storage().checkpoint(a, 'v2')).toBe(true)
-        expect(await storage().checkpoint(b, 'v2')).toBe(false)
+        expect(await save(a, 'v2')).toBe('written')
+        expect(await save(b, 'v2')).toBe('joined')
         expect(held(b)).toBe(0)
-        expect(baseOf(b).key).toBe('v2')
+        expect(snapshotOf(b).key).toBe('v2')
         expect(b.export()).toEqual(a.export())
         // Nobody reads v1 anymore; with locks, both hold v2.
-        expect(await storage().cleanup()).toEqual(['v1'])
+        expect(await storage().retain()).toEqual(['v1'])
         if (locking)
           expect([...env.locks.held.values()].map(lock => lock.count))
             .toEqual([2])
@@ -431,12 +458,12 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         fill(c, 100)
         c.run("update items set body = replace(body, 'x', 'y')")
         expect(rows(c, 'pragma page_count')).toEqual(rows(a, 'pragma page_count'))
-        expect(await storage().checkpoint(a, 'same')).toBe(true)
+        expect(await save(a, 'same')).toBe('written')
         for (const db of [b, c]) {
           const pages = held(db)
-          expect(await storage().checkpoint(db, 'same')).toBe(false)
+          expect(await save(db, 'same')).toBe('mismatch')
           expect(held(db)).toBe(pages)
-          expect(baseOf(db)).toBeUndefined()
+          expect(snapshotOf(db)).toBeUndefined()
         }
         expect(rows(b, 'select count(*) from items')).toEqual([[200]])
         expect(rows(c, "select count(*) from items where body like '%y'"))
@@ -446,7 +473,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('compare bases larger than one read', async () => {
         const first = await openDb()
         fill(first, 7000, 1000)
-        await storage().checkpoint(first, 'v1')
+        await save(first, 'v1')
         first.close()
         const change = (db, last) => {
           db.run('begin')
@@ -460,15 +487,15 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         change(a, 'last')
         change(b, 'last')
         change(c, 'other')
-        expect(await storage().checkpoint(a, 'v2')).toBe(true)
-        expect(await storage().checkpoint(b, 'v2')).toBe(false)
+        expect(await save(a, 'v2')).toBe('written')
+        expect(await save(b, 'v2')).toBe('joined')
         expect(held(b)).toBe(0)
-        expect(baseOf(b).key).toBe('v2')
-        expect(await storage().checkpoint(c, 'v2')).toBe(false)
+        expect(snapshotOf(b).key).toBe('v2')
+        expect(await save(c, 'v2')).toBe('mismatch')
         expect(held(c)).toBeGreaterThan(0)
-        expect(baseOf(c).key).toBe('v1')
+        expect(snapshotOf(c).key).toBe('v1')
         // c differs from v2 only past the first read of 4 MB.
-        await storage().checkpoint(c, 'c2')
+        await save(c, 'c2')
         const v2 = await content('v2')
         const c2 = await content('c2')
         expect(v2.byteLength).toBeGreaterThan(5 << 20)
@@ -482,17 +509,17 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('move a queued snapshot along onto a key that exists', async () => {
         const first = await openDb()
         fill(first, 1000)
-        await storage().checkpoint(first, 'v1')
+        await save(first, 'v1')
         first.close()
         const twin = await openDb('v1')
         const db = await openDb('v1')
         for (const it of [twin, db])
           it.run("update items set body = 'one' where id < 300")
-        expect(await storage().checkpoint(twin, 'v2')).toBe(true)
-        const second = storage().checkpoint(db, 'v2')
+        expect(await save(twin, 'v2')).toBe('written')
+        const second = save(db, 'v2')
         db.run('delete from items where id >= 700')
-        const third = storage().checkpoint(db, 'v3')
-        expect(await Promise.all([second, third])).toEqual([false, true])
+        const third = save(db, 'v3')
+        expect(await Promise.all([second, third])).toEqual(['joined', 'written'])
         // The third snapshot followed db onto v2, and wrote v3 over it.
         expect(db.base.key).toBe('v3')
         expect(held(db)).toBe(0)
@@ -502,26 +529,29 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(dump(reopened)).toEqual(dump(db))
       })
 
-      test('leave a database that reads the key as it is', async () => {
+      test('join the key a database reads when nothing changed, else mismatch', async () => {
         const a = await openDb()
         fill(a, 100)
-        await storage().checkpoint(a, 'v1')
+        await save(a, 'v1')
         const b = await openDb('v1')
         for (const db of [a, b]) {
           const base = db.base
-          expect(await storage().checkpoint(db, 'v1')).toBe(false)
+          expect(await save(db, 'v1')).toBe('joined')
           expect(db.base).toBe(base)
           expect(held(db)).toBe(0)
         }
+        b.run('delete from items where id = 1')
+        expect(await save(b, 'v1')).toBe('mismatch')
+        expect(held(b)).toBeGreaterThan(0)
       })
 
       test('move a database in a transaction that wrote pages meanwhile', async () => {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 1000))
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         both(db, reference, db => db.run("update items set body = 'one' where id < 100"))
-        const checkpoint = storage().checkpoint(db, 'v2')
+        const checkpoint = save(db, 'v2')
         // A small page cache makes the transaction write its pages.
         db.run('pragma cache_size = 2')
         both(db, reference, db => {
@@ -529,7 +559,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           db.run("update items set body = 'two' where id >= 500")
           db.run("insert into items (body) values ('three')")
         })
-        expect(await checkpoint).toBe(true)
+        expect(await checkpoint).toBe('written')
         expect(db.base.key).toBe('v2')
         both(db, reference, db => db.run('commit'))
         expect(db.export()).toEqual(reference.export())
@@ -542,11 +572,11 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('write the base of a database closed meanwhile', async () => {
         const db = await openDb()
         fill(db, 100)
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         db.run('delete from items where id >= 10')
-        const checkpoint = storage().checkpoint(db, 'v2')
+        const checkpoint = save(db, 'v2')
         db.close()
-        expect(await checkpoint).toBe(true)
+        expect(await checkpoint).toBe('written')
         expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[10]])
         // Only the database just opened holds a lock.
         if (locking) expect(env.locks.held.size).toBe(1)
@@ -556,7 +586,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 1000))
-        await storage().checkpoint(db, 'v0')
+        await save(db, 'v0')
         const proto = Object.getPrototypeOf(db)
         const rebase = proto.rebase
         let calls = 0
@@ -567,11 +597,11 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         }
         try {
           both(db, reference, db => db.run("update items set body = 'one' where id < 300"))
-          const first = storage().checkpoint(db, 'v1')
+          const first = save(db, 'v1')
           both(db, reference, db => db.run("update items set body = 'two' where id >= 700"))
           atSecond = keep(reference.fork())
-          const second = storage().checkpoint(db, 'v2')
-          expect(await Promise.all([first, second])).toEqual([true, true])
+          const second = save(db, 'v2')
+          expect(await Promise.all([first, second])).toEqual(['written', 'written'])
         } finally {
           proto.rebase = rebase
         }
@@ -579,51 +609,51 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         // stays on v1, which it still reads.
         expect(db.base.key).toBe('v1')
         expect((await openDb('v2')).export()).toEqual(atSecond.export())
-        expect((await storage().cleanup()).sort()).toEqual(
+        expect((await storage().retain()).sort()).toEqual(
           locking ? ['v0'] : ['v0', 'v1']
         )
         expect(db.export()).toEqual(reference.export())
         both(db, reference, db => db.run('delete from items where id % 3 = 0'))
-        await storage().checkpoint(db, 'v3')
+        await save(db, 'v3')
         expect(db.base.key).toBe('v3')
         expect((await openDb('v3')).export()).toEqual(reference.export())
       })
 
-      test('default to the group a database was opened for', async () => {
+      test('default to the branch a session was opened for', async () => {
         const db = await openDb()
         fill(db, 10)
-        await storage().checkpoint(db, 'one', {group: 'cfg1'})
-        const other = await openDb({group: 'cfg2', fallback: 'any'})
-        expect(baseOf(other).group).toBe('cfg1')
+        await save(db, 'one', {branch: 'cfg1'})
+        const other = await openDb({branch: 'cfg2', fallback: 'any-branch'})
+        expect(snapshotOf(other).branch).toBe('cfg1')
         other.run('delete from items where id = 1')
-        await storage().checkpoint(other, 'two')
-        expect(baseOf(other).group).toBe('cfg2')
-        // And to the group of its last checkpoint, also while it is pending.
+        await save(other, 'two')
+        expect(snapshotOf(other).branch).toBe('cfg2')
+        // And to the branch of its last save, also while it is pending.
         other.run('delete from items where id = 2')
-        const three = storage().checkpoint(other, 'three', {group: 'cfg3'})
+        const three = save(other, 'three', {branch: 'cfg3'})
         other.run('delete from items where id = 3')
-        const four = storage().checkpoint(other, 'four')
+        const four = save(other, 'four')
         await Promise.all([three, four])
-        expect(baseOf(other).group).toBe('cfg3')
+        expect(snapshotOf(other).branch).toBe('cfg3')
       })
 
       test('release every base of a database closed with checkpoints queued', async () => {
         const db = await openDb()
         fill(db, 100)
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         const queued = []
         for (let i = 2; i <= 4; i++) {
           db.run(`delete from items where id = ${i}`)
-          queued.push(storage().checkpoint(db, `v${i}`))
+          queued.push(save(db, `v${i}`))
         }
         db.close()
-        expect(await Promise.all(queued)).toEqual([true, true, true])
+        expect(await Promise.all(queued)).toEqual(['written', 'written', 'written'])
         if (locking) {
           // Locks are released once the last snapshot closes, a tick later.
           await tick()
           expect(env.locks.held.size).toBe(0)
         }
-        expect((await storage().cleanup()).sort()).toEqual(['v1', 'v2', 'v3'])
+        expect((await storage().retain()).sort()).toEqual(['v1', 'v2', 'v3'])
         expect(rows(await openDb(), 'select count(*) from items')).toEqual([[97]])
       })
 
@@ -632,17 +662,17 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         fill(db, 10)
         db.run('begin')
         db.run('delete from items')
-        await expect(storage().checkpoint(db, 'v1'))
+        await expect(save(db, 'v1'))
           .rejects.toMatchObject({code: 'SQLITE_BUSY'})
         db.run('commit')
-        expect(await storage().checkpoint(db, 'v1')).toBe(true)
+        expect(await save(db, 'v1')).toBe('written')
       })
 
       test('store databases loaded into memory', async () => {
         const source = keep(new Database())
         fill(source, 500)
         const db = keep(new Database(source.export()))
-        await storage().checkpoint(db, 'loaded')
+        await save(db, 'loaded')
         expect(held(db)).toBe(0)
         expect(rows(await openDb('loaded'), 'select count(*) from items'))
           .toEqual([[500]])
@@ -663,7 +693,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         (await storage().list()).filter(base => base.size > 0).map(base => base.key)
 
       test('are off unless after or maxHeld is given', async () => {
-        const db = await openDb({checkpoint: {}})
+        const db = await openDb({autoSave: {}})
         fill(db, 100)
         await wait(50)
         expect(await keys()).toEqual([])
@@ -672,8 +702,8 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       test('wait for commits to stop, after', async () => {
         let n = 0
         const db = await openDb({
-          group: 'g',
-          checkpoint: {after: 40, key: () => `v${++n}`, meta: db => ({rows: rows(db, 'select count(*) from items')[0][0]})}
+          branch: 'g',
+          autoSave: {after: 40, key: () => `v${++n}`, meta: db => ({rows: rows(db, 'select count(*) from items')[0][0]})}
         })
         for (let i = 0; i < 5; i++) {
           fill(db, 10, 100, i * 10)
@@ -683,14 +713,14 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         await until(async () => (await keys()).length === 1)
         await wait(60)
         const [base] = await storage().list()
-        expect(base).toMatchObject({key: 'v1', group: 'g', meta: {rows: 50}})
-        expect(baseOf(db).key).toBe('v1')
+        expect(base).toMatchObject({key: 'v1', branch: 'g', meta: {rows: 50}})
+        expect(snapshotOf(db).key).toBe('v1')
         expect(held(db)).toBe(0)
       })
 
       test('bound the pages held, with maxHeld', async () => {
         const reference = keep(new Database())
-        const db = await openDb({checkpoint: {maxHeld: 256 << 10}})
+        const db = await openDb({autoSave: {maxHeld: 256 << 10}})
         for (let i = 0; i < 20; i++) {
           both(db, reference, db => fill(db, 100, 500, i * 100))
           await tick()
@@ -709,7 +739,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
 
       test('skip a checkpoint when key returns undefined', async () => {
         let ready = false
-        const db = await openDb({checkpoint: {after: 10, key: () => (ready ? 'ready' : undefined)}})
+        const db = await openDb({autoSave: {after: 10, key: () => (ready ? 'ready' : undefined)}})
         fill(db, 10)
         await wait(40)
         expect(await keys()).toEqual([])
@@ -720,7 +750,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
 
       test('never start inside a transaction', async () => {
-        const db = await openDb({checkpoint: {after: 10}})
+        const db = await openDb({autoSave: {after: 10}})
         fill(db, 10)
         db.run('begin')
         await wait(1)
@@ -733,24 +763,31 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(rows(await openDb((await keys())[0]), 'select count(*) from items')).toEqual([[0]])
       })
 
-      test('stop when the database closes, or when asked', async () => {
-        const db = await openDb({checkpoint: {after: 10}})
+      test('stop when the session or its database closes', async () => {
+        const db = await openDb({autoSave: {after: 10}})
         fill(db, 10)
         db.close()
         await wait(40)
         expect(await keys()).toEqual([])
-        const other = await openDb()
-        const stop = storage().autoCheckpoint(other, {after: 10})
-        fill(other, 10)
-        stop()
+        const session = await storage().open(Database, {autoSave: {after: 10}})
+        fill(session.db, 10)
+        await session.close()
         await wait(40)
         expect(await keys()).toEqual([])
+      })
+
+      test('save sessions made for databases a storage did not open', async () => {
+        const db = keep(new Database())
+        storage().session(db, {branch: 'loaded', autoSave: {after: 10}})
+        fill(db, 10)
+        await until(async () => (await keys()).length === 1)
+        expect((await storage().head('loaded')).size).toBeGreaterThan(0)
       })
 
       test('report errors', async () => {
         const errors = []
         const db = await openDb({
-          checkpoint: {
+          autoSave: {
             after: 5,
             key: () => {
               throw new Error('no key')
@@ -764,25 +801,98 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
       })
     })
 
+    describe('Sessions', () => {
+      test('tell the snapshot, branch and bytes held', async () => {
+        const session = await storage().open(Database, {branch: 'main'})
+        keep(session.db)
+        expect(session.snapshot).toBeUndefined()
+        expect(session.branch).toBe('main')
+        fill(session.db, 100)
+        expect(session.held).toBe(held(session.db) * 4096)
+        const result = await session.save({key: 'v1', meta: {n: 1}})
+        expect(result).toEqual({status: 'written', snapshot: session.snapshot})
+        expect(session.snapshot).toMatchObject({key: 'v1', branch: 'main', meta: {n: 1}})
+        expect(session.held).toBe(0)
+        // Saving to another branch moves the session to it.
+        session.db.run('delete from items where id = 1')
+        await session.save({branch: 'other'})
+        expect(session.branch).toBe('other')
+        expect(session.snapshot.key).toMatch(/^auto-/)
+      })
+
+      test('report the snapshot a mismatch found', async () => {
+        const a = await storage().open(Database)
+        const b = await storage().open(Database)
+        keep(a.db)
+        keep(b.db)
+        fill(a.db, 10)
+        fill(b.db, 20)
+        await a.save({key: 'same', meta: {by: 'a'}})
+        const result = await b.save({key: 'same'})
+        expect(result.status).toBe('mismatch')
+        expect(result.snapshot).toMatchObject({key: 'same', meta: {by: 'a'}})
+        expect(b.snapshot).toBeUndefined()
+      })
+
+      test('fork with their changes and branch, and save on their own', async () => {
+        const session = await storage().open(Database, {branch: 'main'})
+        keep(session.db)
+        fill(session.db, 100)
+        await session.save({key: 'v1'})
+        session.db.run('delete from items where id >= 50')
+        const draft = session.fork()
+        keep(draft.db)
+        expect(draft.branch).toBe('main')
+        expect(draft.snapshot.key).toBe('v1')
+        draft.db.run('delete from items where id >= 10')
+        expect((await draft.save({key: 'draft'})).status).toBe('written')
+        expect(rows(session.db, 'select count(*) from items')).toEqual([[50]])
+        expect(session.snapshot.key).toBe('v1')
+        expect(rows(await openDb('draft'), 'select count(*) from items')).toEqual([[10]])
+      })
+
+      test('save on close when asked, and wait for queued saves', async () => {
+        const session = await storage().open(Database)
+        fill(session.db, 100)
+        const queued = session.save({key: 'v1'})
+        session.db.run('delete from items where id >= 10')
+        await session.close({save: {key: 'v2'}})
+        expect(session.db.isClosed()).toBe(true)
+        expect((await queued).status).toBe('written')
+        expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[10]])
+        // Closing twice does nothing.
+        await session.close()
+      })
+
+      test('refuse databases stored elsewhere', () => {
+        const db = keep(new Database())
+        db.persistence = {flush: async () => {}, close() {}}
+        expect(() => storage().session(db)).toThrow(
+          expect.objectContaining({code: 'SQLITE_MISUSE'})
+        )
+        db.persistence = undefined
+      })
+    })
+
     describe('Forks', () => {
       test('keep reading their base after the database closes and moves on', async () => {
         const db = await openDb()
         fill(db, 1000)
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         const fork = keep(db.fork())
         const forkOfFork = keep(fork.fork())
         db.run('delete from items')
-        await storage().checkpoint(db, 'v2')
+        await save(db, 'v2')
         db.close()
         expect(rows(fork, 'select count(*) from items')).toEqual([[1000]])
         if (locking) {
           // They hold the lock on v1 between them.
-          expect(await storage().cleanup()).toEqual([])
+          expect(await storage().retain()).toEqual([])
           fork.close()
-          expect(await storage().cleanup()).toEqual([])
+          expect(await storage().retain()).toEqual([])
           forkOfFork.close()
         }
-        expect(await storage().cleanup()).toEqual(['v1'])
+        expect(await storage().retain()).toEqual(['v1'])
         // A fresh fork reads every page from the base again.
         if (!locking) {
           const fresh = keep(forkOfFork.fork())
@@ -791,13 +901,13 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         }
       })
 
-      test('can be checkpointed themselves', async () => {
+      test('can be saved themselves', async () => {
         const db = await openDb()
         fill(db, 100)
-        await storage().checkpoint(db, 'v1')
+        await save(db, 'v1')
         const fork = keep(db.fork())
         fork.run('delete from items where id >= 30')
-        expect(await storage().checkpoint(fork, 'fork')).toBe(true)
+        expect(await save(fork, 'fork')).toBe('written')
         expect(held(fork)).toBe(0)
         expect(rows(await openDb('fork'), 'select count(*) from items')).toEqual([[30]])
         expect(rows(db, 'select count(*) from items')).toEqual([[100]])
@@ -805,39 +915,54 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
     })
 
     describe('Cleanup', () => {
-      test('keeps the newest base of each group', async () => {
+      test('keeps the head of each branch', async () => {
         const db = await openDb()
         fill(db, 10)
         for (const key of ['a1', 'a2', 'a3']) {
           db.run(`insert into items (body) values ('${key}')`)
-          await storage().checkpoint(db, key, {group: 'a'})
+          await save(db, key, {branch: 'a'})
         }
         const other = keep(new Database())
         fill(other, 5)
-        await storage().checkpoint(other, 'b1', {group: 'b'})
+        await save(other, 'b1', {branch: 'b'})
         other.run('delete from items where id = 1')
-        await storage().checkpoint(other, 'b2')
+        await save(other, 'b2')
         other.close()
-        expect((await storage().cleanup()).sort()).toEqual(['a1', 'a2', 'b1'])
+        expect((await storage().retain()).sort()).toEqual(['a1', 'a2', 'b1'])
         expect((await storage().list()).map(base => base.key).sort()).toEqual(['a3', 'b2'])
-        expect(rows(await openDb({group: 'a'}), 'select count(*) from items')).toEqual([[13]])
+        expect(rows(await openDb({branch: 'a'}), 'select count(*) from items')).toEqual([[13]])
       })
 
-      test('refuses keepGroups that is not a whole number', async () => {
-        for (const keepGroups of [-1, 1.5, NaN])
-          await expect(storage().cleanup({keepGroups})).rejects.toThrow(RangeError)
+      test('refuses counts that are not whole numbers', async () => {
+        for (const branches of [-1, 1.5, NaN])
+          await expect(storage().retain({branches})).rejects.toThrow(RangeError)
+        for (const perBranch of [0, 2.5])
+          await expect(storage().retain({perBranch})).rejects.toThrow(RangeError)
       })
 
-      test('keeps the newest groups only, with keepGroups', async () => {
+      test('keeps more per branch, and pinned keys', async () => {
         const db = await openDb()
         fill(db, 10)
-        for (const [key, group] of [['a1', 'a'], ['b1', 'b'], ['a2', 'a'], ['c1', 'c'], ['b2', 'b']]) {
+        for (const key of ['v1', 'v2', 'v3', 'v4']) {
           db.run(`insert into items (body) values ('${key}')`)
-          await storage().checkpoint(db, key, {group})
+          await save(db, key)
+        }
+        db.close()
+        expect((await storage().retain({perBranch: 2, pinned: ['v1']})).sort())
+          .toEqual(['v2'])
+        expect((await storage().list()).map(s => s.key)).toEqual(['v4', 'v3', 'v1'])
+      })
+
+      test('keeps the newest branches only, with branches', async () => {
+        const db = await openDb()
+        fill(db, 10)
+        for (const [key, branch] of [['a1', 'a'], ['b1', 'b'], ['a2', 'a'], ['c1', 'c'], ['b2', 'b']]) {
+          db.run(`insert into items (body) values ('${key}')`)
+          await save(db, key, {branch})
         }
         db.close()
         // Newest first: b (b2), c (c1), a (a2)
-        expect((await storage().cleanup({keepGroups: 2})).sort())
+        expect((await storage().retain({branches: 2})).sort())
           .toEqual(['a1', 'a2', 'b1'])
         expect((await storage().list()).map(base => base.key)).toEqual(['b2', 'c1'])
       })
@@ -846,100 +971,100 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         test('keeps bases a database reads', async () => {
           const a = await openDb()
           fill(a, 10)
-          await storage().checkpoint(a, 'v1')
+          await save(a, 'v1')
           const b = await openDb('v1')
           b.run('delete from items where id = 1')
-          await storage().checkpoint(b, 'v2')
+          await save(b, 'v2')
           b.run('delete from items where id = 2')
-          await storage().checkpoint(b, 'v3')
+          await save(b, 'v3')
           // a reads v1, b reads v3, which is newest.
-          expect(await storage().cleanup()).toEqual(['v2'])
+          expect(await storage().retain()).toEqual(['v2'])
           a.close()
-          expect(await storage().cleanup()).toEqual(['v1'])
+          expect(await storage().retain()).toEqual(['v1'])
           b.close()
-          expect(await storage().cleanup()).toEqual([])
+          expect(await storage().retain()).toEqual([])
           expect(rows(await openDb(), 'select count(*) from items')).toEqual([[8]])
         })
 
         test('does not delete a base while a checkpoint writes it', async () => {
           const db = await openDb()
           fill(db, 100)
-          await storage().checkpoint(db, 'v1')
+          await save(db, 'v1')
           db.run('delete from items')
-          const checkpoint = storage().checkpoint(db, 'v2')
+          const checkpoint = save(db, 'v2')
           // Wait until v2 exists, empty, while it is written.
           while (!(await storage().list()).some(base => base.key === 'v2')) await tick()
-          expect(await storage().cleanup()).toEqual([])
+          expect(await storage().retain()).toEqual([])
           await checkpoint
-          expect(await storage().cleanup()).toEqual(['v1'])
+          expect(await storage().retain()).toEqual(['v1'])
         })
 
         test('tells the newest base apart when file times are equal', async () => {
           const db = await openDb()
           fill(db, 10)
-          await storage().checkpoint(db, 'v1')
+          await save(db, 'v1')
           db.run('delete from items where id >= 5')
-          await storage().checkpoint(db, 'v2')
+          await save(db, 'v2')
           // WebKit's file times can be this coarse.
           for (const file of env.directory.files.values()) file.lastModified = 1
           expect((await storage().list()).map(base => base.key)).toEqual(['v2', 'v1'])
           expect(rows(await openDb(), 'select count(*) from items')).toEqual([[5]])
         })
 
-        test('keeps the newest two of a group without Web Locks', async () => {
+        test('keeps the newest two of a branch without Web Locks', async () => {
           const unlocked = storage({locks: null})
-          const db = keep(await unlocked.open(Database))
+          const db = register(await unlocked.open(Database))
           fill(db, 10)
           for (const key of ['v1', 'v2', 'v3', 'v4']) {
             db.run(`insert into items (body) values ('${key}')`)
-            await unlocked.checkpoint(db, key)
+            await saveTo(unlocked, db, key)
           }
-          expect((await unlocked.cleanup()).sort()).toEqual(['v1', 'v2'])
+          expect((await unlocked.retain()).sort()).toEqual(['v1', 'v2'])
           expect(rows(db, 'select count(*) from items')).toEqual([[14]])
         })
 
         test('does not delete a base being written without Web Locks', async () => {
           const unlocked = storage({locks: null})
-          const db = keep(await unlocked.open(Database))
+          const db = register(await unlocked.open(Database))
           fill(db, 100)
-          await unlocked.checkpoint(db, 'v1', {group: 'g'})
+          await saveTo(unlocked, db, 'v1', {branch: 'g'})
           db.run('delete from items')
-          const checkpoint = unlocked.checkpoint(db, 'v2')
+          const checkpoint = saveTo(unlocked, db, 'v2')
           while (!(await unlocked.list()).some(base => base.key === 'v2')) await tick()
-          expect(await unlocked.cleanup()).toEqual([])
-          expect(await checkpoint).toBe(true)
-          expect((await unlocked.newest('g')).key).toBe('v2')
+          expect(await unlocked.retain()).toEqual([])
+          expect(await checkpoint).toBe('written')
+          expect((await unlocked.head('g')).key).toBe('v2')
         })
 
         test('leaves no base and the database unchanged when writing fails', async () => {
           const db = await openDb()
           fill(db, 100)
-          await storage().checkpoint(db, 'v1')
+          await save(db, 'v1')
           db.run('delete from items where id >= 10')
           const pages = held(db)
           env.directory.failWrites = true
-          await expect(storage().checkpoint(db, 'v2')).rejects.toThrow('write failed')
+          await expect(save(db, 'v2')).rejects.toThrow('write failed')
           env.directory.failWrites = false
           expect([...env.directory.files.keys()].sort()).toEqual(['v1', 'v1.json'])
           expect(db.base.key).toBe('v1')
           expect(held(db)).toBe(pages)
           expect(rows(db, 'select count(*) from items')).toEqual([[10]])
-          expect(await storage().checkpoint(db, 'v2')).toBe(true)
+          expect(await save(db, 'v2')).toBe('written')
         })
       } else {
         test('deletes bases databases read, which keep reading them', async () => {
           const a = await openDb()
           fill(a, 1000)
-          await storage().checkpoint(a, 'v1')
+          await save(a, 'v1')
           const b = await openDb('v1')
           b.run('delete from items where id < 10')
-          await storage().checkpoint(b, 'v2')
-          expect(await storage().cleanup()).toEqual(['v1'])
+          await save(b, 'v2')
+          expect(await storage().retain()).toEqual(['v1'])
           // a reads v1 from a fresh fork, whose page cache is empty.
           const fork = keep(a.fork())
           expect(rows(fork, 'select count(*), sum(length(body)) from items'))
             .toEqual([[1000, 500_000]])
-          await expect(storage().open(Database, 'v1'))
+          await expect(storage().open(Database, {key: 'v1'}))
             .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
         })
       }
@@ -949,7 +1074,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
 
 describe('Checkpoints in memory', () => {
   test('move the database even when reading the new base back fails', async () => {
-    const store = memoryBaseStore()
+    const store = memorySnapshotStore()
     let fail = false
     const flaky = {
       ...store,
@@ -962,22 +1087,22 @@ describe('Checkpoints in memory', () => {
       }
     }
     const storage = new SnapshotStorage(flaky)
-    const db = keep(await storage.open(Database))
+    const db = register(await storage.open(Database))
     fill(db, 100)
-    await storage.checkpoint(db, 'v1')
+    await saveTo(storage, db, 'v1')
     db.run('delete from items where id >= 10')
     fail = true
-    expect(await storage.checkpoint(db, 'v2')).toBe(true)
-    expect(baseOf(db)).toMatchObject({key: 'v2', group: ''})
+    expect(await saveTo(storage, db, 'v2')).toBe('written')
+    expect(snapshotOf(db)).toMatchObject({key: 'v2', branch: ''})
     expect(held(db)).toBe(0)
   })
 
   test('copy meta in and out', async () => {
-    const storage = memorySnapshotStorage()
-    const db = keep(await storage.open(Database))
+    const storage = memorySnapshots()
+    const db = register(await storage.open(Database))
     fill(db, 1)
     const meta = {tree: 'a'}
-    await storage.checkpoint(db, 'v1', {meta})
+    await saveTo(storage, db, 'v1', {meta})
     meta.tree = 'changed'
     expect((await storage.list())[0].meta).toEqual({tree: 'a'})
   })
@@ -1033,7 +1158,7 @@ describe('Random checkpoints', () => {
   async function run(seed, storage, autoVacuum) {
     const next = random(seed)
     const pick = n => Math.floor(next() * n)
-    const db = keep(await storage.open(Database))
+    const db = register(await storage.open(Database))
     const reference = keep(new Database())
     // Statements fail the same way on both, or not at all.
     const run = sql => {
@@ -1082,7 +1207,7 @@ describe('Random checkpoints', () => {
         run(`pragma incremental_vacuum(${pick(50)})`)
       } else if (x < 0.82 && !inTransaction) {
         const key = `k${pending.length}`
-        pending.push({key, at: keep(reference.fork()), written: storage.checkpoint(db, key)})
+        pending.push({key, at: keep(reference.fork()), written: saveTo(storage, db, key)})
       } else {
         for (let i = pick(4); i > 0; i--) await tick()
       }
@@ -1090,8 +1215,8 @@ describe('Random checkpoints', () => {
     }
     if (inTransaction) run('rollback')
     for (const {key, at, written} of pending) {
-      expect(await written).toBe(true)
-      expect(state(keep(await storage.open(Database, key)))).toBe(state(at))
+      expect(await written).toBe('written')
+      expect(state(register(await storage.open(Database, {key})))).toBe(state(at))
     }
     expect(state(db)).toBe(state(reference))
   }
@@ -1107,16 +1232,16 @@ describe('Random checkpoints', () => {
   }
 
   test('keep a statement stepping while its database moves', async () => {
-    const storage = memorySnapshotStorage()
-    const db = keep(await storage.open(Database))
+    const storage = memorySnapshots()
+    const db = register(await storage.open(Database))
     db.run('create table t (id integer primary key, b blob)')
     db.run('begin')
     for (let i = 0; i < 2000; i++) db.run(`insert into t values (${i}, zeroblob(500))`)
     db.run('commit')
-    await storage.checkpoint(db, 'v1')
+    await saveTo(storage, db, 'v1')
     db.run('pragma cache_size = 2')
     db.run('update t set b = zeroblob(400) where id % 3 = 0')
-    const checkpoint = storage.checkpoint(db, 'v2')
+    const checkpoint = saveTo(storage, db, 'v2')
     const stmt = db.prepare('select id, length(b) from t order by id')
     const read = []
     for (let i = 0; i < 10; i++) {
@@ -1124,7 +1249,7 @@ describe('Random checkpoints', () => {
       read.push(stmt.get())
     }
     await checkpoint
-    expect(baseOf(db).key).toBe('v2')
+    expect(snapshotOf(db).key).toBe('v2')
     while (stmt.step()) read.push(stmt.get())
     stmt.free()
     expect(read.length).toBe(2000)

@@ -3,18 +3,16 @@
 // each message names an action, and is answered with its result or error.
 // Give every SharedWorker its own name to start a new one.
 import {init} from '@alinea/sqlite-wasm'
-import {
-  indexedDBSnapshotStorage,
-  opfsSnapshotStorage
-} from '@alinea/sqlite-wasm/snapshots'
+import {indexedDBSnapshots, opfsSnapshots} from '@alinea/sqlite-wasm/snapshots'
 import {build, change, INDEX_COUNT, QUERIES} from './bench-data.js'
 
 const ready = init()
 let storage
+let session
 let db
 
 const rows = sql => db.exec(sql)[0]?.values ?? []
-const storages = {opfs: opfsSnapshotStorage, indexeddb: indexedDBSnapshotStorage}
+const storages = {opfs: opfsSnapshots, indexeddb: indexedDBSnapshots}
 
 // How much the Wasm heap grows while `run` runs (sampled), and its size.
 // Workers have no measure of the JS heap (performance.memory is the main
@@ -50,7 +48,8 @@ const actions = {
     const {Database} = await ready
     storage = storages[variant](name)
     const start = performance.now()
-    db = await storage.open(Database, base)
+    session = await storage.open(Database, base === undefined ? {} : {key: base})
+    db = session.db
     const openMs = performance.now() - start
     if (query) rows(QUERIES.point[0])
     if (pageSize) db.run(`pragma page_size = ${pageSize}`)
@@ -68,12 +67,12 @@ const actions = {
     insert.free()
     db.run('commit')
   },
-  async checkpoint({name, group}) {
+  async checkpoint({name, branch}) {
     const start = performance.now()
-    const written = await storage.checkpoint(db, name, {group})
-    return {written, ms: performance.now() - start}
+    const {status} = await session.save({key: name, branch})
+    return {written: status === 'written', status, ms: performance.now() - start}
   },
-  cleanup: () => storage.cleanup(),
+  cleanup: () => storage.retain(),
   list: () => storage.list(),
   // Read every row of the base, and change some, `rounds` times with a
   // pause in between, checking each time that what was read adds up.
@@ -102,12 +101,13 @@ const actions = {
   async benchFirstBase({variant, storage: name, key}) {
     const {Database} = await ready
     storage = storages[variant](name)
-    db = await storage.open(Database)
+    session = await storage.open(Database, {branch: 'bench'})
+    db = session.db
     build(db)
     const [[pages]] = rows('pragma page_count')
     const held = Number(rows('pragma overlay_pages')[0][0]) * 65536
     const {ms, wasmHeap, wasmGrowth} = await measured(() =>
-      storage.checkpoint(db, key, {group: 'bench'})
+      session.save({key})
     )
     return {ms, size: pages * 65536, held, wasmHeap, wasmGrowth}
   },
@@ -133,9 +133,9 @@ const actions = {
     change(db, count, version)
     const held = Number(rows('pragma overlay_pages')[0][0]) * 65536
     const {ms, result, wasmHeap, wasmGrowth} = await measured(() =>
-      storage.checkpoint(db, key)
+      session.save({key})
     )
-    return {ms, written: result, held, wasmHeap, wasmGrowth}
+    return {ms, written: result.status === 'written', held, wasmHeap, wasmGrowth}
   },
   // Write and checkpoint in a loop for `seconds`, cleaning up after each.
   async writerLoop({seconds}) {
@@ -146,9 +146,9 @@ const actions = {
       i++
       change(db, 100, i)
       db.run('insert into log values (?)', [i])
-      const written = await storage.checkpoint(db, `writer-${i}`)
-      if (!written) throw new Error(`checkpoint ${i} not written`)
-      await storage.cleanup()
+      const {status} = await session.save({key: `writer-${i}`})
+      if (status !== 'written') throw new Error(`save ${i} ${status}`)
+      await storage.retain()
     }
     const [[count, max]] = rows('select count(*), max(i) from log')
     if (count !== i || max !== i) throw new Error(`log: ${count} ${max}, expected ${i}`)
@@ -198,14 +198,14 @@ const actions = {
     const s = storages[variant](name)
     if (!s.supported()) return {ok: false, error: 'supported() is false'}
     const first = await s.open(Database)
-    first.exec('create table t (x); insert into t values (1), (2)')
-    await s.checkpoint(first, 'a')
-    first.run('insert into t values (3)')
-    await s.checkpoint(first, 'b')
+    first.db.exec('create table t (x); insert into t values (1), (2)')
+    await first.save({key: 'a'})
+    first.db.run('insert into t values (3)')
+    await first.save({key: 'b'})
     const second = await s.open(Database)
-    const [[sum]] = second.exec('select sum(x) from t')[0].values
-    first.close()
-    second.close()
+    const [[sum]] = second.db.exec('select sum(x) from t')[0].values
+    await first.close()
+    await second.close()
     return sum === 6 ? {ok: true} : {ok: false, error: `read ${sum}`}
   }
 }
