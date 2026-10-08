@@ -130,7 +130,10 @@ export class MemorySnapshotDirectory {
     }
     return {
       copy: source => write(() => file.write(source, {at: 0})),
-      write: (data, position) => write(() => file.write(data, {at: position})),
+      write: async (data, position) => {
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(await data.arrayBuffer())
+        return write(() => file.write(bytes, {at: position}))
+      },
       truncate: size =>
         write(() => {
           if (size < file.size) file.truncate(size)

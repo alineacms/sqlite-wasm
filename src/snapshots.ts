@@ -343,7 +343,8 @@ export interface DirectoryFile {
 export interface FileWriter {
   /** Write `source` from the start of the file. */
   copy(source: BaseSource): Promise<void>
-  write(data: Uint8Array, position: number): Promise<void>
+  /** Write `data` at `position`, past the end with zeros before it. */
+  write(data: BaseSource, position: number): Promise<void>
   /** Shorten the file, or lengthen it with zeros. */
   truncate(size: number): Promise<void>
   /** Make the file appear, with everything written, at once. */
@@ -442,7 +443,7 @@ export function opfsSnapshotDirectory(
           writable.write({
             type: 'write',
             position,
-            data: data as Uint8Array<ArrayBuffer>
+            data: data as Uint8Array<ArrayBuffer> | Blob
           }),
         truncate: size => writable.truncate(size),
         close: () => writable.close(),
@@ -617,13 +618,24 @@ export function directorySnapshotStore(
           await writer.write(DELTA_MARKER, 0)
           await writePages(writer, snapshot, i => DELTA_MARKER.length + i * chunkSize)
         } else {
-          const base = snapshot.base
-          if (base && visible > 0) {
-            if (sizeOf(base) < visible)
-              throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
-            await writer.copy(slice(base, 0, visible))
+          // The old content where no page replaces it, then the pages: the
+          // old content is read only where it is needed.
+          let at = 0
+          const keep = async (end: number) => {
+            const to = Math.min(end, visible, size)
+            if (to > at) {
+              const base = snapshot.base
+              if (!base || sizeOf(base) < to)
+                throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
+              await writer.write(slice(base, at, to), at)
+            }
+            at = Math.max(at, end)
           }
-          await writer.truncate(visible)
+          for (const index of pages) {
+            await keep(index * chunkSize)
+            at = (index + 1) * chunkSize
+          }
+          await keep(size)
           await writePages(writer, snapshot, i => pages[i] * chunkSize)
           await writer.truncate(size)
         }
@@ -704,7 +716,8 @@ function composeBlob(base: NewSnapshot): Blob {
   // The old base up to `end`, and zeros past what is visible of it.
   const fill = (end: number) => {
     const keep = Math.min(end, base.visible)
-    if (base.base && keep > at)
+    // Composing the old content can take long: only when some is kept.
+    if (keep > at && base.base)
       parts.push(slice(base.base, at, keep) as BlobPart)
     const from = Math.max(at, keep)
     if (end > from) parts.push(new Uint8Array(end - from))
