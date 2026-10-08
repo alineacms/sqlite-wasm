@@ -227,3 +227,21 @@ SharedWorkers, 10 s in this run), the writer saved 63 times with files and
 Firefox and WebKit were not measured again; WebKit's slow IndexedDB
 saves came from composing large Blobs, which a delta of a few pages
 avoids, but that is not measured.
+
+### Page size
+
+The benchmark database at three page sizes, in Chromium 141 only, after the
+changes above (OPFS files / IndexedDB Blobs, ms; queries cold, default 8 MB
+page cache). The 4 KB run predates the last two save fixes, which matter
+for its 20,000-row save.
+
+| Page size | Database | Held after 10 rows | Save 10 rows | Save 1,000 rows | Save 20,000 rows | Point | Range | Full |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 64 KB | 47.4 MB | 1.25 MB | 24 / 16 | 265 / 253 | 227 / 230 | 3.1 / 3.4 | 1421 / 1022 | 170 / 170 |
+| 16 KB | 49.2 MB | 0.34 MB | 18 / 8 | 73 / 60 | 307 / 258 | 4.6 / 3.9 | 1276 / 812 | 159 / 133 |
+| 4 KB | 84.4 MB | 0.11 MB | 21 / 10 | 42 / 30 | 1745 / 935 | 0.2 / 0.0 | 1475 / 867 | 299 / 225 |
+
+With 16 KB pages, a small change holds a quarter of the memory, and 1,000
+changed rows save as a delta 3–4 times faster than the full save they
+take with 64 KB pages; queries are as fast. With 4 KB pages, rows of
+about 2.4 KB leave much of each page empty: the database grows by 80%.
