@@ -128,6 +128,7 @@ build-dist:
 	bun x esbuild --format=esm --minify --tree-shaking src/indexeddb.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/opfs.ts --outdir=dist
 	bun x esbuild --format=esm --minify --tree-shaking src/snapshots.ts --outdir=dist
+	bun x esbuild --format=esm --minify --platform=node src/file.ts --outdir=dist
 # SQLiteError.js is imported by the modules above, so they share one class.
 	bun x esbuild --format=esm --minify src/SQLiteError.ts --outdir=dist
 	cp cache/sqlite3-emscripten.wasm dist/sqlite3-emscripten.wasm

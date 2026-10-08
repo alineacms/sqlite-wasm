@@ -215,6 +215,36 @@ APIs they need are there.
 read-only `SyncFile`, and `new SnapshotStorage(store)` takes any other
 `SnapshotStore`.
 
+## Opening a database file without loading it
+
+`openOverlay(Database, file)` opens a database over a file that does not
+change while it is open, as snapshot storage does: SQLite reads pages as
+queries need them, every change stays in memory, and `db.fork()` is cheap.
+In Node and Bun, `readOnlyFileAt(path)` from `@alinea/sqlite-wasm/file`
+reads a file of the file system with `fs.readSync`, where the native
+`overlay` extension cannot be loaded:
+
+```ts
+import {init} from '@alinea/sqlite-wasm'
+import {readOnlyFileAt} from '@alinea/sqlite-wasm/file'
+import {openOverlay} from '@alinea/sqlite-wasm/snapshots'
+
+const {Database} = await init()
+const db = openOverlay(Database, readOnlyFileAt('generated.db'))
+```
+
+- Nothing locks the file, so it must not be written in place while it is
+  open: each read checks that its size and modification time are as they
+  were, and fails with `SQLITE_IOERR_READ` if not. Replace it instead (write
+  a new file and rename it over the path): open databases keep reading the
+  file they opened.
+- The file closes once the database and its forks are closed.
+- `file` can also be a `File`, `Blob` or `Uint8Array`, or any read-only
+  `SyncFile`. Opening a file that is not a database fails with
+  `SQLITE_CORRUPT`.
+- SQLite keeps up to 8 MB of the pages it read in its page cache (`PRAGMA
+  cache_size` changes it).
+
 ## Storing every commit
 
 Snapshot storage keeps changes in memory until a save. When every

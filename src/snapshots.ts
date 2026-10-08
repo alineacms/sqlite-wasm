@@ -142,6 +142,69 @@ export function readOnlyFile(
   }
 }
 
+/**
+ * Open a database over `base`, a database file that does not change while
+ * it is open: SQLite reads its pages as queries need them, and every change
+ * stays in memory, as with a snapshot. `db.fork()` is as cheap as for
+ * snapshots. `base` is a read-only `SyncFile`, such as one of
+ * `readOnlyFileAt(path)` from `@alinea/sqlite-wasm/file` in Node and Bun,
+ * or a `File`, `Blob` or bytes. The file is closed once the database and
+ * its forks are. Fails with `SQLITE_CORRUPT` if it is not a database.
+ *
+ * ```ts
+ * import {readOnlyFileAt} from '@alinea/sqlite-wasm/file'
+ * import {openOverlay} from '@alinea/sqlite-wasm/snapshots'
+ *
+ * const db = openOverlay(Database, readOnlyFileAt('generated.db'))
+ * ```
+ */
+export function openOverlay<T extends Database>(
+  Database: new () => T,
+  base: SyncFile | BaseSource
+): T {
+  const file =
+    base instanceof Uint8Array || base instanceof Blob ? readOnlyFile(base) : base
+  let db: T | undefined
+  let name: string | undefined
+  try {
+    const size = file.getSize()
+    const header = new Uint8Array(100)
+    file.read(header, {at: 0})
+    checkHeader(header, size, 'Database')
+    db = new Database()
+    const files = filesOf(db.wasm)
+    name = `overlays/${nextFile++}`
+    files.add(name, file, () => file.close())
+    try {
+      db.openBase(name)
+    } finally {
+      // Opening failed before SQLite opened the file.
+      if (files.openHandles(name) === 0) {
+        files.remove(name)
+        name = undefined
+      }
+    }
+    try {
+      db.exec('select count(*) from sqlite_schema')
+      db.run(`pragma cache_size = -${CACHE_KIB}`)
+    } catch (error) {
+      throw new SQLiteError(
+        `Database is corrupt: ${(error as Error).message}`,
+        SQLITE_CORRUPT,
+        {cause: error}
+      )
+    }
+    return db
+  } catch (error) {
+    try {
+      db?.close()
+    } catch {}
+    // Closes the file, unless the database still had it open.
+    if (name === undefined) file.close()
+    throw error
+  }
+}
+
 function sizeOf(source: BaseSource) {
   return source instanceof Uint8Array ? source.byteLength : source.size
 }
@@ -1137,9 +1200,10 @@ export interface RetainPolicy {
 /** Names of the "js" VFS files snapshots are registered as */
 let nextFile = 0
 
-function checkHeader(header: Uint8Array, size: number, key: string) {
+/** Check the header of a database file of `size` bytes, called `name`. */
+function checkHeader(header: Uint8Array, size: number, name: string) {
   const corrupt = (reason: string) =>
-    new SQLiteError(`Snapshot "${key}" is corrupt: ${reason}`, SQLITE_CORRUPT)
+    new SQLiteError(`${name} is corrupt: ${reason}`, SQLITE_CORRUPT)
   const magic = 'SQLite format 3\0'
   if (size < 512) throw corrupt(`too small (${size} bytes)`)
   for (let i = 0; i < magic.length; i++)
@@ -1153,7 +1217,7 @@ function checkHeader(header: Uint8Array, size: number, key: string) {
   const pageCount = view.getUint32(28)
   const stored = Math.ceil(size / pageSize)
   if (view.getUint32(92) === view.getUint32(24) && pageCount > stored)
-    throw corrupt(`${pageCount} pages in the header, ${stored} in the snapshot`)
+    throw corrupt(`${pageCount} pages in the header, ${stored} in the file`)
 }
 
 async function read(source: BaseSource, start: number, end: number) {
@@ -1411,7 +1475,7 @@ export class SnapshotStorage {
       const reader = base.file()
       const header = new Uint8Array(100)
       reader.read(header, {at: 0})
-      checkHeader(header, base.size, key)
+      checkHeader(header, base.size, `Snapshot "${key}"`)
       db = new Database()
       const opened = db
       const files = filesOf(opened.wasm)
