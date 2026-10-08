@@ -723,18 +723,50 @@ function composeBlob(base: NewSnapshot): Blob {
     if (end > from) parts.push(new Uint8Array(end - from))
     at = end
   }
-  base.pages.forEach((index, i) => {
-    const start = index * base.chunkSize
-    if (start >= base.size) return
+  const {chunkSize, pages, size} = base
+  for (const [i, end] of pageRuns(pages, chunkSize, true)) {
+    const start = pages[i] * chunkSize
     fill(start)
-    const page = base.page(i)
-    // The Blob copies the bytes out of Wasm memory.
-    const length = Math.min(page.byteLength, base.size - start)
-    parts.push(page.subarray(0, length) as Uint8Array<ArrayBuffer>)
+    const length = Math.min((end - i) * chunkSize, size - start)
+    parts.push(pageRun(base, i, end).subarray(0, length) as Uint8Array<ArrayBuffer>)
     at = start + length
-  })
-  fill(base.size)
+  }
+  fill(size)
   return new Blob(parts)
+}
+
+/**
+ * Runs of pages `[i, end)` of at most WRITE_BYTES, which are consecutive
+ * in the file if `consecutive`
+ */
+function* pageRuns(
+  pages: Array<number>,
+  chunkSize: number,
+  consecutive: boolean
+): Generator<[number, number]> {
+  const perRun = Math.max(1, Math.floor(WRITE_BYTES / chunkSize))
+  for (let i = 0; i < pages.length; ) {
+    let end = i + 1
+    while (
+      end < pages.length &&
+      end - i < perRun &&
+      (!consecutive || pages[end] === pages[end - 1] + 1)
+    )
+      end++
+    yield [i, end]
+    i = end
+  }
+}
+
+/**
+ * Pages `[i, end)` of `snapshot` copied out of Wasm memory into one buffer:
+ * a Blob of fewer, larger parts is faster to build and store.
+ */
+function pageRun(snapshot: NewSnapshot, i: number, end: number): Uint8Array {
+  const {chunkSize} = snapshot
+  const run = new Uint8Array((end - i) * chunkSize)
+  for (let k = i; k < end; k++) run.set(snapshot.page(k), (k - i) * chunkSize)
+  return run
 }
 
 /**
@@ -826,9 +858,12 @@ export function indexedDBSnapshotStore(
     async write(base) {
       if (await request((await store('readonly')).count(base.key))) return
       const {chunkSize, visible, pages, delta} = base
-      // The Blob copies the pages out of Wasm memory.
       const blob = delta
-        ? new Blob(pages.map((_, i) => base.page(i) as Uint8Array<ArrayBuffer>))
+        ? new Blob(
+            [...pageRuns(pages, chunkSize, false)].map(
+              ([i, end]) => pageRun(base, i, end) as Uint8Array<ArrayBuffer>
+            )
+          )
         : composeBlob(base)
       const record: BaseRecord = {
         key: base.key,
