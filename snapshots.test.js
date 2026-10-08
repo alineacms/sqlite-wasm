@@ -1127,6 +1127,40 @@ describe('Read-only files', () => {
     expect(() => file.truncate(0)).toThrow()
   })
 
+  test('read Blobs in blocks while reads run forward', () => {
+    const bytes = new Uint8Array(10_000).map((_, i) => (i * 31) & 255)
+    const slices = []
+    class CountingBlob extends Blob {
+      slice(start, end) {
+        slices.push(end - start)
+        return super.slice(start, end)
+      }
+    }
+    const file = readOnlyFile(new CountingBlob([bytes]), {blockSize: 1024, blocks: 3})
+    const check = (at, length) => {
+      const buffer = new Uint8Array(length)
+      const read = file.read(buffer, {at})
+      const expected = bytes.subarray(at, at + length)
+      expect(read).toBe(expected.length)
+      expect(buffer.subarray(0, read)).toEqual(expected)
+    }
+    // Reads in random order read what was asked; a read shortly after the
+    // previous one reads its whole block.
+    check(5000, 50)
+    check(100, 50)
+    check(300, 50)
+    check(500, 50)
+    expect(slices).toEqual([50, 50, 1024])
+    // Within, across and past blocks, and past the end
+    const next = (seed => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff))(5)
+    for (let i = 0; i < 500; i++) check(next() % 10_500, 1 + (next() % 3000))
+    // A scan reads one block at a time, after its first read.
+    slices.length = 0
+    for (let at = 0; at < 10_000; at += 256) check(at, 256)
+    expect(slices.slice(1).every(length => length === 1024 || length === 784)).toBe(true)
+    expect(slices.length).toBeLessThanOrEqual(11)
+  })
+
   test('read Blobs', () => {
     const file = readOnlyFile(new Blob([new Uint8Array([5, 6, 7])]))
     const buffer = new Uint8Array(4)
