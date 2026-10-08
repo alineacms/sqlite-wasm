@@ -178,3 +178,27 @@ WebKit copies stored Blob data when it stores a Blob made from it, and its
 cost grows with the number of parts. A checkpoint of changes spread over
 the database is such a Blob: one part per run of unchanged pages and per
 run of changed pages.
+
+### Reading snapshots in blocks
+
+The results above predate block reads. A `FileReaderSync` read costs about
+a millisecond however little it reads (measured in Chromium 141 on a 48 MB
+file: 980 ms in 64 KB reads, 150 ms in 1 MB reads, 92 ms in 4 MB reads,
+whether in order or not). Snapshots are now read a 1 MB block at a time
+while reads run forward, and page by page otherwise (see `readOnlyFile`).
+Section 3 again, in Chromium 141 only, before and after (ms, cold / warm):
+
+| Bases | Page cache | Point | Range | Full |
+| --- | --- | --- | --- | --- |
+| OPFS files, before | 8 MB | 7.0 / 0.2 | 1877 / 1786 | 1255 / 1115 |
+| OPFS files, after | 8 MB | 3.3 / 0.2 | 1658 / 1624 | 160 / 156 |
+| OPFS files, before | 64 MB | 10.3 / 0.3 | 955 / 4.2 | 1089 / 31.9 |
+| OPFS files, after | 64 MB | 3.3 / 0.1 | 890 / 4.4 | 169 / 26.5 |
+| IndexedDB Blobs, before | 8 MB | 6.3 / 0.2 | 1219 / 1278 | 793 / 771 |
+| IndexedDB Blobs, after | 8 MB | 2.7 / 0.2 | 973 / 855 | 134 / 116 |
+| IndexedDB Blobs, before | 64 MB | 13.6 / 0.2 | 683 / 3.8 | 707 / 41.2 |
+| IndexedDB Blobs, after | 64 MB | 2.0 / 0.0 | 521 / 3.7 | 117 / 31.9 |
+
+Full scans are 6–8 times faster. The range reads table pages in index
+order, which is random, so it still reads page by page: the page cache
+remains what makes it fast. Firefox and WebKit were not measured again.

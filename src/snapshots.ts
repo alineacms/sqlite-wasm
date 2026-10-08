@@ -32,6 +32,10 @@ const WRITE_BYTES = 4 << 20
 // read from the base again once they leave it, which takes about a
 // millisecond for 64 KB.
 const CACHE_KIB = 8192
+// Blob reads of snapshots: bytes read at once, and how many such blocks are
+// kept, see readOnlyFile
+const BLOCK_BYTES = 1 << 20
+const CACHED_BLOCKS = 4
 // Without locks, how old an empty base is before cleanup deletes it: one
 // that is still being written after this long has failed.
 const STALE_MS = 60 * 60_000
@@ -39,12 +43,30 @@ const STALE_MS = 60 * 60_000
 /** Content that does not change: a `File` or `Blob`, or bytes. */
 export type BaseSource = Blob | Uint8Array
 
+/** How a read-only file reads a Blob, see `readOnlyFile`. */
+export interface ReadOnlyFileOptions {
+  /** Bytes per block read at once, a power of two (default: 1 MiB) */
+  blockSize?: number
+  /** How many blocks are kept (default: 4) */
+  blocks?: number
+}
+
 /**
  * A read-only `SyncFile` over `source`. Blobs, such as the `File` of an
  * OPFS file or a Blob read from IndexedDB, are read synchronously with
  * `FileReaderSync`, which Workers have (not the main thread).
+ *
+ * Each `FileReaderSync` read costs about a millisecond however little it
+ * reads, so a Blob is read in blocks where that pays: a read that starts
+ * where the previous one ended, or shortly after, reads the whole block it
+ * starts in, which is kept for the reads that follow (the newest `blocks`
+ * are). Scans read a block at a time; reads in random order, such as point
+ * lookups and lookups through an index, read only what they ask for.
  */
-export function readOnlyFile(source: BaseSource): SyncFile {
+export function readOnlyFile(
+  source: BaseSource,
+  options: ReadOnlyFileOptions = {}
+): SyncFile {
   const readOnly = () => {
     throw new SQLiteError('Bases are read-only', SQLITE_READONLY)
   }
@@ -57,12 +79,51 @@ export function readOnlyFile(source: BaseSource): SyncFile {
     }
   } else {
     const reader = new FileReaderSync()
+    const size = source.size
+    const blockSize = options.blockSize ?? BLOCK_BYTES
+    const capacity = options.blocks ?? CACHED_BLOCKS
+    // Blocks by index, least recently used first
+    const cached = new Map<number, Uint8Array>()
+    // Where the previous read ended
+    let previousEnd = -1
+    const readRange = (start: number, end: number) =>
+      new Uint8Array(reader.readAsArrayBuffer(source.slice(start, end)))
+    const block = (index: number) => {
+      let data = cached.get(index)
+      if (data) {
+        cached.delete(index)
+      } else {
+        const start = index * blockSize
+        data = readRange(start, Math.min(start + blockSize, size))
+        if (cached.size >= capacity && capacity > 0)
+          cached.delete(cached.keys().next().value!)
+      }
+      if (capacity > 0) cached.set(index, data)
+      return data
+    }
     read = (buffer, at) => {
-      const end = Math.min(at + buffer.length, source.size)
+      const end = Math.min(at + buffer.length, size)
       if (end <= at) return 0
-      const data = reader.readAsArrayBuffer(source.slice(at, end))
-      buffer.set(new Uint8Array(data))
-      return data.byteLength
+      const first = Math.floor(at / blockSize)
+      const last = Math.floor((end - 1) / blockSize)
+      let whole = at >= previousEnd && at < previousEnd + blockSize
+      if (!whole) {
+        whole = true
+        for (let i = first; i <= last; i++) if (!cached.has(i)) whole = false
+      }
+      previousEnd = end
+      if (!whole) {
+        buffer.set(readRange(at, end))
+        return end - at
+      }
+      for (let i = first; i <= last; i++) {
+        const start = i * blockSize
+        const data = block(i)
+        const from = Math.max(at, start)
+        const to = Math.min(end, start + data.length)
+        buffer.set(data.subarray(from - start, to - start), from - at)
+      }
+      return end - at
     }
   }
   return {
