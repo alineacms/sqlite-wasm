@@ -149,6 +149,11 @@ export class Database {
     )
   }
 
+  /** If the database was closed. @internal */
+  isClosed(): boolean {
+    return !this.dbPtr
+  }
+
   /** The pages this database holds over its base file. @internal */
   pages(): Pages {
     if (!this.dbPtr) throw new Error('Database closed')

@@ -32,6 +32,9 @@ const WRITE_BYTES = 4 << 20
 // read from the base again once they leave it, which takes about a
 // millisecond for 64 KB.
 const CACHE_KIB = 8192
+// Without locks, how old an empty base is before cleanup deletes it: one
+// that is still being written after this long has failed.
+const STALE_MS = 60 * 60_000
 
 /** Content that does not change: a `File` or `Blob`, or bytes. */
 export type BaseSource = Blob | Uint8Array
@@ -886,7 +889,7 @@ export class SnapshotStorage {
    * without changing `db`, if base `key` exists already: name bases by
    * their content, so a key always means the same data. The state is taken
    * when `checkpoint` is called; checkpoints of one database are written
-   * one at a time. Fails with `SQLITE_BUSY` during a write transaction and
+   * one at a time. A database closed meanwhile is not moved. Fails with `SQLITE_BUSY` during a write transaction and
    * `SQLITE_MISUSE` for a database stored elsewhere, such as in IndexedDB
    * storage.
    */
@@ -930,7 +933,8 @@ export class SnapshotStorage {
   /**
    * Write base `key` from `snapshot`, and move `db` onto it, with the later
    * snapshots of `db` that wait for their turn: they read the same base as
-   * `db` until then.
+   * `db` until then. Those that read another base by now (when moving one
+   * failed) stay where they are, as does `db` once it is closed.
    */
   private async write(
     db: Database,
@@ -939,6 +943,7 @@ export class SnapshotStorage {
     {key, group, meta}: {key: string; group: string; meta: BaseMeta}
   ): Promise<boolean> {
     const release = once(await this.hold(key))
+    let registered = false
     try {
       const source = await this.exclusive(key, () =>
         this.store.write(this.newBase(snapshot, key, group, meta))
@@ -947,18 +952,33 @@ export class SnapshotStorage {
         release()
         return false
       }
-      const base = {key, group, source}
-      this.use(db, base, release, file => {
-        db.rebase(snapshot, file)
-        for (const later of snapshots) {
-          if (later === snapshot) continue
-          later.rebase(snapshot, file)
-          later.base = base
+      const base: Base = {key, group, source}
+      const from = snapshot.base
+      const files = filesOf(db.wasm)
+      const file = `snapshots/${nextFile++}/${key}`
+      // From here on, the lock is released once nothing reads the file.
+      files.add(file, readOnlyFile(source), release)
+      registered = true
+      try {
+        if (!db.isClosed() && db.base === from) {
+          db.rebase(snapshot, file)
+          db.base = base
         }
-      })
+        for (const later of snapshots) {
+          if (later === snapshot || later.base !== from) continue
+          try {
+            later.rebase(snapshot, file)
+            later.base = base
+          } catch {
+            // It writes from the base it reads, and db stays on that.
+          }
+        }
+      } finally {
+        if (files.openHandles(file) === 0) files.remove(file)
+      }
       return true
     } catch (error) {
-      release()
+      if (!registered) release()
       throw error
     }
   }
@@ -1003,7 +1023,9 @@ export class SnapshotStorage {
    * Delete the bases that are not the newest of their group. With locks
    * (OPFS), bases a database reads are kept; without, OPFS keeps the
    * newest two of each group, as a Worker may still read the other, and
-   * IndexedDB, whose Blobs stay readable, keeps one. Resolves to the keys
+   * IndexedDB, whose Blobs stay readable, keeps one. Empty bases are
+   * being written, or writing them failed: with locks, those nobody writes
+   * are deleted, without, those older than an hour. Resolves to the keys
    * of the deleted bases.
    */
   async cleanup(): Promise<Array<string>> {
@@ -1012,11 +1034,14 @@ export class SnapshotStorage {
     const keep = this.locks || this.store.keepsRemoved ? 1 : 2
     const deleted: Array<string> = []
     for (const base of bases) {
-      // Empty bases are being written (and locked), or failed.
       if (base.size > 0) {
         const count = (seen.get(base.group) ?? 0) + 1
         seen.set(base.group, count)
         if (count <= keep) continue
+      } else if (!this.locks && now() - base.createdAt < STALE_MS) {
+        // Empty bases are being written, which locks them, or writing them
+        // failed. Without locks, only the ones that are old have failed.
+        continue
       }
       if (!this.locks) {
         await this.store.remove(base.key)

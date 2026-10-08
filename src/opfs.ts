@@ -53,8 +53,8 @@ export function opfsFileSystem(
       } catch (error) {
         // Chromium and Firefox: NoModificationAllowedError, WebKit:
         // InvalidStateError
-        const name = (error as DOMException)?.name
-        if (name === 'NoModificationAllowedError' || name === 'InvalidStateError') {
+        const kind = (error as DOMException)?.name
+        if (kind === 'NoModificationAllowedError' || kind === 'InvalidStateError') {
           throw new SQLiteError(
             `OPFS file "${name}" is open in another Worker`,
             SQLITE_BUSY,

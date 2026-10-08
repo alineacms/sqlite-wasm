@@ -1942,13 +1942,15 @@ int sqlite3_overlay_pages(
 ** (sqlite3_overlay_pages) were written there. The overlay drops the pages
 ** it shares with the snapshot, which the new base holds, and keeps those
 ** that changed since; it reads exactly what it read before. Its old base
-** file is closed. Allowed during a transaction, as the content does not
-** change, but not with PRAGMA mmap_size (SQLITE_MISUSE), nor for overlays
-** on a writable base or with a commit hook. SQLITE_CORRUPT if the new base
-** is not the snapshot's size. On failure the overlay reads its old base,
+** file is closed. Allowed during a transaction, also one that wrote pages
+** already, as the content does not change; not with PRAGMA mmap_size
+** (SQLITE_MISUSE), nor for overlays on a writable base or with a commit
+** hook. SQLITE_CORRUPT if the new base is not the snapshot's size. On failure the overlay reads its old base,
 ** possibly holding more pages than before.
 **
-** The caller makes sure no other connection uses the overlay meanwhile.
+** The caller makes sure no other connection uses the overlay meanwhile,
+** and that its own connection is not in a call (between two calls of a
+** single-threaded program).
 */
 int sqlite3_overlay_rebase(
   sqlite3 *db,
@@ -1974,7 +1976,6 @@ int sqlite3_overlay_rebase(
     return SQLITE_MISUSE;
   }
   if( pVfs==0 || strcmp(zVfs, OVERLAY_VFS_NAME)==0 ) return SQLITE_CANTOPEN;
-  if( ov->eWriter>=SQLITE_LOCK_PENDING ) return SQLITE_BUSY;
 
   /* Open the new base and read its first chunk, without touching ov. */
   memset(&base, 0, sizeof(base));

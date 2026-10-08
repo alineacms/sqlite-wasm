@@ -284,8 +284,8 @@ at once. A file stops being readable once it is deleted, so Workers hold a
 shared Web Lock on each base they read (also through forks), and cleanup
 keeps the bases a Worker reads. Checkpoints to one key lock it, so one
 Worker writes it. Without Web Locks (`{locks: null}`) cleanup keeps the
-newest two bases of each group; every browser with `createWritable()` has
-Web Locks. `new SnapshotStorage(directoryBaseStore(name, directory))` keeps
+newest two bases of each group, and bases still being written until they
+are an hour old; every browser with `createWritable()` has Web Locks. `new SnapshotStorage(directoryBaseStore(name, directory))` keeps
 files in any other `SnapshotDirectory`.
 
 Both are tested in Chromium, Firefox and WebKit, in dedicated and shared

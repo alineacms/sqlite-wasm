@@ -360,6 +360,80 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(held(winner)).toBe(0)
       })
 
+      test('move a database in a transaction that wrote pages meanwhile', async () => {
+        const db = await openDb()
+        const reference = keep(new Database())
+        both(db, reference, db => fill(db, 1000))
+        await storage().checkpoint(db, 'v1')
+        both(db, reference, db => db.run("update items set body = 'one' where id < 100"))
+        const checkpoint = storage().checkpoint(db, 'v2')
+        // A small page cache makes the transaction write its pages.
+        db.run('pragma cache_size = 2')
+        both(db, reference, db => {
+          db.run('begin')
+          db.run("update items set body = 'two' where id >= 500")
+          db.run("insert into items (body) values ('three')")
+        })
+        expect(await checkpoint).toBe(true)
+        expect(db.base.key).toBe('v2')
+        both(db, reference, db => db.run('commit'))
+        expect(db.export()).toEqual(reference.export())
+        db.run('begin')
+        db.run('delete from items')
+        db.run('rollback')
+        expect(db.export()).toEqual(reference.export())
+      })
+
+      test('write the base of a database closed meanwhile', async () => {
+        const db = await openDb()
+        fill(db, 100)
+        await storage().checkpoint(db, 'v1')
+        db.run('delete from items where id >= 10')
+        const checkpoint = storage().checkpoint(db, 'v2')
+        db.close()
+        expect(await checkpoint).toBe(true)
+        expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[10]])
+        // Only the database just opened holds a lock.
+        if (locking) expect(env.locks.held.size).toBe(1)
+      })
+
+      test('keep a database right when moving a later snapshot fails', async () => {
+        const db = await openDb()
+        const reference = keep(new Database())
+        both(db, reference, db => fill(db, 1000))
+        await storage().checkpoint(db, 'v0')
+        const proto = Object.getPrototypeOf(db)
+        const rebase = proto.rebase
+        let calls = 0
+        let atSecond
+        proto.rebase = function (...args) {
+          if (++calls === 2) throw new Error('injected')
+          return rebase.apply(this, args)
+        }
+        try {
+          both(db, reference, db => db.run("update items set body = 'one' where id < 300"))
+          const first = storage().checkpoint(db, 'v1')
+          both(db, reference, db => db.run("update items set body = 'two' where id >= 700"))
+          atSecond = keep(reference.fork())
+          const second = storage().checkpoint(db, 'v2')
+          expect(await Promise.all([first, second])).toEqual([true, true])
+        } finally {
+          proto.rebase = rebase
+        }
+        // The second snapshot could not move: it wrote from v0, and db
+        // stays on v1, which it still reads.
+        expect(db.base.key).toBe('v1')
+        expect((await openDb('v2')).export()).toEqual(atSecond.export())
+        expect((await storage().cleanup()).sort()).toEqual(
+          locking ? ['v0'] : ['v0', 'v1']
+        )
+        expect(db.export()).toEqual(reference.export())
+        both(db, reference, db => db.run('delete from items where id % 3 = 0'))
+        await storage().checkpoint(db, 'v3')
+        expect(db.base.key).toBe('v3')
+        expect((await openDb('v3')).export()).toEqual(reference.export())
+      })
+
       test('fail during a write transaction', async () => {
         const db = await openDb()
         fill(db, 10)
@@ -497,6 +571,19 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           expect(rows(db, 'select count(*) from items')).toEqual([[14]])
         })
 
+        test('does not delete a base being written without Web Locks', async () => {
+          const unlocked = storage({locks: null})
+          const db = keep(await unlocked.open(Database))
+          fill(db, 100)
+          await unlocked.checkpoint(db, 'v1', {group: 'g'})
+          db.run('delete from items')
+          const checkpoint = unlocked.checkpoint(db, 'v2')
+          while (!(await unlocked.list()).some(base => base.key === 'v2')) await tick()
+          expect(await unlocked.cleanup()).toEqual([])
+          expect(await checkpoint).toBe(true)
+          expect((await unlocked.newest('g')).key).toBe('v2')
+        })
+
         test('leaves no base and the database unchanged when writing fails', async () => {
           const db = await openDb()
           fill(db, 100)
@@ -550,4 +637,64 @@ describe('Read-only files', () => {
     expect(file.read(buffer, {at: 1})).toBe(2)
     expect([...buffer.subarray(0, 2)]).toEqual([6, 7])
   })
+})
+
+// Random changes, VACUUM (also to other page sizes) and checkpoints that
+// overlap them, compared with the same changes on a plain database: the
+// database, and every base as of when its checkpoint was called.
+describe('Random checkpoints', () => {
+  function random(seed) {
+    return () => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff
+      return seed / 0x7fffffff
+    }
+  }
+
+  const state = db =>
+    JSON.stringify([db.exec('select id, hex(b) from t order by id'), db.exec('pragma page_count')])
+
+  async function run(seed, storage) {
+    const next = random(seed)
+    const pick = n => Math.floor(next() * n)
+    const db = keep(await storage.open(Database))
+    const reference = keep(new Database())
+    const run = sql => both(db, reference, db => db.run(sql))
+    run('create table t (id integer primary key, b blob)')
+    let id = 0
+    const pending = []
+    for (let step = 0; step < 50; step++) {
+      const x = next()
+      if (x < 0.3) {
+        run('begin')
+        for (let i = pick(200); i >= 0; i--)
+          run(`insert into t values (${id++}, zeroblob(${pick(3000)}) || char(${65 + pick(26)}))`)
+        run('commit')
+      } else if (x < 0.45) {
+        const from = pick(id)
+        run(`delete from t where id between ${from} and ${from + pick(300)}`)
+      } else if (x < 0.55) {
+        run(`update t set b = char(${65 + pick(26)}) where id % ${2 + pick(5)} = 0`)
+      } else if (x < 0.65) {
+        if (next() < 0.5) run(`pragma page_size = ${[1024, 2048, 4096, 8192][pick(4)]}`)
+        run('vacuum')
+      } else if (x < 0.85) {
+        const key = `k${pending.length}`
+        pending.push({key, at: keep(reference.fork()), written: storage.checkpoint(db, key)})
+      } else {
+        for (let i = pick(4); i > 0; i--) await tick()
+      }
+      expect(state(db)).toBe(state(reference))
+    }
+    for (const {key, at, written} of pending) {
+      expect(await written).toBe(true)
+      expect(state(keep(await storage.open(Database, key)))).toBe(state(at))
+    }
+    expect(state(db)).toBe(state(reference))
+  }
+
+  for (const [variant, {setup}] of Object.entries(variants)) {
+    test(`match a plain database in ${variant}`, async () => {
+      for (let seed = 1; seed <= 6; seed++) await run(seed, setup().storage())
+    }, 60_000)
+  }
 })
