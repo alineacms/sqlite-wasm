@@ -40,8 +40,8 @@ draft.close()
 ```
 
 This is deliberately a size-oriented SQLite build. Date/time functions,
-`EXPLAIN`, `ALTER TABLE`, and `ANALYZE` are omitted. The complete compile-time
-option list is kept in the `SQLITE_OMIT_FLAGS` variable in the Makefile.
+`EXPLAIN` and `ALTER TABLE` are omitted. The complete compile-time option
+list is kept in the `SQLITE_OMIT_FLAGS` variable in the Makefile.
 
 ## Snapshot storage
 
@@ -107,11 +107,13 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   cloning.
 - Key bases by their content, such as a content hash: a checkpoint to a key
   that exists writes nothing and resolves to `false`. If that base holds
-  the committed state of the database byte for byte, as when Workers make
-  the same changes to the same base, the database reads it from then on
-  and drops the pages it holds, as if it had written it; else it stays as
-  it is. The newest checkpoint wins: new Workers open it, and Workers on
-  older bases keep reading those, with their own changes.
+  the committed state of the database byte for byte, the database reads it
+  from then on and drops the pages it holds, as if it had written it; else
+  it stays as it is. Bytes only match when the same commits were made on
+  the same base: reaching the same content another way stores it
+  differently (the header counts commits, and free pages keep old bytes).
+  The newest checkpoint wins: new Workers open it, and Workers on older
+  bases keep reading those, with their own changes.
 - `db.fork()` works as usual; a fork keeps reading the base it was forked
   on. `storage.checkpoint(fork, key)` writes a fork too.
 - `await storage.cleanup()` deletes every base that is not the newest of

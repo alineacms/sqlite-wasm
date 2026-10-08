@@ -443,6 +443,78 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           .toEqual([[100]])
       })
 
+      test('compare bases larger than one read', async () => {
+        const first = await openDb()
+        fill(first, 7000, 1000)
+        await storage().checkpoint(first, 'v1')
+        first.close()
+        const change = (db, last) => {
+          db.run('begin')
+          db.run("update items set body = 'first' where id < 10")
+          db.run('update items set body = ? where id = 6999', [last])
+          db.run('commit')
+        }
+        const a = await openDb('v1')
+        const b = await openDb('v1')
+        const c = await openDb('v1')
+        change(a, 'last')
+        change(b, 'last')
+        change(c, 'other')
+        expect(await storage().checkpoint(a, 'v2')).toBe(true)
+        expect(await storage().checkpoint(b, 'v2')).toBe(false)
+        expect(held(b)).toBe(0)
+        expect(baseOf(b).key).toBe('v2')
+        expect(await storage().checkpoint(c, 'v2')).toBe(false)
+        expect(held(c)).toBeGreaterThan(0)
+        expect(baseOf(c).key).toBe('v1')
+        // c differs from v2 only past the first read of 4 MB.
+        await storage().checkpoint(c, 'c2')
+        const v2 = await content('v2')
+        const c2 = await content('c2')
+        expect(v2.byteLength).toBeGreaterThan(5 << 20)
+        expect(c2.byteLength).toBe(v2.byteLength)
+        expect(v2.findIndex((byte, i) => byte !== c2[i]))
+          .toBeGreaterThan(4 << 20)
+        expect(rows(c, 'select body from items where id = 6999'))
+          .toEqual([['other']])
+      })
+
+      test('move a queued snapshot along onto a key that exists', async () => {
+        const first = await openDb()
+        fill(first, 1000)
+        await storage().checkpoint(first, 'v1')
+        first.close()
+        const twin = await openDb('v1')
+        const db = await openDb('v1')
+        for (const it of [twin, db])
+          it.run("update items set body = 'one' where id < 300")
+        expect(await storage().checkpoint(twin, 'v2')).toBe(true)
+        const second = storage().checkpoint(db, 'v2')
+        db.run('delete from items where id >= 700')
+        const third = storage().checkpoint(db, 'v3')
+        expect(await Promise.all([second, third])).toEqual([false, true])
+        // The third snapshot followed db onto v2, and wrote v3 over it.
+        expect(db.base.key).toBe('v3')
+        expect(held(db)).toBe(0)
+        const reopened = await openDb('v3')
+        expect(rows(reopened, "select count(*), sum(body = 'one') from items"))
+          .toEqual([[700, 300]])
+        expect(dump(reopened)).toEqual(dump(db))
+      })
+
+      test('leave a database that reads the key as it is', async () => {
+        const a = await openDb()
+        fill(a, 100)
+        await storage().checkpoint(a, 'v1')
+        const b = await openDb('v1')
+        for (const db of [a, b]) {
+          const base = db.base
+          expect(await storage().checkpoint(db, 'v1')).toBe(false)
+          expect(db.base).toBe(base)
+          expect(held(db)).toBe(0)
+        }
+      })
+
       test('move a database in a transaction that wrote pages meanwhile', async () => {
         const db = await openDb()
         const reference = keep(new Database())

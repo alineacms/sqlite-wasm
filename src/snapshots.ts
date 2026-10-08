@@ -851,7 +851,12 @@ async function read(source: BaseSource, start: number, end: number) {
 
 function equal(a: Uint8Array, b: Uint8Array) {
   if (a.length !== b.length) return false
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  const aligned = a.byteOffset % 4 === 0 && b.byteOffset % 4 === 0
+  const words = aligned ? a.length >> 2 : 0
+  const x = new Uint32Array(a.buffer, a.byteOffset, words)
+  const y = new Uint32Array(b.buffer, b.byteOffset, words)
+  for (let i = 0; i < words; i++) if (x[i] !== y[i]) return false
+  for (let i = words * 4; i < a.length; i++) if (a[i] !== b[i]) return false
   return true
 }
 
@@ -1062,13 +1067,14 @@ export class SnapshotStorage {
    * dropped from memory. The database keeps working meanwhile; changes made
    * after the checkpoint started stay in memory. Resolves to `false`,
    * writing nothing, if base `key` exists already: name bases by their
-   * content, so a key always means the same data. If that base holds
-   * exactly the committed state of `db`, `db` reads it from then on as if
-   * it had written it, else `db` stays as it is. The state is taken when
-   * `checkpoint` is called; checkpoints of one database are written one at
-   * a time. A database closed meanwhile is not moved. Fails with
-   * `SQLITE_BUSY` during a write transaction and `SQLITE_MISUSE` for a
-   * database stored elsewhere, such as in IndexedDB storage.
+   * content, so a key always means the same data. If that base holds the
+   * committed state of `db` byte for byte, which takes the same commits on
+   * the same base, `db` reads it from then on as if it had written it, else
+   * `db` stays as it is. The state is taken when `checkpoint` is called;
+   * checkpoints of one database are written one at a time. A database
+   * closed meanwhile is not moved. Fails with `SQLITE_BUSY` during a write
+   * transaction and `SQLITE_MISUSE` for a database stored elsewhere, such
+   * as in IndexedDB storage.
    */
   checkpoint(
     db: Database,

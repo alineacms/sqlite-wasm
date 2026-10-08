@@ -291,6 +291,15 @@ for (const [name, initialize] of [
       }
     })
 
+    test('parses deeply nested expressions and subqueries', () => {
+      const parens = `select ${'('.repeat(1000)}1${')'.repeat(1000)}`
+      expect(db.exec(parens)[0].values).toEqual([[1]])
+      const subqueries =
+        `select * from ${'(select * from '.repeat(100)}` +
+        `(select 1)${')'.repeat(100)}`
+      expect(db.exec(subqueries)[0].values).toEqual([[1]])
+    })
+
     test('supports window functions', () => {
       db.run('create table scores (value integer)')
       db.run('insert into scores values (30), (10), (20)')
