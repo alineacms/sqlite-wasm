@@ -1973,6 +1973,8 @@ function newSnapshot(
     if (depth <= maxDepth && bytes * 2 <= size && chainBytes <= size)
       delta = {parent: base.key, depth, chainBytes}
   }
+  // Composed once, when a store reads it, and only for this save
+  let content: BaseSource | undefined
   // The snapshot is not used meanwhile, so its pages stay where they are,
   // but the Wasm heap may grow: take HEAPU8 afresh.
   return {
@@ -1980,7 +1982,7 @@ function newSnapshot(
     branch,
     meta,
     get base() {
-      return base?.content()
+      return (content ??= base?.content())
     },
     visible,
     size,
