@@ -282,6 +282,11 @@ export interface NewSnapshot {
    * Not needed to write a delta: read it only to write a full snapshot.
    */
   readonly base?: BaseSource
+  /**
+   * Bytes `start` to `end` of `base`, below `visible`: cheaper than slicing
+   * `base` when it is composed of deltas. Stores use it where it is given.
+   */
+  baseRange?(start: number, end: number): BaseSource
   visible: number
   /** The size of the new base; past `visible`, what no page covers is zero */
   size: number
@@ -624,10 +629,12 @@ export function directorySnapshotStore(
           const keep = async (end: number) => {
             const to = Math.min(end, visible, size)
             if (to > at) {
-              const base = snapshot.base
-              if (!base || sizeOf(base) < to)
-                throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
-              await writer.write(slice(base, at, to), at)
+              if (!snapshot.baseRange) {
+                const base = snapshot.base
+                if (!base || sizeOf(base) < to)
+                  throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
+              }
+              await writer.write(baseRange(snapshot, at, to), at)
             }
             at = Math.max(at, end)
           }
@@ -717,8 +724,8 @@ function composeBlob(base: NewSnapshot): Blob {
   const fill = (end: number) => {
     const keep = Math.min(end, base.visible)
     // Composing the old content can take long: only when some is kept.
-    if (keep > at && base.base)
-      parts.push(slice(base.base, at, keep) as BlobPart)
+    if (keep > at && (base.baseRange || base.base))
+      parts.push(baseRange(base, at, keep) as BlobPart)
     const from = Math.max(at, keep)
     if (end > from) parts.push(new Uint8Array(end - from))
     at = end
@@ -733,6 +740,13 @@ function composeBlob(base: NewSnapshot): Blob {
   }
   fill(size)
   return new Blob(parts)
+}
+
+/** Bytes `start` to `end` of the content `snapshot` writes its pages over */
+function baseRange(snapshot: NewSnapshot, start: number, end: number): BaseSource {
+  return snapshot.baseRange
+    ? snapshot.baseRange(start, end)
+    : slice(snapshot.base!, start, end)
 }
 
 /**
@@ -1049,8 +1063,8 @@ interface Base extends SnapshotInfo {
   /** Deltas from the full snapshot below, and the bytes they store */
   depth: number
   chainBytes: number
-  /** The whole database, composed of the layers where needed */
-  content(): BaseSource
+  /** The database, or bytes `start` to `end` of it, from the layers */
+  content(start?: number, end?: number): BaseSource
   /** A file that reads it */
   file(): SyncFile
 }
@@ -1066,7 +1080,7 @@ function baseOf(layer: Layer): Base {
     chainBytes: layer.delta?.chainBytes ?? 0,
     // Only needed to write in full or compare: not kept, as for bytes it
     // copies the database.
-    content: () => layerContent(layer),
+    content: (start?: number, end?: number) => layerContent(layer, start, end),
     file: () => layerFile(layer)
   }
 }
@@ -1159,8 +1173,12 @@ function createLayerFile(layer: Layer): SyncFile {
 }
 
 /** The database a layer holds, as one Blob, or bytes for bytes */
-function layerContent(layer: Layer): BaseSource {
-  if (!layer.delta) return layer.source
+function layerContent(
+  layer: Layer,
+  start = 0,
+  end = layer.info.size
+): BaseSource {
+  if (!layer.delta && start === 0 && end === sizeOf(layer.source)) return layer.source
   const parts: Array<BaseSource> = []
   const add = (source: BaseSource, start: number, end: number) => {
     const stored = Math.min(end, sizeOf(source))
@@ -1176,9 +1194,10 @@ function layerContent(layer: Layer): BaseSource {
       else parts.push(new Uint8Array(run.to - run.from))
     }
   }
-  collect(layer, 0, layer.info.size)
+  collect(layer, start, end)
+  if (parts.length === 1) return parts[0]
   if (parts.some(part => part instanceof Blob)) return new Blob(parts as Array<BlobPart>)
-  const bytes = new Uint8Array(layer.info.size)
+  const bytes = new Uint8Array(end - start)
   let at = 0
   for (const part of parts as Array<Uint8Array>) {
     bytes.set(part, at)
@@ -2032,6 +2051,7 @@ function newSnapshot(
     get base() {
       return (content ??= base?.content())
     },
+    baseRange: base && ((start, end) => base.content(start, end)),
     visible,
     size,
     chunkSize,
