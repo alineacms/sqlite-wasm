@@ -300,7 +300,8 @@ async function readText(source: BaseSource) {
 
 /**
  * Bases as files in `directory`: base `key` in a file named after it, and
- * its group and meta in one next to it. Files are written with one writer
+ * its group, meta and time in one next to it (file times can be too coarse
+ * to tell which of two bases is newer). Files are written with one writer
  * each, which shows them at once when it closes; the base is created first,
  * empty, and the metadata written before it. Reading a file that is
  * deleted is not guaranteed to work, so this store uses locks.
@@ -309,13 +310,18 @@ export function directoryBaseStore(
   name: string,
   directory: SnapshotDirectory
 ): BaseStore {
-  async function readMeta(key: string) {
+  // The metadata of base `key`, with its time, or else `lastModified`
+  async function readMeta(key: string, lastModified: number) {
     const source = await directory.get(encodeKey(key) + META_SUFFIX)
+    let stored: {group?: unknown; meta?: BaseMeta; createdAt?: unknown} = {}
     try {
-      const {group, meta} = source ? JSON.parse(await readText(source)) : {}
-      return {group: String(group ?? ''), meta: (meta ?? {}) as BaseMeta}
-    } catch {
-      return {group: '', meta: {}}
+      if (source) stored = JSON.parse(await readText(source)) ?? {}
+    } catch {}
+    return {
+      group: String(stored.group ?? ''),
+      meta: stored.meta ?? {},
+      createdAt:
+        typeof stored.createdAt === 'number' ? stored.createdAt : lastModified
     }
   }
   async function writeFile(file: string, data: Uint8Array) {
@@ -342,8 +348,7 @@ export function directoryBaseStore(
             const key = decodeKey(file.name)
             return {
               key,
-              ...(await readMeta(key)),
-              createdAt: file.lastModified,
+              ...(await readMeta(key, file.lastModified)),
               size: file.size
             }
           })
@@ -352,11 +357,12 @@ export function directoryBaseStore(
     async get(key) {
       const source = await directory.get(encodeKey(key))
       if (!source) return undefined
-      const createdAt = source instanceof Blob && 'lastModified' in source
-        ? (source as File).lastModified
-        : 0
+      const lastModified =
+        source instanceof Blob && 'lastModified' in source
+          ? (source as File).lastModified
+          : 0
       return {
-        info: {key, ...(await readMeta(key)), createdAt, size: sizeOf(source)},
+        info: {key, ...(await readMeta(key, lastModified)), size: sizeOf(source)},
         source
       }
     },
@@ -368,7 +374,11 @@ export function directoryBaseStore(
       // without one.
       const writer = await directory.create(file)
       try {
-        const meta = JSON.stringify({group: base.group, meta: base.meta})
+        const meta = JSON.stringify({
+          group: base.group,
+          meta: base.meta,
+          createdAt: now()
+        })
         await writeFile(file + META_SUFFIX, new TextEncoder().encode(meta))
         if (base.base && base.visible > 0) {
           if (sizeOf(base.base) < base.visible)

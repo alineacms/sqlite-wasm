@@ -1,0 +1,181 @@
+{
+  "browser": "webkit",
+  "date": "2026-10-08T13:37:08.003Z",
+  "machine": {
+    "os": "Linux 6.18.44-fc-v80",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cores": 4,
+    "memory": 16876494848
+  },
+  "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.6 Safari/605.1.15",
+  "variants": {
+    "opfs": {
+      "firstBase": {
+        "ms": 542,
+        "size": 47448064,
+        "held": 47448064,
+        "wasmHeap": 50724864,
+        "wasmGrowth": 0
+      },
+      "open": {
+        "base": "base-0",
+        "openMs": 15,
+        "ms": 21
+      },
+      "queries": {
+        "point": {
+          "cold": 5,
+          "warm": 0
+        },
+        "range": {
+          "cold": 1266,
+          "warm": 1249
+        },
+        "full": {
+          "cold": 777,
+          "warm": 779
+        }
+      },
+      "queriesLargeCache": {
+        "point": {
+          "cold": 4,
+          "warm": 1
+        },
+        "range": {
+          "cold": 692,
+          "warm": 4
+        },
+        "full": {
+          "cold": 744,
+          "warm": 33
+        }
+      },
+      "checkpoints": {
+        "10": {
+          "ms": 343,
+          "written": true,
+          "held": 1245184,
+          "wasmHeap": 50724864,
+          "wasmGrowth": 0
+        },
+        "1000": {
+          "ms": 454,
+          "written": true,
+          "held": 46333952,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        },
+        "20000": {
+          "ms": 466,
+          "written": true,
+          "held": 50397184,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        }
+      },
+      "twoWorkers": {
+        "seconds": 30,
+        "checkpoints": 29,
+        "readerRounds": 5714,
+        "bases": 2,
+        "expectedBases": 2,
+        "ok": true
+      },
+      "deletedRead": {
+        "error": "disk I/O error"
+      }
+    },
+    "indexeddb": {
+      "firstBase": {
+        "ms": 568,
+        "size": 47448064,
+        "held": 47448064,
+        "wasmHeap": 50724864,
+        "wasmGrowth": 0
+      },
+      "open": {
+        "base": "base-0",
+        "openMs": 19,
+        "ms": 24
+      },
+      "queries": {
+        "point": {
+          "cold": 4,
+          "warm": 0
+        },
+        "range": {
+          "cold": 925,
+          "warm": 978
+        },
+        "full": {
+          "cold": 591,
+          "warm": 467
+        }
+      },
+      "queriesLargeCache": {
+        "point": {
+          "cold": 3,
+          "warm": 0
+        },
+        "range": {
+          "cold": 551,
+          "warm": 5
+        },
+        "full": {
+          "cold": 575,
+          "warm": 34
+        }
+      },
+      "checkpoints": {
+        "10": {
+          "ms": 4155,
+          "written": true,
+          "held": 1245184,
+          "wasmHeap": 50724864,
+          "wasmGrowth": 0
+        },
+        "1000": {
+          "ms": 8303,
+          "written": true,
+          "held": 46333952,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        },
+        "20000": {
+          "ms": 4405,
+          "written": true,
+          "held": 50397184,
+          "wasmHeap": 146472960,
+          "wasmGrowth": 0
+        }
+      },
+      "twoWorkers": {
+        "seconds": 30,
+        "checkpoints": 1,
+        "readerRounds": 5349,
+        "bases": 1,
+        "expectedBases": 1,
+        "ok": true
+      },
+      "deletedRead": {
+        "ok": true,
+        "count": 20000,
+        "length": 41826237
+      }
+    }
+  },
+  "support": {
+    "shared opfs": {
+      "ok": true
+    },
+    "shared indexeddb": {
+      "ok": true
+    },
+    "dedicated opfs": {
+      "ok": true
+    },
+    "dedicated indexeddb": {
+      "ok": true
+    }
+  }
+}

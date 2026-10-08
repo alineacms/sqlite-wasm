@@ -473,6 +473,18 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           expect(await storage().cleanup()).toEqual(['v1'])
         })
 
+        test('tells the newest base apart when file times are equal', async () => {
+          const db = await openDb()
+          fill(db, 10)
+          await storage().checkpoint(db, 'v1')
+          db.run('delete from items where id >= 5')
+          await storage().checkpoint(db, 'v2')
+          // WebKit's file times can be this coarse.
+          for (const file of env.directory.files.values()) file.lastModified = 1
+          expect((await storage().list()).map(base => base.key)).toEqual(['v2', 'v1'])
+          expect(rows(await openDb(), 'select count(*) from items')).toEqual([[5]])
+        })
+
         test('keeps the newest two of a group without Web Locks', async () => {
           const unlocked = storage({locks: null})
           const db = keep(await unlocked.open(Database))
