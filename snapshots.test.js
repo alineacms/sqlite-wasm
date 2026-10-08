@@ -1331,6 +1331,36 @@ describe('Checkpoints in memory', () => {
     expect(held(db)).toBe(0)
   })
 
+  test('compose the content a full save writes over deltas once', async () => {
+    const store = memorySnapshotStore()
+    let composed = 0
+    const checking = {
+      ...store,
+      async write(snapshot) {
+        if (!snapshot.delta && snapshot.visible > 0) {
+          const first = snapshot.base
+          // Stores read it once per run of unchanged pages.
+          for (let i = 0; i < 100; i++) expect(snapshot.base).toBe(first)
+          composed++
+        }
+        return store.write(snapshot)
+      }
+    }
+    const storage = new SnapshotStorage(checking, {maxDepth: 1})
+    const session = await storage.open(Database)
+    register(session)
+    fill(session.db, 1000)
+    await session.save({key: 'v1'})
+    session.db.run("update items set body = 'a' where id = 1")
+    await session.save({key: 'v2'})
+    session.db.run("update items set body = 'b' where id = 2")
+    // Past maxDepth: in full, over the delta v2
+    await session.save({key: 'v3'})
+    expect(composed).toBe(1)
+    expect(rows(await storage.open(Database, {key: 'v3'}).then(register), 'select body from items where id < 3'))
+      .toEqual([['0 '.padEnd(500, 'x')], ['a'], ['b']])
+  })
+
   test('copy meta in and out', async () => {
     const storage = memorySnapshots()
     const db = register(await storage.open(Database))
