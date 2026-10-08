@@ -842,6 +842,41 @@ async function readHeader(source: BaseSource) {
     : new Uint8Array(await head.arrayBuffer())
 }
 
+async function read(source: BaseSource, start: number, end: number) {
+  const part = slice(source, start, end)
+  return part instanceof Uint8Array
+    ? part
+    : new Uint8Array(await part.arrayBuffer())
+}
+
+function equal(a: Uint8Array, b: Uint8Array) {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+/** If `source` holds exactly what writing `base` would write. */
+async function holds(source: BaseSource, base: NewBase) {
+  const {size, visible, chunkSize, pages} = base
+  if (size === 0 || sizeOf(source) !== size) return false
+  const step = Math.max(1, Math.floor(WRITE_BYTES / chunkSize)) * chunkSize
+  let i = 0
+  for (let at = 0; at < size; at += step) {
+    const end = Math.min(at + step, size)
+    const actual = await read(source, at, end)
+    const expected = new Uint8Array(end - at)
+    if (base.base && at < visible)
+      expected.set(await read(base.base, at, Math.min(end, visible)))
+    // Pages are views of Wasm memory: take them after the last await.
+    for (; i < pages.length && pages[i] * chunkSize < end; i++) {
+      const start = pages[i] * chunkSize
+      expected.set(base.page(i).subarray(0, end - start), start - at)
+    }
+    if (!equal(actual, expected)) return false
+  }
+  return true
+}
+
 const newestFirst = (a: BaseInfo, b: BaseInfo) => b.createdAt - a.createdAt
 
 /**
@@ -1026,12 +1061,14 @@ export class SnapshotStorage {
    * read that from now on: the pages it holds that did not change since are
    * dropped from memory. The database keeps working meanwhile; changes made
    * after the checkpoint started stay in memory. Resolves to `false`,
-   * without changing `db`, if base `key` exists already: name bases by
-   * their content, so a key always means the same data. The state is taken
-   * when `checkpoint` is called; checkpoints of one database are written
-   * one at a time. A database closed meanwhile is not moved. Fails with `SQLITE_BUSY` during a write transaction and
-   * `SQLITE_MISUSE` for a database stored elsewhere, such as in IndexedDB
-   * storage.
+   * writing nothing, if base `key` exists already: name bases by their
+   * content, so a key always means the same data. If that base holds
+   * exactly the committed state of `db`, `db` reads it from then on as if
+   * it had written it, else `db` stays as it is. The state is taken when
+   * `checkpoint` is called; checkpoints of one database are written one at
+   * a time. A database closed meanwhile is not moved. Fails with
+   * `SQLITE_BUSY` during a write transaction and `SQLITE_MISUSE` for a
+   * database stored elsewhere, such as in IndexedDB storage.
    */
   checkpoint(
     db: Database,
@@ -1164,10 +1201,11 @@ export class SnapshotStorage {
   }
 
   /**
-   * Write base `key` from `snapshot`, and move `db` onto it, with the later
-   * snapshots of `db` that wait for their turn: they read the same base as
-   * `db` until then. Those that read another base by now (when moving one
-   * failed) stay where they are, as does `db` once it is closed.
+   * Write base `key` from `snapshot`, or find it written with the same
+   * content, and move `db` onto it, with the later snapshots of `db` that
+   * wait for their turn: they read the same base as `db` until then. Those
+   * that read another base by now (when moving one failed) stay where they
+   * are, as does `db` once it is closed. Resolves to whether it wrote it.
    */
   private async write(
     db: Database,
@@ -1178,24 +1216,30 @@ export class SnapshotStorage {
     const release = once(await this.hold(key))
     let registered = false
     try {
-      const source = await this.exclusive(key, () =>
+      const written = await this.exclusive(key, () =>
         this.store.write(this.newBase(snapshot, key, group, meta))
       )
-      if (!source) {
+      let base: Base | undefined
+      if (written) {
+        // Only for its time: the fallback is close enough if reading fails.
+        const stored = await this.store.get(key).catch(() => undefined)
+        const size = sizeOf(written)
+        base = {
+          ...(stored?.info ?? {key, group, meta, createdAt: now(), size}),
+          source: written
+        }
+      } else {
+        base = await this.existing(snapshot, key)
+      }
+      if (!base) {
         release()
         return false
-      }
-      // Only for its time: the fallback is close enough if reading fails.
-      const stored = await this.store.get(key).catch(() => undefined)
-      const base: Base = {
-        ...(stored?.info ?? {key, group, meta, createdAt: now(), size: sizeOf(source)}),
-        source
       }
       const from = snapshot.base
       const files = filesOf(db.wasm)
       const file = `snapshots/${nextFile++}/${key}`
       // From here on, the lock is released once nothing reads the file.
-      files.add(file, readOnlyFile(source), release)
+      files.add(file, readOnlyFile(base.source), release)
       registered = true
       try {
         if (!db.isClosed() && db.base === from) {
@@ -1214,10 +1258,34 @@ export class SnapshotStorage {
       } finally {
         if (files.openHandles(file) === 0) files.remove(file)
       }
-      return true
+      return written !== undefined
     } catch (error) {
       if (!registered) release()
       throw error
+    }
+  }
+
+  /**
+   * Base `key`, if it exists and holds exactly the committed state of
+   * `snapshot`, which can then move onto it as onto a base it wrote.
+   */
+  private async existing(
+    snapshot: Database,
+    key: string
+  ): Promise<Base | undefined> {
+    if ((snapshot.base as Base | undefined)?.key === key) return undefined
+    try {
+      const found = await this.store.get(key)
+      if (!found) return undefined
+      // A key names content, but other Workers may have stored the same
+      // rows in other pages, under which the pages a database holds would
+      // not fit.
+      const content = this.newBase(snapshot, key, '', {})
+      if (!(await holds(found.source, content))) return undefined
+      return {...found.info, source: found.source}
+    } catch {
+      // Deleted while it was read: the database stays where it is.
+      return undefined
     }
   }
 

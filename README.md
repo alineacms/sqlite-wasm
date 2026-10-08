@@ -106,9 +106,12 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   group of the base it reads; `meta` is any data that survives structured
   cloning.
 - Key bases by their content, such as a content hash: a checkpoint to a key
-  that exists writes nothing, leaves the database as it is, and resolves
-  to `false`. The newest checkpoint wins: new Workers open it, and Workers
-  on older bases keep reading those, with their own changes.
+  that exists writes nothing and resolves to `false`. If that base holds
+  the committed state of the database byte for byte, as when Workers make
+  the same changes to the same base, the database reads it from then on
+  and drops the pages it holds, as if it had written it; else it stays as
+  it is. The newest checkpoint wins: new Workers open it, and Workers on
+  older bases keep reading those, with their own changes.
 - `db.fork()` works as usual; a fork keeps reading the base it was forked
   on. `storage.checkpoint(fork, key)` writes a fork too.
 - `await storage.cleanup()` deletes every base that is not the newest of

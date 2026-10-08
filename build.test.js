@@ -265,6 +265,32 @@ for (const [name, initialize] of [
       expect(sizeAfterVacuum).toBeLessThan(sizeBeforeVacuum)
     })
 
+    test('gathers statistics for the query planner', () => {
+      db.run('create table items (kind text, value integer)')
+      db.run('create index items_kind on items (kind)')
+      db.run(`
+        insert into items
+        with recursive n(i) as (
+          select 1 union all select i + 1 from n where i < 100
+        )
+        select i % 4, i from n
+      `)
+      // Creating sqlite_stat1 parses SQL within a parse within a parse.
+      db.run('analyze')
+      expect(db.exec('select tbl, idx, stat from sqlite_stat1')[0].values)
+        .toEqual([['items', 'items_kind', '100 25']])
+      db.run('pragma analysis_limit = 400')
+      expect(db.exec('pragma analysis_limit')[0].values).toEqual([[400]])
+      db.run('pragma optimize')
+      const restored = new Database(db.export())
+      try {
+        expect(restored.exec('select count(*) from sqlite_stat1')[0].values)
+          .toEqual([[1]])
+      } finally {
+        restored.close()
+      }
+    })
+
     test('supports window functions', () => {
       db.run('create table scores (value integer)')
       db.run('insert into scores values (30), (10), (20)')
@@ -481,8 +507,7 @@ for (const [name, initialize] of [
     test.each([
       ['date/time functions', "select date('now')"],
       ['EXPLAIN', 'explain select 1'],
-      ['ALTER TABLE', 'alter table items add column title text'],
-      ['ANALYZE', 'analyze items']
+      ['ALTER TABLE', 'alter table items add column title text']
     ])('intentionally omits %s', (_feature, sql) => {
       db.run('create table items (value text)')
       expect(() => db.exec(sql)).toThrow()

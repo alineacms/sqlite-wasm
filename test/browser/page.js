@@ -166,6 +166,39 @@ for (const variant of ['opfs', 'indexeddb']) {
     }
 }
 
+// Two SharedWorkers that make the same changes share the base the first
+// writes: the second finds it written and reads it too.
+for (const variant of ['opfs', 'indexeddb']) {
+  tests[`two SharedWorkers with the same content share a base (${variant})`] =
+    async () => {
+      const storage = 'same-content'
+      const workers = [spawnShared(), spawnShared()]
+      for (const worker of workers) {
+        await worker.call('open', {variant, storage})
+        await worker.call('fill', {count: 2000, size: 1000})
+      }
+      const [a, b] = workers
+      same((await a.call('checkpoint', {name: 'same'})).written, true, 'a')
+      same((await b.call('checkpoint', {name: 'same'})).written, false, 'b')
+      for (const worker of workers) {
+        same(await worker.call('base'), 'same', 'base')
+        same(
+          await worker.call('rows', {sql: 'pragma overlay_pages'}),
+          [['0']],
+          'pages held'
+        )
+        same(
+          await worker.call('rows', {
+            sql: 'select count(*), sum(length(body)) from items'
+          }),
+          [[2000, 2_000_000]],
+          'rows'
+        )
+      }
+      same((await a.call('list')).map(base => base.key), ['same'], 'bases')
+    }
+}
+
 window.runTests = async () => {
   const results = []
   for (const [name, test] of Object.entries(tests)) {

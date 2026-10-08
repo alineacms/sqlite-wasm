@@ -372,10 +372,75 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           storage().checkpoint(a, 'same'),
           storage().checkpoint(b, 'same')
         ])
-        const winner = results[0] ? a : b
         expect([...results].sort()).toEqual([false, true])
-        expect(winner.base.key).toBe('same')
-        expect(held(winner)).toBe(0)
+        // The other finds the same content there, and reads it too.
+        for (const db of [a, b]) {
+          expect(db.base.key).toBe('same')
+          expect(held(db)).toBe(0)
+        }
+      })
+
+      test('move onto a key that exists with the same content', async () => {
+        const a = await openDb()
+        const b = await openDb()
+        fill(a, 100)
+        fill(b, 100)
+        expect(await storage().checkpoint(a, 'same')).toBe(true)
+        const written = await content('same')
+        expect(held(b)).toBeGreaterThan(0)
+        expect(await storage().checkpoint(b, 'same')).toBe(false)
+        expect(await content('same')).toEqual(written)
+        expect(held(b)).toBe(0)
+        expect(baseOf(b).key).toBe('same')
+        expect(dump(b)).toEqual(dump(a))
+        b.run('delete from items where id >= 10')
+        expect(rows(b, 'select count(*) from items')).toEqual([[10]])
+        expect(rows(a, 'select count(*) from items')).toEqual([[100]])
+      })
+
+      test('move onto a key that exists from the same base', async () => {
+        const first = await openDb()
+        fill(first, 2000)
+        await storage().checkpoint(first, 'v1')
+        first.close()
+        const a = await openDb('v1')
+        const b = await openDb('v1')
+        for (const db of [a, b])
+          db.run("update items set body = 'changed' where id % 100 = 0")
+        expect(await storage().checkpoint(a, 'v2')).toBe(true)
+        expect(await storage().checkpoint(b, 'v2')).toBe(false)
+        expect(held(b)).toBe(0)
+        expect(baseOf(b).key).toBe('v2')
+        expect(b.export()).toEqual(a.export())
+        // Nobody reads v1 anymore; with locks, both hold v2.
+        expect(await storage().cleanup()).toEqual(['v1'])
+        if (locking)
+          expect([...env.locks.held.values()].map(lock => lock.count))
+            .toEqual([2])
+        expect(rows(keep(b.fork()), 'select count(*) from items'))
+          .toEqual([[2000]])
+      })
+
+      test('stay on the base when a key exists with other content', async () => {
+        const a = await openDb()
+        const b = await openDb()
+        const c = await openDb()
+        fill(a, 100)
+        fill(b, 200)
+        // The same size, but other bytes
+        fill(c, 100)
+        c.run("update items set body = replace(body, 'x', 'y')")
+        expect(rows(c, 'pragma page_count')).toEqual(rows(a, 'pragma page_count'))
+        expect(await storage().checkpoint(a, 'same')).toBe(true)
+        for (const db of [b, c]) {
+          const pages = held(db)
+          expect(await storage().checkpoint(db, 'same')).toBe(false)
+          expect(held(db)).toBe(pages)
+          expect(baseOf(db)).toBeUndefined()
+        }
+        expect(rows(b, 'select count(*) from items')).toEqual([[200]])
+        expect(rows(c, "select count(*) from items where body like '%y'"))
+          .toEqual([[100]])
       })
 
       test('move a database in a transaction that wrote pages meanwhile', async () => {
