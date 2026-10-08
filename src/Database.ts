@@ -367,8 +367,13 @@ export class Database {
     fork.base = this.base
     // Keep the page cache size of the source: pages of a base are read from
     // it again once they leave the cache.
-    const [[cacheSize]] = this.exec('pragma cache_size')[0].values
-    fork.run(`pragma cache_size = ${cacheSize}`)
+    try {
+      const [[cacheSize]] = this.exec('pragma cache_size')[0].values
+      fork.run(`pragma cache_size = ${cacheSize}`)
+    } catch (error) {
+      fork.close()
+      throw error
+    }
     return fork
   }
 

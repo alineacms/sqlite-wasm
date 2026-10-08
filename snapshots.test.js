@@ -452,6 +452,44 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect((await openDb('v3')).export()).toEqual(reference.export())
       })
 
+      test('default to the group a database was opened for', async () => {
+        const db = await openDb()
+        fill(db, 10)
+        await storage().checkpoint(db, 'one', {group: 'cfg1'})
+        const other = await openDb({group: 'cfg2', fallback: 'any'})
+        expect(baseOf(other).group).toBe('cfg1')
+        other.run('delete from items where id = 1')
+        await storage().checkpoint(other, 'two')
+        expect(baseOf(other).group).toBe('cfg2')
+        // And to the group of its last checkpoint, also while it is pending.
+        other.run('delete from items where id = 2')
+        const three = storage().checkpoint(other, 'three', {group: 'cfg3'})
+        other.run('delete from items where id = 3')
+        const four = storage().checkpoint(other, 'four')
+        await Promise.all([three, four])
+        expect(baseOf(other).group).toBe('cfg3')
+      })
+
+      test('release every base of a database closed with checkpoints queued', async () => {
+        const db = await openDb()
+        fill(db, 100)
+        await storage().checkpoint(db, 'v1')
+        const queued = []
+        for (let i = 2; i <= 4; i++) {
+          db.run(`delete from items where id = ${i}`)
+          queued.push(storage().checkpoint(db, `v${i}`))
+        }
+        db.close()
+        expect(await Promise.all(queued)).toEqual([true, true, true])
+        if (locking) {
+          // Locks are released once the last snapshot closes, a tick later.
+          await tick()
+          expect(env.locks.held.size).toBe(0)
+        }
+        expect((await storage().cleanup()).sort()).toEqual(['v1', 'v2', 'v3'])
+        expect(rows(await openDb(), 'select count(*) from items')).toEqual([[97]])
+      })
+
       test('fail during a write transaction', async () => {
         const db = await openDb()
         fill(db, 10)
@@ -483,7 +521,9 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         }
         throw new Error('timed out')
       }
-      const keys = async () => (await storage().list()).map(base => base.key)
+      // Bases written in full (files appear empty while they are written)
+      const keys = async () =>
+        (await storage().list()).filter(base => base.size > 0).map(base => base.key)
 
       test('are off unless after or maxHeld is given', async () => {
         const db = await openDb({checkpoint: {}})
@@ -646,6 +686,11 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(rows(await openDb({group: 'a'}), 'select count(*) from items')).toEqual([[13]])
       })
 
+      test('refuses keepGroups that is not a whole number', async () => {
+        for (const keepGroups of [-1, 1.5, NaN])
+          await expect(storage().cleanup({keepGroups})).rejects.toThrow(RangeError)
+      })
+
       test('keeps the newest groups only, with keepGroups', async () => {
         const db = await openDb()
         fill(db, 10)
@@ -765,6 +810,42 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
   })
 }
 
+describe('Checkpoints in memory', () => {
+  test('move the database even when reading the new base back fails', async () => {
+    const store = memoryBaseStore()
+    let fail = false
+    const flaky = {
+      ...store,
+      async get(key) {
+        if (fail) {
+          fail = false
+          throw new Error('read failed')
+        }
+        return store.get(key)
+      }
+    }
+    const storage = new SnapshotStorage(flaky)
+    const db = keep(await storage.open(Database))
+    fill(db, 100)
+    await storage.checkpoint(db, 'v1')
+    db.run('delete from items where id >= 10')
+    fail = true
+    expect(await storage.checkpoint(db, 'v2')).toBe(true)
+    expect(baseOf(db)).toMatchObject({key: 'v2', group: ''})
+    expect(held(db)).toBe(0)
+  })
+
+  test('copy meta in and out', async () => {
+    const storage = memorySnapshotStorage()
+    const db = keep(await storage.open(Database))
+    fill(db, 1)
+    const meta = {tree: 'a'}
+    await storage.checkpoint(db, 'v1', {meta})
+    meta.tree = 'changed'
+    expect((await storage.list())[0].meta).toEqual({tree: 'a'})
+  })
+})
+
 describe('Forks', () => {
   test('keep the page cache size of an in-memory database', () => {
     const db = keep(new Database())
@@ -792,9 +873,11 @@ describe('Read-only files', () => {
   })
 })
 
-// Random changes, VACUUM (also to other page sizes) and checkpoints that
-// overlap them, compared with the same changes on a plain database: the
-// database, and every base as of when its checkpoint was called.
+// Random changes, transactions with savepoints and rollbacks, VACUUM (also
+// to other page sizes, and incremental), and checkpoints that overlap them,
+// so databases move onto new bases also halfway through a transaction:
+// compared with the same changes on a plain database, the database and
+// every base as of when its checkpoint was called.
 describe('Random checkpoints', () => {
   function random(seed) {
     return () => {
@@ -804,33 +887,63 @@ describe('Random checkpoints', () => {
   }
 
   const state = db =>
-    JSON.stringify([db.exec('select id, hex(b) from t order by id'), db.exec('pragma page_count')])
+    JSON.stringify([
+      db.exec('select id, hex(b) from t order by id'),
+      db.exec('pragma page_count'),
+      db.exec('pragma freelist_count')
+    ])
 
-  async function run(seed, storage) {
+  async function run(seed, storage, autoVacuum) {
     const next = random(seed)
     const pick = n => Math.floor(next() * n)
     const db = keep(await storage.open(Database))
     const reference = keep(new Database())
-    const run = sql => both(db, reference, db => db.run(sql))
+    // Statements fail the same way on both, or not at all.
+    const run = sql => {
+      const errors = [db, reference].map(db => {
+        try {
+          db.run(sql)
+        } catch (error) {
+          return error.message
+        }
+      })
+      expect(errors[0]).toBe(errors[1])
+    }
+    run(`pragma auto_vacuum = ${autoVacuum}`)
     run('create table t (id integer primary key, b blob)')
+    // A small cache makes transactions write their pages early.
+    run('pragma cache_size = 3')
     let id = 0
+    let inTransaction = false
+    let savepoints = 0
     const pending = []
-    for (let step = 0; step < 50; step++) {
+    for (let step = 0; step < 100; step++) {
       const x = next()
-      if (x < 0.3) {
+      if (x < 0.1 && !inTransaction) {
         run('begin')
-        for (let i = pick(200); i >= 0; i--)
-          run(`insert into t values (${id++}, zeroblob(${pick(3000)}) || char(${65 + pick(26)}))`)
-        run('commit')
+        inTransaction = true
+      } else if (x < 0.17 && inTransaction) {
+        run(next() < 0.5 ? 'commit' : 'rollback')
+        inTransaction = false
+        savepoints = 0
+      } else if (x < 0.22 && inTransaction) {
+        run(`savepoint s${savepoints++}`)
+      } else if (x < 0.26 && inTransaction && savepoints > 0) {
+        run(`rollback to s${pick(savepoints)}`)
       } else if (x < 0.45) {
-        const from = pick(id)
-        run(`delete from t where id between ${from} and ${from + pick(300)}`)
+        for (let i = pick(80); i >= 0; i--)
+          run(`insert into t values (${id++}, zeroblob(${pick(3000)}) || char(${65 + pick(26)}))`)
       } else if (x < 0.55) {
+        const from = pick(id)
+        run(`delete from t where id between ${from} and ${from + pick(200)}`)
+      } else if (x < 0.6) {
         run(`update t set b = char(${65 + pick(26)}) where id % ${2 + pick(5)} = 0`)
-      } else if (x < 0.65) {
+      } else if (x < 0.64 && !inTransaction) {
         if (next() < 0.5) run(`pragma page_size = ${[1024, 2048, 4096, 8192][pick(4)]}`)
         run('vacuum')
-      } else if (x < 0.85) {
+      } else if (x < 0.67 && autoVacuum === 2) {
+        run(`pragma incremental_vacuum(${pick(50)})`)
+      } else if (x < 0.82 && !inTransaction) {
         const key = `k${pending.length}`
         pending.push({key, at: keep(reference.fork()), written: storage.checkpoint(db, key)})
       } else {
@@ -838,6 +951,7 @@ describe('Random checkpoints', () => {
       }
       expect(state(db)).toBe(state(reference))
     }
+    if (inTransaction) run('rollback')
     for (const {key, at, written} of pending) {
       expect(await written).toBe(true)
       expect(state(keep(await storage.open(Database, key)))).toBe(state(at))
@@ -847,7 +961,37 @@ describe('Random checkpoints', () => {
 
   for (const [variant, {setup}] of Object.entries(variants)) {
     test(`match a plain database in ${variant}`, async () => {
-      for (let seed = 1; seed <= 6; seed++) await run(seed, setup().storage())
-    }, 60_000)
+      for (const autoVacuum of [0, 1, 2]) {
+        for (let seed = 1; seed <= 4; seed++) {
+          await run(seed * 7 + autoVacuum, setup().storage(), autoVacuum)
+        }
+      }
+    }, 120_000)
   }
+
+  test('keep a statement stepping while its database moves', async () => {
+    const storage = memorySnapshotStorage()
+    const db = keep(await storage.open(Database))
+    db.run('create table t (id integer primary key, b blob)')
+    db.run('begin')
+    for (let i = 0; i < 2000; i++) db.run(`insert into t values (${i}, zeroblob(500))`)
+    db.run('commit')
+    await storage.checkpoint(db, 'v1')
+    db.run('pragma cache_size = 2')
+    db.run('update t set b = zeroblob(400) where id % 3 = 0')
+    const checkpoint = storage.checkpoint(db, 'v2')
+    const stmt = db.prepare('select id, length(b) from t order by id')
+    const read = []
+    for (let i = 0; i < 10; i++) {
+      stmt.step()
+      read.push(stmt.get())
+    }
+    await checkpoint
+    expect(baseOf(db).key).toBe('v2')
+    while (stmt.step()) read.push(stmt.get())
+    stmt.free()
+    expect(read.length).toBe(2000)
+    expect(read.every(([id, length], i) => id === i && length === (i % 3 === 0 ? 400 : 500)))
+      .toBe(true)
+  })
 })

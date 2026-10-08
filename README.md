@@ -102,8 +102,9 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   the database reads the new base and drops those pages from memory;
   changes made meanwhile stay. The database keeps working: the checkpoint
   captures the committed state when it is called. The group defaults to
-  the group of the base the database reads; `meta` is any data that
-  survives structured cloning.
+  the one the database was opened for or last checkpointed to, else the
+  group of the base it reads; `meta` is any data that survives structured
+  cloning.
 - Key bases by their content, such as a content hash: a checkpoint to a key
   that exists writes nothing, leaves the database as it is, and resolves
   to `false`. The newest checkpoint wins: new Workers open it, and Workers
@@ -112,7 +113,8 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   on. `storage.checkpoint(fork, key)` writes a fork too.
 - `await storage.cleanup()` deletes every base that is not the newest of
   its group, and resolves to their keys. `cleanup({keepGroups: n})` also
-  deletes the bases of all but the `n` groups with the newest bases.
+  deletes the bases of all but the `n` groups with the newest bases (with
+  OPFS and no Web Locks, also ones Workers still read).
 - SQLite keeps up to 8 MB of the pages it read in its page cache
   (`PRAGMA cache_size` changes it).
 - `checkpoint` fails during a write transaction (`SQLITE_BUSY`), and for a
@@ -187,8 +189,9 @@ other `SnapshotDirectory`.
 OPFS nor `FileReaderSync`. Storages given the same store share its bases,
 as Workers share OPFS or IndexedDB.
 
-Both are tested in Chromium, Firefox and WebKit, in dedicated and shared
-Workers; `storage.supported()` tells if the APIs they need are there.
+Bases in IndexedDB and in OPFS are tested in Chromium, Firefox and
+WebKit, in dedicated and shared Workers; `storage.supported()` tells if the
+APIs they need are there.
 `readOnlyFile(blobOrBytes)` reads a `File`, `Blob` or `Uint8Array` as a
 read-only `SyncFile`, and `new SnapshotStorage(store)` takes any other
 `BaseStore`.
