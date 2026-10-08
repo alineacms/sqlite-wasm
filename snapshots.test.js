@@ -919,6 +919,50 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(rows(session.db, 'select count(*) from items')).toEqual([[99]])
       })
 
+      test('open older snapshots when the head lies over a missing one', async () => {
+        const full = storage({maxDepth: 0})
+        const first = await full.open(Database, {branch: 'b'})
+        register(first)
+        fill(first.db, 100)
+        await first.save({key: 'v0'})
+        first.db.run('delete from items where id >= 50')
+        await first.save({key: 'v1'})
+        await first.close()
+        const session = await storage().open(Database, {branch: 'b'})
+        register(session)
+        session.db.run('delete from items where id >= 10')
+        await session.save({key: 'v2'})
+        expect((await stored('v2')).info.parent).toBe('v1')
+        await storage().store.remove('v1')
+        // v2 cannot be read, v1 is gone: v0 opens.
+        const db = await openDb({branch: 'b'})
+        expect(snapshotOf(db).key).toBe('v0')
+        expect(rows(db, 'select count(*) from items')).toEqual([[100]])
+        await expect(storage().open(Database, {key: 'v2'}))
+          .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
+      })
+
+      if (!locking) {
+        test('write in full when the snapshot below was deleted meanwhile', async () => {
+          const session = await storage().open(Database)
+          register(session)
+          fill(session.db, 500)
+          await session.save({key: 'v1'})
+          session.db.run('delete from items where id = 1')
+          // As retain() in another Worker would, while this one reads v1
+          await storage().store.remove('v1')
+          await session.save({key: 'v2'})
+          expect((await stored('v2')).delta).toBeUndefined()
+          expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[499]])
+        })
+      }
+
+      test('refuse a maxDepth past the deepest chain that opens', () => {
+        expect(() => storage({maxDepth: 65})).toThrow(RangeError)
+        expect(() => storage({maxDepth: Infinity})).toThrow(RangeError)
+        expect(() => storage({maxDepth: 64})).not.toThrow()
+      })
+
       test('keep the snapshots that kept ones lie over', async () => {
         const session = await storage().open(Database, {branch: 'main'})
         const db = register(session)
@@ -1330,6 +1374,19 @@ describe('Read-only files', () => {
     for (let at = 0; at < 10_000; at += 256) check(at, 256)
     expect(slices.slice(1).every(length => length === 1024 || length === 784)).toBe(true)
     expect(slices.length).toBeLessThanOrEqual(11)
+  })
+
+  test('read only what is asked without cached blocks', () => {
+    const slices = []
+    class CountingBlob extends Blob {
+      slice(start, end) {
+        slices.push(end - start)
+        return super.slice(start, end)
+      }
+    }
+    const file = readOnlyFile(new CountingBlob([new Uint8Array(10_000)]), {blockSize: 1024, blocks: 0})
+    for (let at = 0; at < 2000; at += 100) file.read(new Uint8Array(100), {at})
+    expect(slices.every(length => length === 100)).toBe(true)
   })
 
   test('read Blobs', () => {

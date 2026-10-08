@@ -42,6 +42,8 @@ const CACHED_BLOCKS = 4
 // those of all of them no more than the database: reads look through every
 // delta, and deltas keep pages the ones above replace.
 const MAX_DEPTH = 8
+// The most deltas a snapshot can lie over, whatever maxDepth was
+const MAX_CHAIN = 64
 // Without locks, how old an empty base is before cleanup deletes it: one
 // that is still being written after this long has failed.
 const STALE_MS = 60 * 60_000
@@ -112,7 +114,7 @@ export function readOnlyFile(
       if (end <= at) return 0
       const first = Math.floor(at / blockSize)
       const last = Math.floor((end - 1) / blockSize)
-      let whole = at >= previousEnd && at < previousEnd + blockSize
+      let whole = capacity > 0 && at >= previousEnd && at < previousEnd + blockSize
       if (!whole) {
         whole = true
         for (let i = first; i <= last; i++) if (!cached.has(i)) whole = false
@@ -164,43 +166,52 @@ export function openOverlay<T extends Database>(
 ): T {
   const file =
     base instanceof Uint8Array || base instanceof Blob ? readOnlyFile(base) : base
+  return openOn(Database, file, file.getSize(), 'Database', () => file.close())
+}
+
+/**
+ * Open a database on `file`, `size` bytes, which reads `name` in errors.
+ * `release` is called once, when the database and its forks closed or if
+ * opening fails.
+ */
+function openOn<T extends Database>(
+  Database: new () => T,
+  file: SyncFile,
+  size: number,
+  name: string,
+  release: () => void
+): T {
+  release = once(release)
   let db: T | undefined
-  let name: string | undefined
   try {
-    const size = file.getSize()
     const header = new Uint8Array(100)
     file.read(header, {at: 0})
-    checkHeader(header, size, 'Database')
+    checkHeader(header, size, name)
     db = new Database()
     const files = filesOf(db.wasm)
-    name = `overlays/${nextFile++}`
-    files.add(name, file, () => file.close())
+    const label = `bases/${nextFile++}`
+    files.add(label, file, release)
     try {
-      db.openBase(name)
+      db.openBase(label)
     } finally {
-      // Opening failed before SQLite opened the file.
-      if (files.openHandles(name) === 0) {
-        files.remove(name)
-        name = undefined
-      }
+      // Opening failed before SQLite opened the file: this releases it.
+      if (files.openHandles(label) === 0) files.remove(label)
     }
     try {
       db.exec('select count(*) from sqlite_schema')
       db.run(`pragma cache_size = -${CACHE_KIB}`)
     } catch (error) {
-      throw new SQLiteError(
-        `Database is corrupt: ${(error as Error).message}`,
-        SQLITE_CORRUPT,
-        {cause: error}
-      )
+      throw new SQLiteError(`${name} is corrupt: ${(error as Error).message}`, SQLITE_CORRUPT, {
+        cause: error
+      })
     }
     return db
   } catch (error) {
     try {
+      // Releases the file once SQLite closes it.
       db?.close()
     } catch {}
-    // Closes the file, unless the database still had it open.
-    if (name === undefined) file.close()
+    release()
     throw error
   }
 }
@@ -999,14 +1010,15 @@ interface Base extends SnapshotInfo {
 function baseOf(layer: Layer): Base {
   const keys: Array<string> = []
   for (let at: Layer | undefined = layer; at; at = at.below) keys.push(at.info.key)
-  let content: BaseSource | undefined
   return {
     ...layer.info,
     layer,
     keys,
     depth: layer.delta?.depth ?? 0,
     chainBytes: layer.delta?.chainBytes ?? 0,
-    content: () => (content ??= layerContent(layer)),
+    // Only needed to write in full or compare: not kept, as for bytes it
+    // copies the database.
+    content: () => layerContent(layer),
     file: () => layerFile(layer)
   }
 }
@@ -1057,8 +1069,17 @@ function* runs(delta: DeltaLayout, start: number, end: number): Generator<Run> {
   }
 }
 
+/** Files of layers, so files over the same ones share their block caches */
+const layerFiles = new WeakMap<Layer, SyncFile>()
+
 /** A read-only file of the database a layer holds */
 function layerFile(layer: Layer): SyncFile {
+  let file = layerFiles.get(layer)
+  if (!file) layerFiles.set(layer, (file = createLayerFile(layer)))
+  return file
+}
+
+function createLayerFile(layer: Layer): SyncFile {
   const own = readOnlyFile(layer.source)
   const {delta, below} = layer
   if (!delta || !below) return own
@@ -1091,6 +1112,7 @@ function layerFile(layer: Layer): SyncFile {
 
 /** The database a layer holds, as one Blob, or bytes for bytes */
 function layerContent(layer: Layer): BaseSource {
+  if (!layer.delta) return layer.source
   const parts: Array<BaseSource> = []
   const add = (source: BaseSource, start: number, end: number) => {
     const stored = Math.min(end, sizeOf(source))
@@ -1107,7 +1129,6 @@ function layerContent(layer: Layer): BaseSource {
     }
   }
   collect(layer, 0, layer.info.size)
-  if (!layer.delta) return layer.source
   if (parts.some(part => part instanceof Blob)) return new Blob(parts as Array<BlobPart>)
   const bytes = new Uint8Array(layer.info.size)
   let at = 0
@@ -1298,6 +1319,8 @@ export class SnapshotStorage {
   ) {
     this.maxDepth = options?.maxDepth ?? MAX_DEPTH
     wholeNumber('maxDepth', this.maxDepth, 0)
+    if (this.maxDepth > MAX_CHAIN)
+      throw new RangeError(`maxDepth must be at most ${MAX_CHAIN}, not ${this.maxDepth}`)
     this.locks =
       options?.locks !== undefined
         ? options.locks
@@ -1396,7 +1419,7 @@ export class SnapshotStorage {
         found.push(stored)
         if (!stored.delta) break
         at = stored.delta.parent
-        if (found.length > 64)
+        if (found.length > MAX_CHAIN + 1)
           throw new SQLiteError(`Snapshot "${key}" lies over too many`, SQLITE_CORRUPT)
       }
       let layer: Layer | undefined
@@ -1431,24 +1454,32 @@ export class SnapshotStorage {
     options: OpenOptions = {}
   ): Promise<Session<T>> {
     const {key, branch, fallback, autoSave} = options
-    const head = async () =>
-      (await this.head(branch)) ??
-      (fallback === 'any-branch' && branch !== undefined
-        ? await this.head()
-        : undefined)
-    for (let attempt = 0; ; attempt++) {
-      const found = key ?? (await head())?.key
-      if (found === undefined)
-        return this.session(new Database(), {branch, autoSave})
-      try {
-        const db = await this.openSnapshot(Database, found)
-        return this.session(db, {branch, autoSave})
-      } catch (error) {
-        // The head was deleted after it was found: a newer one replaced it.
-        const missing = (error as SQLiteError)?.resultCode === SQLITE_CANTOPEN
-        if (key !== undefined || !missing || attempt >= 2) throw error
+    if (key !== undefined)
+      return this.session(await this.openSnapshot(Database, key), {branch, autoSave})
+    const scopes = fallback === 'any-branch' && branch !== undefined ? [branch, undefined] : [branch]
+    const tried = new Set<string>()
+    for (const scope of scopes) {
+      const head = await this.head(scope)
+      const order = head ? [head.key] : []
+      let listed = false
+      for (let i = 0; i < order.length; i++) {
+        if (tried.has(order[i])) continue
+        tried.add(order[i])
+        try {
+          return this.session(await this.openSnapshot(Database, order[i]), {branch, autoSave})
+        } catch (error) {
+          // Deleted after it was found, or a snapshot it lies over was: try
+          // the newer ones that replaced it, then the older ones.
+          if ((error as SQLiteError)?.resultCode !== SQLITE_CANTOPEN) throw error
+          if (!listed) {
+            listed = true
+            for (const snapshot of await this.list({branch: scope}))
+              if (snapshot.size > 0) order.push(snapshot.key)
+          }
+        }
       }
     }
+    return this.session(new Database(), {branch, autoSave})
   }
 
   /**
@@ -1470,42 +1501,9 @@ export class SnapshotStorage {
     const resolved = await this.resolve(key)
     if (!resolved) throw new SQLiteError(`No snapshot "${key}"`, SQLITE_CANTOPEN)
     const {base, release} = resolved
-    let db: T | undefined
-    try {
-      const reader = base.file()
-      const header = new Uint8Array(100)
-      reader.read(header, {at: 0})
-      checkHeader(header, base.size, `Snapshot "${key}"`)
-      db = new Database()
-      const opened = db
-      const files = filesOf(opened.wasm)
-      const file = `snapshots/${nextFile++}/${key}`
-      files.add(file, reader, release)
-      try {
-        opened.openBase(file)
-        opened.base = base
-      } finally {
-        // Opening failed before SQLite opened the file.
-        if (files.openHandles(file) === 0) files.remove(file)
-      }
-      try {
-        db.exec('select count(*) from sqlite_schema')
-        db.run(`pragma cache_size = -${CACHE_KIB}`)
-      } catch (error) {
-        throw new SQLiteError(
-          `Snapshot "${key}" is corrupt: ${(error as Error).message}`,
-          SQLITE_CORRUPT,
-          {cause: error}
-        )
-      }
-      return db
-    } catch (error) {
-      try {
-        db?.close()
-      } catch {}
-      release()
-      throw error
-    }
+    const db = openOn(Database, base.file(), base.size, `Snapshot "${key}"`, release)
+    db.base = base
+    return db
   }
 
   /**
@@ -1528,6 +1526,12 @@ export class SnapshotStorage {
     let registered = false
     try {
       const content = newSnapshot(snapshot, key, branch, meta, this.maxDepth)
+      // Without locks, retain() elsewhere may have deleted the snapshot a
+      // delta would lie over: then write in full.
+      if (content.delta && !this.locks) {
+        const parent = await this.store.get(content.delta.parent).catch(() => undefined)
+        if (!parent || parent.info.size === 0) content.delta = undefined
+      }
       const written = await this.exclusive(key, () => this.store.write(content))
       let target: Base
       if (written) {
