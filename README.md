@@ -19,8 +19,9 @@ The build includes SQLite JSON functions, FTS5, views, triggers, window
 functions, temporary tables, `VACUUM`, and `ATTACH` for additional in-memory
 databases. Databases live in memory;
 use `db.export()` and `new Database(bytes)` to persist and restore their file
-representation, [sync them with IndexedDB](#indexeddb-storage), or
-[store them in OPFS](#opfs-storage) without keeping them in memory.
+representation, [sync them with IndexedDB](#indexeddb-storage),
+[store them in OPFS](#opfs-storage) without keeping them in memory, or open
+them in many Workers at once on [snapshots in OPFS](#snapshot-storage).
 
 Databases are stored copy-on-write, so `db.fork()` creates an independent copy
 without duplicating any data. The fork shares every page with its source and
@@ -172,9 +173,9 @@ db.run('insert into notes values (?)', ['stored'])
   fails again.
 - OPFS files can only be opened this way in a dedicated Worker, by one
   Worker at a time: syncing a database that another Worker or tab holds
-  fails with `SQLITE_BUSY`. Have one Worker own the database, and the other
-  tabs send it their queries, as [shareDatabase](#sharing-a-database-between-tabs)
-  does. No cross-origin isolation headers are needed.
+  fails with `SQLITE_BUSY`. Have one Worker own the database and the other
+  tabs send it their queries, or use [snapshot storage](#snapshot-storage).
+  No cross-origin isolation headers are needed.
 - `db.fork()` creates an in-memory snapshot, as for any database. It keeps
   its content when the stored database changes or closes, copying the pages
   it still read from the file first.
@@ -191,41 +192,81 @@ db.run('insert into notes values (?)', ['stored'])
 instead of its root. `fileStorage(name, fileSystem)` uses any other
 `FileSystem` that opens files for synchronous access.
 
-### Sharing a database between tabs
+## Snapshot storage
 
-Only one Worker can hold an OPFS file. `shareDatabase` from
-`@alinea/sqlite-wasm/shared` lets every tab use it anyway: call it in a
-dedicated Worker in each tab, and the Web Locks API elects one of them to
-open the database while the others send it their statements over a
-BroadcastChannel.
+`@alinea/sqlite-wasm/snapshots` keeps a database in immutable base files in
+OPFS, which any number of Workers open at the same time, dedicated or
+shared, and of different builds of an app. Each opens a copy-on-write
+overlay on a base file: SQLite reads pages from the file as queries need
+them, and every change stays in that Worker's memory. A checkpoint writes a
+new base file with the changes, which other Workers open from then on.
 
 ```ts
 import {init} from '@alinea/sqlite-wasm'
-import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
-import {shareDatabase} from '@alinea/sqlite-wasm/shared'
+import {snapshotStorage} from '@alinea/sqlite-wasm/snapshots'
 
-const db = shareDatabase('notes', async () => {
-  const {Database} = await init()
-  return Database.sync(opfsStorage('notes.sqlite3'))
-})
-await db.exec('create table if not exists notes (text)')
-await db.transaction([['insert into notes values (?)', ['shared']]])
-console.log(await db.query('select * from notes'))
+const {Database} = await init()
+const storage = snapshotStorage('entries')
+if (storage.supported()) {
+  const db = await storage.open(Database) // on the newest base, or empty
+  db.run('create table if not exists notes (text)')
+  db.run('insert into notes values (?)', ['stored'])
+  await storage.checkpoint(db, contentHash) // writes base file contentHash
+  await storage.cleanup() // deletes base files nobody reads
+}
 ```
 
-- `query(sql, params)` returns rows as objects, `exec(sql)` runs a script
-  without parameters, and `transaction(statements)` runs statements in one
-  transaction and returns the rows of each. They resolve once the
-  statements ran in the owning Worker and their commits are stored.
-- Requests run one at a time, so tabs never interleave inside a
-  transaction. A transaction must begin and end in one request: a request
-  that leaves one open is rolled back and fails with `SQLITE_MISUSE`.
-- When the owning tab closes, the next Worker in line opens the database
-  (finishing a commit that was interrupted) and the others send what was
-  not answered yet again. A request the previous owner ran but did not
-  answer runs twice, so make writes safe to repeat where that matters.
-- `isOwner` tells if this Worker holds the database; `close()` releases it.
-- `open` can return any database, also one stored in IndexedDB.
+Use it for a cache or a copy of data that lives elsewhere, which many
+Workers read and change, where losing recent changes costs a reload. For a
+database whose commits must all be stored, use [OPFS storage](#opfs-storage)
+with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
+
+- There is no writable shared file: base files are never changed once
+  written, so two Workers can never corrupt each other's data. No
+  journal or WAL is written to OPFS; nothing is loaded into memory up
+  front.
+- `storage.open(Database)` opens the newest base file (by modification
+  time), and `storage.open(Database, name)` a given one. Without base
+  files the database starts empty. Opening a missing base fails with
+  `SQLITE_CANTOPEN`, a base that is not a database with `SQLITE_CORRUPT`.
+- Changes are kept in memory until a checkpoint: commits since the last
+  one are lost when the database closes or its Worker ends.
+  `PRAGMA overlay_pages` tells how many pages a database holds in memory.
+- `await storage.checkpoint(db, name)` writes base file `name`: a copy of
+  the base file the database reads, streamed by the browser, with the
+  pages the database holds written over it, in one `createWritable()`
+  that appears at once when it closes. Then the database reads the new
+  file and drops the pages it wrote from memory; changes made while the
+  file was written stay. The database keeps working meanwhile: the
+  checkpoint captures the committed state when it is called.
+- Name base files by their content, such as a content hash: a checkpoint
+  to a name that exists writes nothing, leaves the database as it is, and
+  resolves to `false`. The newest checkpoint wins: new Workers open it, and
+  Workers on older bases keep reading those, with their own changes.
+- `db.fork()` works as usual; a fork keeps reading the base it was forked
+  on. `storage.checkpoint(fork, name)` writes a fork too.
+- Workers hold a shared Web Lock on each base file they read (also through
+  forks). `await storage.cleanup()` deletes the base files nobody reads,
+  except the newest, and resolves to their names. Without Web Locks it
+  keeps the newest two, which a Worker may still read, and two Workers
+  that checkpoint to the same name at once may both write it, leaving one
+  reading the other's file: every browser with `createWritable()` has Web
+  Locks.
+- SQLite keeps up to 8 MB of the pages it read in its page cache. Reading a
+  page from a base file takes from half a millisecond to two for 64 KB
+  pages; writing a 50 MB checkpoint less than a second (in Chromium).
+- `checkpoint` fails during a write transaction (`SQLITE_BUSY`), and for a
+  database stored elsewhere (`SQLITE_MISUSE`).
+
+Base files are read synchronously with `FileReaderSync` and written with
+`FileSystemFileHandle.createWritable()`, in dedicated and shared Workers;
+`storage.supported()` tells if both are there. It is tested in Chromium.
+`snapshotStorage(name, {directory})` keeps base files in a directory of
+OPFS other than its root, `{locks}` passes another Web Locks
+implementation (or `null` for none), and `new SnapshotStorage(name,
+directory)` keeps them in any other `SnapshotDirectory`.
+`readOnlyFile(blobOrBytes)` reads a `File`, `Blob` or `Uint8Array` as a
+read-only `SyncFile`.
 
 ## Native extension
 
@@ -283,7 +324,7 @@ bun test
 ```
 
 `bun run test:browser` runs the tests in `test/browser` in headless
-Chromium, which OPFS storage and shared databases need; install the browser
+Chromium, which OPFS and snapshot storage need; install the browser
 it expects once with `bunx playwright-core install chromium`.
 
 `bun run build` also builds the native extension for the current platform

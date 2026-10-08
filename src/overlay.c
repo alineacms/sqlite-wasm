@@ -24,6 +24,11 @@
 **                                             base file of VFS, to which
 **                                             every commit is written back
 **                                             (see "Writable base files")
+**   file:base.db?vfs=overlay&overlay=A&base=VFS&base_readonly=1
+**                                             named overlay A on a read-only
+**                                             base file of VFS, as without
+**                                             base= (see "Read-only base files
+**                                             of another VFS")
 **
 ** Page storage
 ** ------------
@@ -136,6 +141,7 @@ struct Overlay {
   i64 iJournal;           /* End of the last record in the redo journal */
   unsigned int nSeq;      /* Sequence number of the next record */
   unsigned int salt;      /* Salt of the records since the last checkpoint */
+  sqlite3_vfs *pRoVfs;    /* VFS of a read-only base (base_readonly=1), or NULL */
 };
 
 /* An open main database file. */
@@ -453,6 +459,7 @@ static void ovCloseBase(Overlay *ov){
   ov->zJournal = 0;
   ov->zPath = 0;
   ov->pBaseVfs = 0;
+  ov->pRoVfs = 0;
   ov->bChanging = 0;
   ov->bBorrowed = 0;
   ov->rcWrite = SQLITE_OK;
@@ -605,6 +612,9 @@ static int ovCreateLocked(
           ? "overlay: base= and from= cannot be combined"
           : "overlay: no VFS '%s' for the base file", zBaseVfs);
       rc = SQLITE_CANTOPEN;
+    }else if( sqlite3_uri_boolean(zPath, "base_readonly", 0) ){
+      rc = ovOpenBase(ov, pVfs, zPath, 0, &szBase);
+      ov->pRoVfs = pVfs;
     }else{
       rc = ovOpenWritableBase(ov, pVfs, zPath, &szBase);
       ov->bChanging = 1;
@@ -618,6 +628,12 @@ static int ovCreateLocked(
     ov->bBorrowed = ov->bChanging = 1;
     ov->zPath = sqlite3_create_filename(pSrc->zPath, "", "", 0, 0);
     if( ov->zPath==0 ) rc = SQLITE_NOMEM;
+  }else if( pSrc && pSrc->pRoVfs ){
+    /* A snapshot of an overlay on a read-only base of another VFS opens
+    ** the same file. The base never changes, so each has its own handle
+    ** and outlives the other. */
+    rc = ovOpenBase(ov, pSrc->pRoVfs, pSrc->zPath, 0, &szBase);
+    ov->pRoVfs = pSrc->pRoVfs;
   }else{
 #ifndef OVERLAY_OMIT_BASE
     rc = ovOpenBase(ov, gOrig, zPath, 0, &szBase);
@@ -784,18 +800,23 @@ static void ovReleaseBorrowersLocked(Overlay *ov){
 }
 
 /*
-** Give an overlay that borrows a base file a copy of every chunk it reads
-** from it, and let go of the base, so it can be stored elsewhere.
+** Give an overlay that borrows a base file, or reads a read-only base of
+** another VFS, a copy of every chunk it reads from it, and let go of the
+** base, so it can be stored elsewhere.
 */
 static int ovUnborrow(Overlay *ov){
   i64 i, nVisible;
   int rc = SQLITE_OK;
-  if( !ov->bBorrowed ) return SQLITE_OK;
+  if( !ov->bBorrowed && !ov->pRoVfs ) return SQLITE_OK;
   nVisible = (ov->szVisible+ov->szChunk-1)/ov->szChunk;
   for(i=0; rc==SQLITE_OK && i<nVisible; i++) rc = ovPreserveChunk(ov, i);
   if( rc!=SQLITE_OK ) return rc;
-  ov->pBase = 0;
-  ov->bBorrowed = ov->bChanging = 0;
+  if( ov->pRoVfs ){
+    ovCloseBase(ov);
+  }else{
+    ov->pBase = 0;
+    ov->bBorrowed = ov->bChanging = 0;
+  }
   ov->szVisible = 0;
   return SQLITE_OK;
 }
@@ -1853,6 +1874,176 @@ int sqlite3_overlay_flush(sqlite3 *db, const char *zSchema){
   if( ov->pBaseVfs==0 ) return SQLITE_OK;
   if( ov->pWriter ) return ov->rcWrite;
   return ovWriteBack(ov);
+}
+
+/* ------------------------------------------------------------------------ */
+/* Read-only base files of another VFS                                      */
+/* ------------------------------------------------------------------------ */
+/*
+** With base=VFS&base_readonly=1, the base file is opened read-only through
+** VFS, as the OS VFS opens it without base=: it is never written, and every
+** change stays in the overlay. Snapshots (from=) open the same file with
+** their own handle. The Wasm build stores databases this way in immutable
+** base files that a checkpoint writes from time to time: it lists the pages
+** an overlay holds (sqlite3_overlay_pages), writes a new base file with
+** them, and moves the overlay onto it (sqlite3_overlay_rebase).
+*/
+
+/*
+** Describe the pages the overlay behind zSchema holds over its base file,
+** in *pPages: the index and content of each, the chunk size, the file size
+** (szFile) and the part of the base file it still reads (szMin). Chunks it
+** does not hold read from the base file below szMin, and as zero from
+** there on; with this, the base file and the pages make up the database.
+** Release the arrays with sqlite3_free((void*)pPages->aiChunk). The
+** content stays valid until the overlay changes or closes. SQLITE_BUSY
+** during a write transaction, SQLITE_MISUSE on a writable base file.
+*/
+int sqlite3_overlay_pages(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3_overlay_commit *pPages
+){
+  Overlay *ov = ovOf(db, zSchema);
+  i64 i, nChunk, nHeld = 0;
+  i64 *ai = 0;
+  const u8 **ap = 0;
+  memset(pPages, 0, sizeof(*pPages));
+  /* A writable base changes: the pages alone do not describe the file. */
+  if( ov==0 || ov->pBaseVfs || ov->bBorrowed ) return SQLITE_MISUSE;
+  if( ov->pWriter ) return SQLITE_BUSY;
+  nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
+  for(i=0; i<nChunk && i<ov->nPage; i++){
+    if( ov->apPage[i] ) nHeld++;
+  }
+  if( nHeld>0 ){
+    ai = sqlite3_malloc64(nHeld*(sizeof(i64)+sizeof(u8*)));
+    if( ai==0 ) return SQLITE_NOMEM;
+    ap = (const u8**)&ai[nHeld];
+    for(i=0; i<nChunk && i<ov->nPage; i++){
+      if( ov->apPage[i]==0 ) continue;
+      ai[pPages->nChunk] = i;
+      ap[pPages->nChunk] = ov->apPage[i]->a;
+      pPages->nChunk++;
+    }
+  }
+  pPages->szChunk = ov->szChunk;
+  pPages->aiChunk = ai;
+  pPages->apChunk = ap;
+  pPages->szFile = ov->szFile;
+  pPages->szMin = ov->szVisible<ov->szFile ? ov->szVisible : ov->szFile;
+  return SQLITE_OK;
+}
+
+/*
+** Move the overlay behind zSchema onto a new read-only base file, zPath of
+** VFS zVfs, which holds the committed state of pSnapshot: a snapshot (from=)
+** of this overlay on the same base file, whose base file and pages
+** (sqlite3_overlay_pages) were written there. The overlay drops the pages
+** it shares with the snapshot, which the new base holds, and keeps those
+** that changed since; it reads exactly what it read before. Its old base
+** file is closed. Allowed during a transaction, as the content does not
+** change, but not with PRAGMA mmap_size (SQLITE_MISUSE), nor for overlays
+** on a writable base or with a commit hook. SQLITE_CORRUPT if the new base
+** is not the snapshot's size. On failure the overlay reads its old base,
+** possibly holding more pages than before.
+**
+** The caller makes sure no other connection uses the overlay meanwhile.
+*/
+int sqlite3_overlay_rebase(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3 *pSnapshot,
+  const char *zSnapshotSchema,
+  const char *zVfs,
+  const char *zPath
+){
+  Overlay *ov = ovOf(db, zSchema);
+  Overlay *snap = pSnapshot ? ovOf(pSnapshot, zSnapshotSchema) : 0;
+  sqlite3_vfs *pVfs = zVfs ? sqlite3_vfs_find(zVfs) : 0;
+  Overlay base;
+  i64 i, nChunk, szBase = 0, szNew;
+  int rc;
+  if( ov==0 || snap==0 || ov==snap ) return SQLITE_MISUSE;
+  if( ov->pBaseVfs || ov->bBorrowed || ov->xCommit || ov->szMmap>0 ){
+    return SQLITE_MISUSE;
+  }
+  /* The snapshot must read the same base file as the overlay. */
+  if( snap->szChunk!=ov->szChunk || (ov->zPath==0)!=(snap->zPath==0)
+   || (ov->zPath && strcmp(ov->zPath, snap->zPath)!=0) ){
+    return SQLITE_MISUSE;
+  }
+  if( pVfs==0 || strcmp(zVfs, OVERLAY_VFS_NAME)==0 ) return SQLITE_CANTOPEN;
+  if( ov->eWriter>=SQLITE_LOCK_PENDING ) return SQLITE_BUSY;
+
+  /* Open the new base and read its first chunk, without touching ov. */
+  memset(&base, 0, sizeof(base));
+  base.szChunk = ov->szChunk;
+  rc = ovOpenBase(&base, pVfs, zPath, 0, &szBase);
+  if( rc==SQLITE_OK && szBase!=snap->szFile ) rc = SQLITE_CORRUPT;
+  if( rc==SQLITE_OK && szBase>0 ){
+    int n = szBase<base.szChunk ? (int)szBase : base.szChunk;
+    base.pHead = ovPageAlloc(base.szChunk);
+    if( base.pHead==0 ){
+      rc = SQLITE_NOMEM;
+    }else{
+      rc = base.pBase->pMethods->xRead(base.pBase, base.pHead->a, n, 0);
+      if( rc==SQLITE_IOERR_SHORT_READ ) rc = SQLITE_OK;
+      if( n<base.szChunk ) memset(base.pHead->a+n, 0, base.szChunk-n);
+      if( n>=100 && ovIsWalHeader(base.pHead->a) ){
+        ovPatchWal(base.pHead->a, 20, 0);
+      }
+      base.nHead = base.szChunk;
+    }
+  }
+
+  /* Bytes the overlay reads from its base below szNew from now on, and as
+  ** zero past it: never past its own end, so the file grows with zeros. A
+  ** chunk it does not hold must read the same from either base, or it gets
+  ** a copy of what it reads now: chunks the snapshot holds (the overlay
+  ** truncated them away since), and chunks that read from the old base in
+  ** one and as zero in the other. */
+  szNew = snap->szFile<ov->szFile ? snap->szFile : ov->szFile;
+  nChunk = (ov->szFile+ov->szChunk-1)/ov->szChunk;
+  for(i=0; rc==SQLITE_OK && i<nChunk; i++){
+    i64 iOfst = i*ov->szChunk;
+    OvPage *pg;
+    if( i<ov->nPage && ov->apPage[i] ) continue;
+    if( iOfst>=szNew ){
+      if( iOfst>=ov->szVisible ) continue;
+    }else if( !(i<snap->nPage && snap->apPage[i])
+           && (iOfst<snap->szVisible)==(iOfst<ov->szVisible) ){
+      continue;
+    }
+    rc = ovPageForWrite(ov, i, 0, &pg);
+  }
+  if( rc!=SQLITE_OK ){
+    if( base.pHead ) sqlite3_free(base.pHead);
+    ovCloseBase(&base);
+    return rc;
+  }
+
+  /* Drop the whole chunks the snapshot shares, which the new base holds. */
+  ovEnter();
+  for(i=0; i<ov->nPage && i<snap->nPage; i++){
+    OvPage *p = ov->apPage[i];
+    if( p==0 || p!=snap->apPage[i] || (i+1)*ov->szChunk>szNew ) continue;
+    if( --p->nRef==0 ) sqlite3_free(p);
+    ov->apPage[i] = 0;
+    ov->nUsed--;
+  }
+  if( ov->pHead && --ov->pHead->nRef==0 ) sqlite3_free(ov->pHead);
+  ovLeave();
+  ovCloseBase(ov);
+  ov->pBase = base.pBase;
+  ov->zPath = base.zPath;
+  ov->szMmap = base.szMmap;
+  ov->pHead = base.pHead;
+  ov->nHead = base.nHead;
+  ov->pRoVfs = pVfs;
+  ov->szVisible = szNew;
+  ov->szStored = szBase;
+  return SQLITE_OK;
 }
 
 /*

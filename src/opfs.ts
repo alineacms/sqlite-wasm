@@ -71,16 +71,36 @@ export function opfsFileSystem(
   }
 }
 
-/** Answers the "js" VFS of one Wasm module with the files storages opened. */
-class Files implements JSFiles {
+/**
+ * Answers the "js" VFS of one Wasm module with the files storages opened.
+ * @internal
+ */
+export class Files implements JSFiles {
   private ids = new Map<string, number>()
   private files: Array<SyncFile | undefined> = []
+  /** Handles SQLite has open, for files added with a release callback */
+  private handles = new Map<
+    number,
+    {name: string; count: number; release: () => void}
+  >()
 
   constructor(private wasm: SQLite3Wasm) {}
 
-  add(name: string, file: SyncFile) {
-    this.ids.set(name, this.files.length)
+  /**
+   * Make `file` available as `name`. With `release`, the file is removed,
+   * and `release` called, once SQLite closes the last handle it opened.
+   */
+  add(name: string, file: SyncFile, release?: () => void) {
+    const id = this.files.length
+    this.ids.set(name, id)
     this.files.push(file)
+    if (release) this.handles.set(id, {name, count: 0, release})
+  }
+
+  /** Handles SQLite has open on `name` (for files added with `release`) */
+  openHandles(name: string) {
+    const id = this.ids.get(name)
+    return id === undefined ? 0 : (this.handles.get(id)?.count ?? 0)
   }
 
   remove(name: string) {
@@ -88,6 +108,10 @@ class Files implements JSFiles {
     if (id === undefined) return
     this.ids.delete(name)
     this.files[id] = undefined
+    const handles = this.handles.get(id)
+    if (!handles) return
+    this.handles.delete(id)
+    handles.release()
   }
 
   // Calls from Wasm must not throw: errors become SQLite result codes.
@@ -102,10 +126,16 @@ class Files implements JSFiles {
   }
 
   open(name: string) {
-    return this.ids.get(name) ?? -1
+    const id = this.ids.get(name)
+    if (id === undefined) return -1
+    const handles = this.handles.get(id)
+    if (handles) handles.count++
+    return id
   }
 
-  close() {
+  close(id: number) {
+    const handles = this.handles.get(id)
+    if (handles && --handles.count === 0) this.remove(handles.name)
     return 0
   }
 
@@ -154,7 +184,8 @@ class Files implements JSFiles {
   }
 }
 
-function filesOf(wasm: SQLite3Wasm): Files {
+/** @internal */
+export function filesOf(wasm: SQLite3Wasm): Files {
   if (!(wasm.jsvfs instanceof Files)) wasm.jsvfs = new Files(wasm)
   return wasm.jsvfs as Files
 }

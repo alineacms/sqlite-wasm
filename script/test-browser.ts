@@ -1,6 +1,5 @@
-// Runs test/browser in headless Chromium: file storage in OPFS and
-// databases shared between Workers need a browser's OPFS, Web Locks and
-// BroadcastChannel. Build first (bun run build). The Chromium build
+// Runs test/browser in headless Chromium: file and snapshot storage in OPFS
+// need a browser's OPFS, Web Locks and Workers. Build first (bun run build). The Chromium build
 // matching playwright-core must be installed
 // (bunx playwright-core install chromium), or CHROMIUM_PATH set to another.
 import {mkdtemp, rm} from 'node:fs/promises'
@@ -11,7 +10,11 @@ import {chromium} from 'playwright-core'
 const out = await mkdtemp(join(tmpdir(), 'sqlite-wasm-browser-'))
 const profile = await mkdtemp(join(tmpdir(), 'sqlite-wasm-profile-'))
 const built = await Bun.build({
-  entrypoints: ['test/browser/page.js', 'test/browser/worker.js'],
+  entrypoints: [
+    'test/browser/page.js',
+    'test/browser/worker.js',
+    'test/browser/snapshot-worker.js'
+  ],
   outdir: out,
   target: 'browser',
   format: 'esm'
@@ -52,11 +55,18 @@ try {
   })
   await page.goto(`http://127.0.0.1:${server.port}/`)
   await page.waitForFunction(() => 'runTests' in window)
-  const results: Array<{name: string; ok: boolean; ms?: number; error?: string}> =
+  const results: Array<{
+    name: string
+    ok: boolean
+    ms?: number
+    notes?: Array<string>
+    error?: string
+  }> =
     await page.evaluate(() => (window as any).runTests())
   for (const result of results) {
     if (result.ok) {
       console.log(`(pass) ${result.name} [${result.ms!.toFixed(0)}ms]`)
+      for (const note of result.notes ?? []) console.log(`  ${note}`)
     } else {
       failed++
       console.log(`(fail) ${result.name}\n  ${result.error}`)

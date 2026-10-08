@@ -28,6 +28,20 @@ export interface Commit {
   chunks: Map<number, Uint8Array>
 }
 
+/**
+ * The pages a database holds over its base file, in chunks of `chunkSize`
+ * bytes: `[index, pointer]` per chunk, pointing into the Wasm heap, valid
+ * until the database changes or closes. Chunks it does not hold read from
+ * the base file below `visible`, and as zero from there to `size`.
+ * @internal
+ */
+export interface Pages {
+  chunkSize: number
+  size: number
+  visible: number
+  pages: Array<[index: number, pointer: Pointer]>
+}
+
 /** Storage that commits are written to, such as IndexedDB. @internal */
 export interface Persistence {
   flush(): Promise<void>
@@ -58,6 +72,8 @@ export class Database {
   /** @internal */ public persistence?: Persistence
   /** The file of the "js" VFS this database is stored in @internal */
   public file?: string
+  /** The base file a snapshot storage opened this database on @internal */
+  public base?: unknown
   /** @internal */ private attaching = false
 
   /**
@@ -117,6 +133,67 @@ export class Database {
       this.wasm.alinea_open_file(encodeURIComponent(file), this.wasm.tempInt32)
     )
     this.file = file
+  }
+
+  /**
+   * Replace this new, empty database with one that reads `file` of the "js"
+   * VFS, a database file that does not change, and keeps every change in
+   * memory (see snapshots.ts).
+   * @internal
+   */
+  openBase(file: string) {
+    this.wasm.sqlite3_close_v2(this.dbPtr)
+    this.open(
+      this.wasm,
+      this.wasm.alinea_open_base(encodeURIComponent(file), this.wasm.tempInt32)
+    )
+  }
+
+  /** The pages this database holds over its base file. @internal */
+  pages(): Pages {
+    if (!this.dbPtr) throw new Error('Database closed')
+    const wasm = this.wasm
+    const stack = wasm.stackSave()
+    try {
+      const info = wasm.stackAlloc(16)
+      const sizes = wasm.stackAlloc(16)
+      const result = wasm.alinea_pages(this.dbPtr, info, sizes)
+      if (result !== ReturnCode.OK)
+        throw new SQLiteError(wasm.sqlite3_errstr(result), result)
+      const count = wasm.getValue(info + 4, 'i32')
+      const indexes = wasm.getValue(info + 8, '*')
+      const pointers = wasm.getValue(info + 12, '*')
+      const pages: Pages['pages'] = []
+      for (let i = 0; i < count; i++) {
+        // Chunk indexes are 64-bit, but fit the low 32 bits in Wasm.
+        pages.push([
+          wasm.getValue(indexes + 8 * i, 'i32'),
+          wasm.getValue(pointers + 4 * i, '*')
+        ])
+      }
+      wasm.sqlite3_free(indexes)
+      return {
+        chunkSize: wasm.getValue(info, 'i32'),
+        size: wasm.getValue(sizes, 'double'),
+        visible: wasm.getValue(sizes + 8, 'double'),
+        pages
+      }
+    } finally {
+      wasm.stackRestore(stack)
+    }
+  }
+
+  /**
+   * Read `file` of the "js" VFS from now on, which holds the committed
+   * state of `snapshot`, a fork of this database on the same base file.
+   * Pages that did not change since the fork are dropped from memory.
+   * @internal
+   */
+  rebase(snapshot: Database, file: string) {
+    if (!this.dbPtr || !snapshot.dbPtr) throw new Error('Database closed')
+    const result = this.wasm.alinea_rebase(this.dbPtr, snapshot.dbPtr, file)
+    if (result !== ReturnCode.OK)
+      throw new SQLiteError(this.wasm.sqlite3_errstr(result), result)
   }
 
   /**
@@ -251,6 +328,13 @@ export class Database {
     const openResult = this.wasm.alinea_fork(this.dbPtr, this.wasm.tempInt32)
     const fork: this = Object.create(Object.getPrototypeOf(this))
     fork.open(this.wasm, openResult)
+    fork.base = this.base
+    // Pages of a base file are read from it again once they leave the page
+    // cache: keep the cache of the source.
+    if (this.base) {
+      const [[cacheSize]] = this.exec('pragma cache_size')[0].values
+      fork.run(`pragma cache_size = ${cacheSize}`)
+    }
     return fork
   }
 

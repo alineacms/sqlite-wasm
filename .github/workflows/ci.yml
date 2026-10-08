@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Build and test Wasm package
         uses: ./.github/actions/build
-      # OPFS storage and shared databases need a browser: run test/browser
+      # OPFS and snapshot storage need a browser: run test/browser
       # in Chromium on the runner, against the package built above.
       - uses: oven-sh/setup-bun@v2
         with:

@@ -45,5 +45,18 @@ int sqlite3_overlay_attach_base(
   const char *zPath
 );
 int sqlite3_overlay_detach_base(sqlite3 *db, const char *zSchema, int *pWrite);
+int sqlite3_overlay_pages(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3_overlay_commit *pPages
+);
+int sqlite3_overlay_rebase(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3 *pSnapshot,
+  const char *zSnapshotSchema,
+  const char *zVfs,
+  const char *zPath
+);
 
 #endif

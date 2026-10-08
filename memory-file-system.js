@@ -85,3 +85,117 @@ export class MemoryFileSystem {
     return copy
   }
 }
+
+// A directory of base files for snapshot storage, like OPFS with
+// createWritable(): a file being written is empty until the writer closes,
+// and then appears in full. `get` returns the content as it is, which stays
+// as it is, like a File. Every operation waits a moment, so other work
+// runs in between, and `failWrites` makes writing fail.
+export class MemorySnapshotDirectory {
+  files = new Map()
+  clock = 0
+  failWrites = false
+
+  supported() {
+    return true
+  }
+
+  async list() {
+    await tick()
+    return [...this.files].map(([name, file]) => ({
+      name,
+      size: file.data.byteLength,
+      lastModified: file.lastModified
+    }))
+  }
+
+  async get(name) {
+    await tick()
+    return this.files.get(name)?.data
+  }
+
+  /** Put `data` in file `name`, as if a writer wrote it. */
+  set(name, data) {
+    this.files.set(name, {data, lastModified: ++this.clock})
+  }
+
+  async create(name) {
+    await tick()
+    if (!this.files.has(name)) this.set(name, new Uint8Array(0))
+    const file = new MemoryFile()
+    const write = async action => {
+      await tick()
+      if (this.failWrites) throw new Error('write failed')
+      action()
+    }
+    return {
+      copy: source => write(() => file.write(source, {at: 0})),
+      write: (data, position) => write(() => file.write(data, {at: position})),
+      truncate: size =>
+        write(() => {
+          if (size < file.size) file.truncate(size)
+          else file.write(new Uint8Array(0), {at: size})
+        }),
+      close: () => write(() => this.set(name, file.bytes())),
+      abort: async () => {
+        if (this.files.get(name)?.data.byteLength === 0) this.files.delete(name)
+      }
+    }
+  }
+
+  async remove(name) {
+    await tick()
+    this.files.delete(name)
+  }
+}
+
+const tick = () => new Promise(resolve => setTimeout(resolve, 0))
+
+// The parts of the Web Locks API snapshot storage uses: shared and
+// exclusive locks, granted in order, and ifAvailable.
+export class MemoryLocks {
+  held = new Map()
+  waiting = new Map()
+
+  request(name, options, callback) {
+    if (typeof options === 'function') {
+      callback = options
+      options = {}
+    }
+    const mode = options.mode ?? 'exclusive'
+    return new Promise((resolve, reject) => {
+      const run = () => {
+        const state = this.held.get(name) ?? {mode, count: 0}
+        state.count++
+        this.held.set(name, state)
+        Promise.resolve()
+          .then(() => callback({name, mode}))
+          .then(resolve, reject)
+          .finally(() => {
+            if (--state.count === 0) this.held.delete(name)
+            this.next(name)
+          })
+      }
+      const queue = this.waiting.get(name) ?? []
+      this.waiting.set(name, queue)
+      if (queue.length === 0 && this.compatible(name, mode)) run()
+      else if (options.ifAvailable) {
+        Promise.resolve()
+          .then(() => callback(null))
+          .then(resolve, reject)
+      } else queue.push({mode, run})
+    })
+  }
+
+  compatible(name, mode) {
+    const held = this.held.get(name)
+    return !held || (mode === 'shared' && held.mode === 'shared')
+  }
+
+  next(name) {
+    const queue = this.waiting.get(name) ?? []
+    while (queue.length && this.compatible(name, queue[0].mode)) {
+      queue.shift().run()
+    }
+  }
+}

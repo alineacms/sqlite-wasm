@@ -2,11 +2,9 @@
 // on the database it holds, and is answered with its result or error.
 import {init} from '@alinea/sqlite-wasm'
 import {opfsStorage} from '@alinea/sqlite-wasm/opfs'
-import {shareDatabase} from '@alinea/sqlite-wasm/shared'
 
 const {Database} = await init()
 let db
-let shared
 
 const rows = sql => db.exec(sql)[0]?.values ?? []
 
@@ -48,15 +46,7 @@ const actions = {
     } catch {
       return -1
     }
-  },
-  share({name, file}) {
-    shared = shareDatabase(name, () => Database.sync(opfsStorage(file)))
-  },
-  owner: () => shared.isOwner,
-  sharedQuery: ({sql, params}) => shared.query(sql, params),
-  sharedExec: ({sql}) => shared.exec(sql),
-  sharedTransaction: ({statements}) => shared.transaction(statements),
-  sharedClose: () => shared.close()
+  }
 }
 
 self.onmessage = async ({data: {id, action, args}}) => {

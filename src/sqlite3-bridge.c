@@ -184,11 +184,13 @@ int sqlite3_os_end(void) {
 // Every database is a named copy-on-write overlay (see overlay.c), so forks
 // share unchanged pages with their source.
 // With file, a URI-escaped name, the overlay is stored in that file of the
-// "js" VFS (see jsvfs.c) instead of only in memory.
+// "js" VFS (see jsvfs.c) instead of only in memory, or with readonly, reads
+// that file and keeps its changes in memory.
 static int alinea_open_overlay(
   sqlite3 **db,
   const char *from,
-  const char *file
+  const char *file,
+  int readonly
 ) {
   static unsigned int counter = 0;
   int result = sqlite3_initialize();
@@ -199,7 +201,12 @@ static int alinea_open_overlay(
   char *uri = from
     ? sqlite3_mprintf("file:db%u?overlay=db%u&from=%s", id, id, from)
     : file
-    ? sqlite3_mprintf("file:%s?overlay=db%u&base=js", file, id)
+    ? sqlite3_mprintf(
+        "file:%s?overlay=db%u&base=js%s",
+        file,
+        id,
+        readonly ? "&base_readonly=1" : ""
+      )
     : sqlite3_mprintf("file:db%u?overlay=db%u", id, id);
   if (uri == 0) {
     return SQLITE_NOMEM;
@@ -215,14 +222,47 @@ static int alinea_open_overlay(
 }
 
 int alinea_open(sqlite3 **db) {
-  return alinea_open_overlay(db, 0, 0);
+  return alinea_open_overlay(db, 0, 0, 0);
 }
 
 // Opens the database stored in file, a URI-escaped name in the "js" VFS,
 // or starts one there. Every commit is written to it; only the pages of
 // the open transaction are kept in memory.
 int alinea_open_file(const char *file, sqlite3 **db) {
-  return alinea_open_overlay(db, 0, file);
+  return alinea_open_overlay(db, 0, file, 0);
+}
+
+// Opens a database on file, a URI-escaped name in the "js" VFS that holds a
+// database and does not change: its pages are read from the file as they
+// are needed, and every change stays in memory. Forks read the same file.
+int alinea_open_base(const char *file, sqlite3 **db) {
+  return alinea_open_overlay(db, 0, file, 1);
+}
+
+// Lists the pages db holds over its base file (see sqlite3_overlay_pages):
+// writes the chunk size, the count, and pointers to an array of 64-bit
+// chunk indexes and one of pointers to their content into info, and the
+// file size and the size of the base file part it reads into sizes. Free
+// the arrays by passing the first to sqlite3_free.
+int alinea_pages(sqlite3 *db, int *info, double *sizes) {
+  sqlite3_overlay_commit pages;
+  int result = sqlite3_overlay_pages(db, "main", &pages);
+  if (result != SQLITE_OK) {
+    return result;
+  }
+  info[0] = pages.szChunk;
+  info[1] = pages.nChunk;
+  info[2] = (int)(intptr_t)pages.aiChunk;
+  info[3] = (int)(intptr_t)pages.apChunk;
+  sizes[0] = (double)pages.szFile;
+  sizes[1] = (double)pages.szMin;
+  return SQLITE_OK;
+}
+
+// Moves db onto file of the "js" VFS (not URI-escaped), which holds the committed state of
+// snapshot, a fork of db on the same base file (see sqlite3_overlay_rebase).
+int alinea_rebase(sqlite3 *db, sqlite3 *snapshot, const char *file) {
+  return sqlite3_overlay_rebase(db, "main", snapshot, "main", "js", file);
 }
 
 // Stores db, an in-memory database, in file of the "js" VFS from now on, as
@@ -254,7 +294,7 @@ int alinea_fork(sqlite3 *source, sqlite3 **db) {
     *db = 0;
     return SQLITE_MISUSE;
   }
-  return alinea_open_overlay(db, name, 0);
+  return alinea_open_overlay(db, name, 0, 0);
 }
 
 unsigned char *alinea_malloc(int size) {
