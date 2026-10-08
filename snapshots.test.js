@@ -60,11 +60,13 @@ function sessionOf(db, storage) {
 
 const snapshotOf = db => sessions.get(db)?.snapshot
 
-// Save `db` to `key`, and resolve to the status
-function saveTo(storage, db, key, options = {}) {
-  return sessionOf(db, storage)
-    .save({key, ...options})
-    .then(result => result.status)
+// Save `db` to `key`, and resolve to the status. With `branch`, on a
+// session of `db` for that branch from now on.
+function saveTo(storage, db, key, {branch, ...options} = {}) {
+  let session = sessionOf(db, storage)
+  if (branch !== undefined && branch !== session.branch)
+    sessions.set(db, (session = storage.session(db, {branch})))
+  return session.save({key, ...options}).then(result => result.status)
 }
 
 function rows(db, sql) {
@@ -240,12 +242,17 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(await count({key: 'a'})).toBe(5)
         expect(await count('b')).toBe(10)
         expect(db.base.branch).toBe('two')
-        // A branch without snapshots starts empty, or with fallback, on the
-        // head of all; session.snapshot tells which.
+        // A branch without snapshots starts empty, or what choose picks;
+        // session.snapshot tells which.
         expect(snapshotOf(await openDb({branch: 'three'}))).toBeUndefined()
-        const fallback = await openDb({branch: 'three', fallback: 'any-branch'})
-        expect(snapshotOf(fallback)).toEqual(list[0])
-        expect(snapshotOf(await openDb({branch: 'one', fallback: 'any-branch'})).key).toBe('b')
+        const orNewest = branch => ({
+          branch,
+          choose: snapshots => snapshots.find(s => s.branch === branch) ?? snapshots[0]
+        })
+        expect(snapshotOf(await openDb(orNewest('three')))).toEqual(list[0])
+        expect(snapshotOf(await openDb(orNewest('one'))).key).toBe('b')
+        expect(snapshotOf(await openDb({choose: s => s.find(x => x.meta.tree)})).key).toBe('a')
+        expect(snapshotOf(await openDb({choose: () => undefined}))).toBeUndefined()
         // A database follows its saves.
         expect(snapshotOf(db)).toEqual(list[0])
         expect(snapshotOf(keep(new Database()))).toBeUndefined()
@@ -641,22 +648,24 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect((await openDb('v3')).export()).toEqual(reference.export())
       })
 
-      test('default to the branch a session was opened for', async () => {
+      test('save to the branch the session was opened for', async () => {
         const db = await openDb()
         fill(db, 10)
         await save(db, 'one', {branch: 'cfg1'})
-        const other = await openDb({branch: 'cfg2', fallback: 'any-branch'})
-        expect(snapshotOf(other).branch).toBe('cfg1')
+        const session = await storage().open(Database, {
+          branch: 'cfg2',
+          choose: snapshots => snapshots[0]
+        })
+        const other = register(session)
+        expect(session.snapshot.branch).toBe('cfg1')
+        expect(session.branch).toBe('cfg2')
         other.run('delete from items where id = 1')
-        await save(other, 'two')
-        expect(snapshotOf(other).branch).toBe('cfg2')
-        // And to the branch of its last save, also while it is pending.
-        other.run('delete from items where id = 2')
-        const three = save(other, 'three', {branch: 'cfg3'})
-        other.run('delete from items where id = 3')
-        const four = save(other, 'four')
-        await Promise.all([three, four])
-        expect(snapshotOf(other).branch).toBe('cfg3')
+        await session.save({key: 'two'})
+        expect(session.snapshot.branch).toBe('cfg2')
+        // Without a branch, the session saves to the one it opened.
+        const third = await storage().open(Database, {key: 'one'})
+        register(third)
+        expect(third.branch).toBe('cfg1')
       })
 
       test('release every base of a database closed with checkpoints queued', async () => {
@@ -938,6 +947,16 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb({branch: 'b'})
         expect(snapshotOf(db).key).toBe('v0')
         expect(rows(db, 'select count(*) from items')).toEqual([[100]])
+        // choose is asked again without the snapshot it picked.
+        const offered = []
+        const chosen = await openDb({
+          choose: snapshots => {
+            offered.push(snapshots.map(s => s.key))
+            return snapshots[0]
+          }
+        })
+        expect(offered).toEqual([['v2', 'v0'], ['v0']])
+        expect(snapshotOf(chosen).key).toBe('v0')
         await expect(storage().open(Database, {key: 'v2'}))
           .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
       })
@@ -1021,10 +1040,10 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(result).toEqual({status: 'written', snapshot: session.snapshot})
         expect(session.snapshot).toMatchObject({key: 'v1', branch: 'main', meta: {n: 1}})
         expect(session.held).toBe(0)
-        // Saving to another branch moves the session to it.
+        // Without a key, a save gets one of its own.
         session.db.run('delete from items where id = 1')
-        await session.save({branch: 'other'})
-        expect(session.branch).toBe('other')
+        await session.save()
+        expect(session.branch).toBe('main')
         expect(session.snapshot.key).toMatch(/^auto-/)
       })
 

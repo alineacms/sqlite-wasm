@@ -67,9 +67,9 @@ const actions = {
     insert.free()
     db.run('commit')
   },
-  async checkpoint({name, branch}) {
+  async checkpoint({name}) {
     const start = performance.now()
-    const {status} = await session.save({key: name, branch})
+    const {status} = await session.save({key: name})
     return {written: status === 'written', status, ms: performance.now() - start}
   },
   cleanup: () => storage.retain(),
