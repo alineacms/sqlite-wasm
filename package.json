@@ -20,6 +20,7 @@
     "./indexeddb": "./dist/indexeddb.js",
     "./opfs": "./dist/opfs.js",
     "./snapshots": "./dist/snapshots.js",
+    "./file": "./dist/file.js",
     "./package.json": "./package.json",
     "./*": "./dist/*"
   },
