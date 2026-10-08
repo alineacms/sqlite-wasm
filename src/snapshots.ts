@@ -11,7 +11,7 @@ import {SQLiteError} from './SQLiteError.js'
 // which the database reads that one instead and drops those pages (see
 // "Read-only base files of another VFS" in overlay.c).
 //
-// Where bases are kept is up to a BaseStore: files in OPFS
+// Where bases are kept is up to a SnapshotStore: files in OPFS
 // (opfsSnapshotStorage) or Blobs in IndexedDB (indexedDBSnapshotStorage).
 //
 // Locks (Web Locks API), per base, for stores that need them (OPFS):
@@ -86,14 +86,14 @@ function slice(source: BaseSource, start: number, end: number): BaseSource {
 }
 
 /** Information stored with a base, which must survive structured cloning */
-export type BaseMeta = Record<string, unknown>
+export type SnapshotMeta = Record<string, unknown>
 
 /** A stored base. */
-export interface BaseInfo {
+export interface SnapshotInfo {
   key: string
-  /** Bases of one group replace each other; cleanup keeps the newest */
-  group: string
-  meta: BaseMeta
+  /** Bases of one branch replace each other; cleanup keeps the newest */
+  branch: string
+  meta: SnapshotMeta
   /** When it was written, in milliseconds since 1970 */
   createdAt: number
   /** In bytes; 0 while it is written, or if writing it failed */
@@ -101,10 +101,10 @@ export interface BaseInfo {
 }
 
 /** A base to write: pages over (part of) an existing base. */
-export interface NewBase {
+export interface NewSnapshot {
   key: string
-  group: string
-  meta: BaseMeta
+  branch: string
+  meta: SnapshotMeta
   /** The base the pages go over, of which the first `visible` bytes stay */
   base?: BaseSource
   visible: number
@@ -121,7 +121,7 @@ export interface NewBase {
 }
 
 /** Where a `SnapshotStorage` keeps its bases. */
-export interface BaseStore {
+export interface SnapshotStore {
   /** Names the storage in lock names */
   readonly name: string
   /**
@@ -134,16 +134,16 @@ export interface BaseStore {
   /** If it works in this context */
   supported(): boolean
   /** Every base, in any order */
-  list(): Promise<Array<BaseInfo>>
-  /** The newest base of `group` (of all bases without), if it has one */
-  newest?(group?: string): Promise<BaseInfo | undefined>
+  list(): Promise<Array<SnapshotInfo>>
+  /** The newest base of `branch` (of all bases without), if it has one */
+  head?(branch?: string): Promise<SnapshotInfo | undefined>
   /** Base `key` and its content, which stays as it is, if it exists */
-  get(key: string): Promise<{info: BaseInfo; source: BaseSource} | undefined>
+  get(key: string): Promise<{info: SnapshotInfo; source: BaseSource} | undefined>
   /**
    * Write `base`, unless its key exists, and return its content, or
    * undefined if the key exists. A new base appears in full at once.
    */
-  write(base: NewBase): Promise<BaseSource | undefined>
+  write(base: NewSnapshot): Promise<BaseSource | undefined>
   /** Delete base `key`, if it exists. */
   remove(key: string): Promise<void>
 }
@@ -284,7 +284,7 @@ export function opfsSnapshotDirectory(
 }
 
 // Base `key` is the file named by encodeKey(key), which never contains a
-// dot, and its group and meta are JSON in that name plus `.json`.
+// dot, and its branch and meta are JSON in that name plus `.json`.
 const META_SUFFIX = '.json'
 
 function encodeKey(key: string) {
@@ -303,25 +303,25 @@ async function readText(source: BaseSource) {
 
 /**
  * Bases as files in `directory`: base `key` in a file named after it, and
- * its group, meta and time in one next to it (file times can be too coarse
+ * its branch, meta and time in one next to it (file times can be too coarse
  * to tell which of two bases is newer). Files are written with one writer
  * each, which shows them at once when it closes; the base is created first,
  * empty, and the metadata written before it. Reading a file that is
  * deleted is not guaranteed to work, so this store uses locks.
  */
-export function directoryBaseStore(
+export function directorySnapshotStore(
   name: string,
   directory: SnapshotDirectory
-): BaseStore {
+): SnapshotStore {
   // The metadata of base `key`, with its time, or else `lastModified`
   async function readMeta(key: string, lastModified: number) {
     const source = await directory.get(encodeKey(key) + META_SUFFIX)
-    let stored: {group?: unknown; meta?: BaseMeta; createdAt?: unknown} = {}
+    let stored: {branch?: unknown; meta?: SnapshotMeta; createdAt?: unknown} = {}
     try {
       if (source) stored = JSON.parse(await readText(source)) ?? {}
     } catch {}
     return {
-      group: String(stored.group ?? ''),
+      branch: String(stored.branch ?? ''),
       meta: stored.meta ?? {},
       createdAt:
         typeof stored.createdAt === 'number' ? stored.createdAt : lastModified
@@ -378,7 +378,7 @@ export function directoryBaseStore(
       const writer = await directory.create(file)
       try {
         const meta = JSON.stringify({
-          group: base.group,
+          branch: base.branch,
           meta: base.meta,
           createdAt: now()
         })
@@ -426,13 +426,14 @@ export function directoryBaseStore(
 // IndexedDB
 // ------------------------------------------------------------------------
 
-const IDB_VERSION = 1
+// Version 1 stored groups; its bases are dropped (they are a cache).
+const IDB_VERSION = 2
 const BASES = 'bases'
-const BY_GROUP = 'group'
+const BY_BRANCH = 'branch'
 const BY_TIME = 'createdAt'
 
 /** A base as IndexedDB stores it. */
-interface BaseRecord extends BaseInfo {
+interface BaseRecord extends SnapshotInfo {
   blob: Blob
 }
 
@@ -472,7 +473,7 @@ function now() {
  * The content of `base` as one Blob: slices of the old base and copies of
  * the pages, composed by the browser without copying the old base.
  */
-function composeBlob(base: NewBase): Blob {
+function composeBlob(base: NewSnapshot): Blob {
   const parts: Array<BlobPart> = []
   let at = 0
   // The old base up to `end`, and zeros past what is visible of it.
@@ -500,15 +501,15 @@ function composeBlob(base: NewBase): Blob {
 
 /**
  * Bases as Blobs in IndexedDB database `name`: one record per base with its
- * key, group, meta, time and size, indexed by group and time. Writing one
+ * key, branch, meta, time and size, indexed by branch and time. Writing one
  * composes a Blob of slices of the old base and the changed pages, and adds
  * it in one transaction. A Blob that was read stays readable after its
  * record is deleted, so this store needs no locks.
  */
-export function indexedDBBaseStore(
+export function indexedDBSnapshotStore(
   name: string,
   implementation?: IndexedDBImplementation
-): BaseStore {
+): SnapshotStore {
   let opened: Promise<IDBDatabase> | undefined
   const api = () => {
     const factory = implementation?.indexedDB ?? globalThis.indexedDB
@@ -520,8 +521,10 @@ export function indexedDBBaseStore(
     (opened ??= new Promise<IDBDatabase>((resolve, reject) => {
       const req = api().factory.open(name, IDB_VERSION)
       req.onupgradeneeded = () => {
-        const store = req.result.createObjectStore(BASES, {keyPath: 'key'})
-        store.createIndex(BY_GROUP, ['group', 'createdAt'])
+        const idb = req.result
+        if (idb.objectStoreNames.contains(BASES)) idb.deleteObjectStore(BASES)
+        const store = idb.createObjectStore(BASES, {keyPath: 'key'})
+        store.createIndex(BY_BRANCH, ['branch', 'createdAt'])
         store.createIndex(BY_TIME, 'createdAt')
       }
       req.onsuccess = () => {
@@ -540,9 +543,9 @@ export function indexedDBBaseStore(
     }))
   const store = async (mode: IDBTransactionMode) =>
     (await database()).transaction(BASES, mode).objectStore(BASES)
-  const info = ({key, group, meta, createdAt, size}: BaseRecord): BaseInfo => ({
+  const info = ({key, branch, meta, createdAt, size}: BaseRecord): SnapshotInfo => ({
     key,
-    group,
+    branch,
     meta,
     createdAt,
     size
@@ -563,16 +566,16 @@ export function indexedDBBaseStore(
       )
       return records.map(info)
     },
-    async newest(group) {
+    async head(branch) {
       const bases = await store('readonly')
       const {KeyRange} = api()
       const cursor = await request(
-        group === undefined
+        branch === undefined
           ? bases.index(BY_TIME).openCursor(null, 'prev')
           : bases
-              .index(BY_GROUP)
+              .index(BY_BRANCH)
               .openCursor(
-                KeyRange.bound([group, -Infinity], [group, Infinity]),
+                KeyRange.bound([branch, -Infinity], [branch, Infinity]),
                 'prev'
               )
       )
@@ -589,7 +592,7 @@ export function indexedDBBaseStore(
       const blob = composeBlob(base)
       const record: BaseRecord = {
         key: base.key,
-        group: base.group,
+        branch: base.branch,
         meta: base.meta,
         createdAt: now(),
         size: base.size,
@@ -626,13 +629,13 @@ export function indexedDBBaseStore(
  * `FileReaderSync` (Node, Bun). Storages that share the store share its
  * bases, as Workers share OPFS or IndexedDB; nothing outlives the store.
  */
-export function memoryBaseStore(name = 'memory'): BaseStore {
+export function memorySnapshotStore(name = 'memory'): SnapshotStore {
   // Records are copied in and out, as IndexedDB clones them.
-  const copy = (info: BaseInfo): BaseInfo => ({
+  const copy = (info: SnapshotInfo): SnapshotInfo => ({
     ...info,
     meta: structuredClone(info.meta)
   })
-  const bases = new Map<string, {info: BaseInfo; data: Uint8Array}>()
+  const bases = new Map<string, {info: SnapshotInfo; data: Uint8Array}>()
   let last = 0
   return {
     name,
@@ -668,9 +671,9 @@ export function memoryBaseStore(name = 'memory'): BaseStore {
       if (bases.has(base.key)) return undefined
       // Times that differ, also within a millisecond
       const createdAt = (last = Math.max(now(), last + 0.001))
-      const {key, group, meta, size} = base
+      const {key, branch, meta, size} = base
       bases.set(key, {
-        info: copy({key, group, meta, createdAt, size}),
+        info: copy({key, branch, meta, createdAt, size}),
         data
       })
       return data
@@ -680,6 +683,7 @@ export function memoryBaseStore(name = 'memory'): BaseStore {
     }
   }
 }
+
 
 // ------------------------------------------------------------------------
 // Storage
@@ -694,25 +698,25 @@ export interface SnapshotStorageOptions {
 }
 
 /**
- * Keeps databases in immutable base files in the directory called `name`
- * of the origin private file system (OPFS), or of `options.directory`. See
+ * Keeps snapshots as files in the directory called `name` of the origin
+ * private file system (OPFS), or of `options.directory`. See
  * `SnapshotStorage`.
  */
-export function opfsSnapshotStorage(
+export function opfsSnapshots(
   name: string,
   options?: SnapshotStorageOptions & {directory?: FileSystemDirectoryHandle}
 ): SnapshotStorage {
   return new SnapshotStorage(
-    directoryBaseStore(name, opfsSnapshotDirectory(name, options?.directory)),
+    directorySnapshotStore(name, opfsSnapshotDirectory(name, options?.directory)),
     options
   )
 }
 
 /**
- * Keeps databases in immutable Blobs in IndexedDB database `name`, of the
- * global IndexedDB or the given implementation. See `SnapshotStorage`.
+ * Keeps snapshots as Blobs in IndexedDB database `name`, of the global
+ * IndexedDB or the given implementation. See `SnapshotStorage`.
  */
-export function indexedDBSnapshotStorage(
+export function indexedDBSnapshots(
   name: string,
   options?: SnapshotStorageOptions & Partial<IndexedDBImplementation>
 ): SnapshotStorage {
@@ -720,105 +724,116 @@ export function indexedDBSnapshotStorage(
     options?.indexedDB && options.IDBKeyRange
       ? {indexedDB: options.indexedDB, IDBKeyRange: options.IDBKeyRange}
       : undefined
-  return new SnapshotStorage(indexedDBBaseStore(name, implementation), options)
+  return new SnapshotStorage(indexedDBSnapshotStore(name, implementation), options)
 }
 
 /**
- * Keeps databases in memory, on bases of a `memoryBaseStore`: for tests,
- * and for Node and Bun. Pass the same `store` to storages that should
- * share their bases. See `SnapshotStorage`.
+ * Keeps snapshots in memory, in a `memorySnapshotStore`: for tests, and for
+ * Node and Bun. Pass the same `store` to storages that should share their
+ * snapshots. See `SnapshotStorage`.
  */
-export function memorySnapshotStorage(
-  store: BaseStore = memoryBaseStore()
+export function memorySnapshots(
+  store: SnapshotStore = memorySnapshotStore()
 ): SnapshotStorage {
   return new SnapshotStorage(store)
 }
 
-/** The base a database reads, kept as `db.base`. */
-interface Base extends BaseInfo {
+/** The snapshot a database reads, kept as `db.base`. */
+interface Base extends SnapshotInfo {
   source: BaseSource
 }
 
-/**
- * The base `db` reads, if a snapshot storage opened it on one or wrote one
- * from it, or undefined for a database without a base.
- */
-export function baseOf(db: Database): BaseInfo | undefined {
-  const base = db.base as Base | undefined
+function infoOf(base: Base | undefined): SnapshotInfo | undefined {
   if (!base) return undefined
-  const {key, group, meta, createdAt, size} = base
-  return {key, group, meta, createdAt, size}
+  const {key, branch, meta, createdAt, size} = base
+  return {key, branch, meta, createdAt, size}
+}
+
+/** Which snapshot to open, and how the session saves. */
+export interface OpenOptions {
+  /**
+   * Open the head (newest snapshot) of this branch, and save to it.
+   * Default: the head of all branches, and its branch.
+   */
+  branch?: string
+  /** Open this snapshot instead of a head */
+  key?: string
+  /** With `branch`: if it has no snapshots, open the head of all branches */
+  fallback?: 'any-branch'
+  /** Save by itself, see `AutoSaveOptions` */
+  autoSave?: AutoSaveOptions
+}
+
+/** How a session wraps a database it did not open, see `storage.session`. */
+export interface SessionOptions {
+  /** Default: the branch of the snapshot the database reads, or `''` */
+  branch?: string
+  autoSave?: AutoSaveOptions
 }
 
 /**
- * Which base to open: by key, or the newest of a group, or of all. With
- * `fallback: 'any'`, a group without bases opens the newest base of any.
- * With `checkpoint`, the database checkpoints by itself, see
- * `autoCheckpoint`; its group defaults to `group`.
+ * When a session saves by itself: `after` milliseconds after the last
+ * commit (each commit restarts the wait), and/or as soon as it holds
+ * `maxHeld` bytes of changed pages, which bounds the memory a large import
+ * or reindex holds. Off unless one of them is given. A save never starts
+ * inside a transaction (the commit that ends it counts), and one runs at a
+ * time. Stops when the session closes.
  */
-export type OpenOptions =
-  | string
-  | {
-      key?: string
-      group?: string
-      fallback?: 'any'
-      checkpoint?: AutoCheckpointOptions
-    }
-
-/** When and how a database checkpoints by itself, see `autoCheckpoint`. */
-export interface AutoCheckpointOptions {
-  /** Checkpoint this many milliseconds after the last commit */
+export interface AutoSaveOptions {
+  /** Save this many milliseconds after the last commit */
   after?: number
-  /** Checkpoint once the database holds this many bytes of changed pages */
+  /** Save once the database holds this many bytes of changed pages */
   maxHeld?: number
   /**
-   * The key of the new base, or `undefined` to skip this checkpoint, for
+   * The key of the new snapshot, or `undefined` to skip this save, for
    * example while the database is between two consistent states. Default:
-   * a key of its own for every checkpoint. Keys by content let Workers
-   * that reach the same content share one base.
+   * a key of its own for every save. Keys by content let Workers that
+   * reach the same content share one snapshot.
    */
   key?: (db: Database) => string | undefined
-  /** Default: the group of the base the database reads */
-  group?: string
-  meta?: (db: Database) => BaseMeta
-  /** Called with the errors of checkpoints (default: `reportError`) */
+  meta?: (db: Database) => SnapshotMeta
+  /** Called with the errors of saves (default: `reportError`) */
   onError?: (error: unknown) => void
 }
 
-export interface CleanupOptions {
-  /** How many groups keep a base, the ones with the newest (default: all) */
-  keepGroups?: number
-}
-
-/** The group and meta of a new base. */
-export interface CheckpointOptions {
-  /** Default: the group of the base the database reads, or `''` */
-  group?: string
-  meta?: BaseMeta
+export interface SaveOptions {
+  /**
+   * Default: a key of its own. Key snapshots by their content where you
+   * can: a key that exists is not written again, see `SaveResult`.
+   */
+  key?: string
+  /** Default: the session's branch, which becomes this one */
+  branch?: string
+  meta?: SnapshotMeta
 }
 
 /**
- * The group a database was opened for or last checkpointed to, which its
- * checkpoints default to: after `fallback: 'any'` its base may be of
- * another group.
+ * What a save did. `written`: it wrote a new snapshot, which the database
+ * reads now. `joined`: the key existed and holds the committed state of
+ * the database byte for byte (the same commits on the same snapshot), so
+ * the database reads it now, as if it had written it. `mismatch`: the key
+ * existed with other content; nothing was written, and the database stays
+ * as it was. `snapshot` is the snapshot under the key, if it could be read.
  */
-const groups = new WeakMap<Database, string>()
+export type SaveResult =
+  | {status: 'written' | 'joined'; snapshot: SnapshotInfo}
+  | {status: 'mismatch'; snapshot: SnapshotInfo | undefined}
 
-/** Names of the "js" VFS files bases are registered as */
+export interface RetainPolicy {
+  /** How many snapshots each branch keeps, newest first (default: 1) */
+  perBranch?: number
+  /** How many branches keep snapshots, those with the newest heads (default: all) */
+  branches?: number
+  /** Keys that are never deleted */
+  pinned?: Iterable<string>
+}
+
+/** Names of the "js" VFS files snapshots are registered as */
 let nextFile = 0
-
-/**
- * Checkpoints of each database, which run one after the other, and the
- * snapshots they write
- */
-const checkpoints = new WeakMap<
-  Database,
-  {queue: Promise<unknown>; snapshots: Set<Database>}
->()
 
 function checkHeader(header: Uint8Array, size: number, key: string) {
   const corrupt = (reason: string) =>
-    new SQLiteError(`Base "${key}" is corrupt: ${reason}`, SQLITE_CORRUPT)
+    new SQLiteError(`Snapshot "${key}" is corrupt: ${reason}`, SQLITE_CORRUPT)
   const magic = 'SQLite format 3\0'
   if (size < 512) throw corrupt(`too small (${size} bytes)`)
   for (let i = 0; i < magic.length; i++)
@@ -832,14 +847,7 @@ function checkHeader(header: Uint8Array, size: number, key: string) {
   const pageCount = view.getUint32(28)
   const stored = Math.ceil(size / pageSize)
   if (view.getUint32(92) === view.getUint32(24) && pageCount > stored)
-    throw corrupt(`${pageCount} pages in the header, ${stored} in the base`)
-}
-
-async function readHeader(source: BaseSource) {
-  const head = slice(source, 0, 100)
-  return head instanceof Uint8Array
-    ? head
-    : new Uint8Array(await head.arrayBuffer())
+    throw corrupt(`${pageCount} pages in the header, ${stored} in the snapshot`)
 }
 
 async function read(source: BaseSource, start: number, end: number) {
@@ -860,9 +868,9 @@ function equal(a: Uint8Array, b: Uint8Array) {
   return true
 }
 
-/** If `source` holds exactly what writing `base` would write. */
-async function holds(source: BaseSource, base: NewBase) {
-  const {size, visible, chunkSize, pages} = base
+/** If `source` holds exactly what writing `snapshot` would write. */
+async function holds(source: BaseSource, snapshot: NewSnapshot) {
+  const {size, visible, chunkSize, pages} = snapshot
   if (size === 0 || sizeOf(source) !== size) return false
   const step = Math.max(1, Math.floor(WRITE_BYTES / chunkSize)) * chunkSize
   let i = 0
@@ -870,45 +878,51 @@ async function holds(source: BaseSource, base: NewBase) {
     const end = Math.min(at + step, size)
     const actual = await read(source, at, end)
     const expected = new Uint8Array(end - at)
-    if (base.base && at < visible)
-      expected.set(await read(base.base, at, Math.min(end, visible)))
+    if (snapshot.base && at < visible)
+      expected.set(await read(snapshot.base, at, Math.min(end, visible)))
     // Pages are views of Wasm memory: take them after the last await.
     for (; i < pages.length && pages[i] * chunkSize < end; i++) {
       const start = pages[i] * chunkSize
-      expected.set(base.page(i).subarray(0, end - start), start - at)
+      expected.set(snapshot.page(i).subarray(0, end - start), start - at)
     }
     if (!equal(actual, expected)) return false
   }
   return true
 }
 
-const newestFirst = (a: BaseInfo, b: BaseInfo) => b.createdAt - a.createdAt
+const newestFirst = (a: SnapshotInfo, b: SnapshotInfo) =>
+  b.createdAt - a.createdAt
+
+function wholeNumber(name: string, value: number, min: number) {
+  if (value !== Infinity && (!Number.isInteger(value) || value < min))
+    throw new RangeError(`${name} must be a whole number of at least ${min}, not ${value}`)
+}
 
 /**
- * Databases on immutable bases, kept by a `BaseStore`: files in OPFS
- * (`opfsSnapshotStorage`), Blobs in IndexedDB (`indexedDBSnapshotStorage`)
- * or bytes in memory (`memorySnapshotStorage`). Any number of Workers, dedicated or
- * shared, open a database on the same base at once; SQLite reads its pages
- * as it needs them, and keeps every change in the Worker's memory.
- * `checkpoint` writes those changes to a new base.
+ * Databases on immutable snapshots, kept by a `SnapshotStore`: files in
+ * OPFS (`opfsSnapshots`), Blobs in IndexedDB (`indexedDBSnapshots`) or bytes
+ * in memory (`memorySnapshots`). Any number of Workers, dedicated or
+ * shared, open a database on the same snapshot at once; SQLite reads its
+ * pages as it needs them, and keeps every change in the Worker's memory.
+ * `session.save()` writes those changes to a new snapshot.
  *
  * ```ts
  * import {init} from '@alinea/sqlite-wasm'
- * import {opfsSnapshotStorage} from '@alinea/sqlite-wasm/snapshots'
+ * import {opfsSnapshots} from '@alinea/sqlite-wasm/snapshots'
  *
  * const {Database} = await init()
- * const storage = opfsSnapshotStorage('entries')
- * const db = await storage.open(Database, {group: 'config-1'})
- * db.run('create table if not exists notes (text)')
- * await storage.checkpoint(db, 'tree-2', {group: 'config-1'})
- * await storage.cleanup()
+ * const storage = opfsSnapshots('entries')
+ * const session = await storage.open(Database, {branch: 'config-1'})
+ * session.db.run('create table if not exists notes (text)')
+ * await session.save({key: 'tree-2'})
+ * await storage.retain()
  * ```
  */
 export class SnapshotStorage {
   private locks: Pick<LockManager, 'request'> | null
 
   constructor(
-    public readonly store: BaseStore,
+    public readonly store: SnapshotStore,
     options?: SnapshotStorageOptions
   ) {
     this.locks =
@@ -919,28 +933,28 @@ export class SnapshotStorage {
           : null
   }
 
-  /** If bases can be read and written in this context. */
+  /** If snapshots can be read and written in this context. */
   supported(): boolean {
     return this.store.supported()
   }
 
   /**
-   * Every base, newest first. A base of size 0 is being written, or writing
-   * it failed.
+   * Every snapshot, or those of `branch`, newest first. A snapshot of size
+   * 0 is being written, or writing it failed.
    */
-  async list(): Promise<Array<BaseInfo>> {
-    return (await this.store.list()).sort(newestFirst)
+  async list(filter: {branch?: string} = {}): Promise<Array<SnapshotInfo>> {
+    const all = (await this.store.list()).sort(newestFirst)
+    const {branch} = filter
+    return branch === undefined ? all : all.filter(s => s.branch === branch)
   }
 
-  /** The newest base of `group`, or of all, if there is one. */
-  async newest(group?: string): Promise<BaseInfo | undefined> {
-    if (this.store.newest) {
-      const newest = await this.store.newest(group)
-      if (!newest || newest.size > 0) return newest
+  /** The newest snapshot of `branch`, or of all, if there is one. */
+  async head(branch?: string): Promise<SnapshotInfo | undefined> {
+    if (this.store.head) {
+      const head = await this.store.head(branch)
+      if (!head || head.size > 0) return head
     }
-    return (await this.list()).find(
-      base => base.size > 0 && (group === undefined || base.group === group)
-    )
+    return (await this.list({branch})).find(snapshot => snapshot.size > 0)
   }
 
   private lockName(kind: 'read' | 'write', key: string) {
@@ -948,10 +962,11 @@ export class SnapshotStorage {
   }
 
   /**
-   * Hold a shared lock on reading base `key`, which keeps cleanup from
+   * Hold a shared lock on reading snapshot `key`, which keeps `retain` from
    * deleting it, until the returned function is called.
+   * @internal
    */
-  private hold(key: string): Promise<() => void> {
+  hold(key: string): Promise<() => void> {
     const locks = this.locks
     if (!locks) return Promise.resolve(() => {})
     return new Promise((resolve, reject) => {
@@ -963,46 +978,62 @@ export class SnapshotStorage {
     })
   }
 
+  /** Run `write` while no other Worker writes snapshot `key`. @internal */
+  exclusive<T>(key: string, write: () => Promise<T>): Promise<T> {
+    if (!this.locks) return write()
+    return this.locks.request(this.lockName('write', key), write)
+  }
+
   /**
-   * Open a database on base `key` (or `{key}`), or on the newest base of
-   * `{group}` (of any group if it has none and `fallback` is `'any'`), or
-   * of all; `baseOf(db)` tells which. Pages are read from the base as queries need them,
-   * and every change is kept in memory: `checkpoint` writes them to a new
-   * base, and they are lost when the database closes or the Worker ends.
-   * SQLite keeps up to 8 MB of the pages it read in its page cache (`PRAGMA
-   * cache_size`, also for forks). Without a base to open, the database
-   * starts empty. Rejects with `SQLITE_CANTOPEN` if base `key` does not
-   * exist, and with `SQLITE_CORRUPT` if it is not a database.
+   * Open a session on snapshot `key`, or on the head of `branch` (of all
+   * branches if it has none and `fallback` is `'any-branch'`), or on the
+   * head of all; `session.snapshot` tells which. Pages are read from the
+   * snapshot as queries need them, and every change is kept in memory:
+   * `session.save()` writes them to a new snapshot, and they are lost when
+   * the session closes without saving or the Worker ends. SQLite keeps up
+   * to 8 MB of the pages it read in its page cache (`PRAGMA cache_size`,
+   * also for forks). Without a snapshot to open, the database starts empty.
+   * Rejects with `SQLITE_CANTOPEN` if snapshot `key` does not exist, and
+   * with `SQLITE_CORRUPT` if it is not a database.
    */
   async open<T extends Database>(
     Database: new () => T,
-    which: OpenOptions = {}
-  ): Promise<T> {
-    const {key, group, fallback, checkpoint} =
-      typeof which === 'string' ? {key: which, checkpoint: undefined} : which
-    const newest = async () =>
-      (await this.newest(group)) ??
-      (fallback === 'any' && group !== undefined ? await this.newest() : undefined)
-    const auto = <D extends Database>(db: D) => {
-      if (group !== undefined) groups.set(db, group)
-      if (checkpoint) this.autoCheckpoint(db, {group, ...checkpoint})
-      return db
-    }
+    options: OpenOptions = {}
+  ): Promise<Session<T>> {
+    const {key, branch, fallback, autoSave} = options
+    const head = async () =>
+      (await this.head(branch)) ??
+      (fallback === 'any-branch' && branch !== undefined
+        ? await this.head()
+        : undefined)
     for (let attempt = 0; ; attempt++) {
-      const base = key ?? (await newest())?.key
-      if (base === undefined) return auto(new Database())
+      const found = key ?? (await head())?.key
+      if (found === undefined)
+        return this.session(new Database(), {branch, autoSave})
       try {
-        return auto(await this.openBase(Database, base))
+        const db = await this.openSnapshot(Database, found)
+        return this.session(db, {branch, autoSave})
       } catch (error) {
-        // The newest base was deleted after it was found: a newer one
-        // replaced it.
+        // The head was deleted after it was found: a newer one replaced it.
         const missing = (error as SQLiteError)?.resultCode === SQLITE_CANTOPEN
         if (key !== undefined || !missing || attempt >= 2) throw error
       }
     }
   }
 
-  private async openBase<T extends Database>(
+  /**
+   * A session for `db`, a database this storage did not open, such as one
+   * loaded from bytes or a fork: its first save writes all of it. Fails with
+   * `SQLITE_MISUSE` for a database stored elsewhere, such as in IndexedDB
+   * storage.
+   */
+  session<T extends Database>(db: T, options: SessionOptions = {}): Session<T> {
+    if (db.file !== undefined || db.persistence)
+      throw new SQLiteError('Database is stored elsewhere', SQLITE_MISUSE)
+    return new Session(this, db, options)
+  }
+
+  private async openSnapshot<T extends Database>(
     Database: new () => T,
     key: string
   ): Promise<T> {
@@ -1011,20 +1042,27 @@ export class SnapshotStorage {
     try {
       const found = await this.store.get(key)
       if (!found || sizeOf(found.source) === 0)
-        throw new SQLiteError(`No base "${key}"`, SQLITE_CANTOPEN)
+        throw new SQLiteError(`No snapshot "${key}"`, SQLITE_CANTOPEN)
       const {info, source} = found
-      checkHeader(await readHeader(source), sizeOf(source), key)
+      checkHeader(await read(source, 0, 100), sizeOf(source), key)
       db = new Database()
       const opened = db
-      this.use(opened, {...info, key, source}, release, file =>
+      const files = filesOf(opened.wasm)
+      const file = `snapshots/${nextFile++}/${key}`
+      files.add(file, readOnlyFile(source), release)
+      try {
         opened.openBase(file)
-      )
+        opened.base = {...info, key, source} satisfies Base
+      } finally {
+        // Opening failed before SQLite opened the file.
+        if (files.openHandles(file) === 0) files.remove(file)
+      }
       try {
         db.exec('select count(*) from sqlite_schema')
         db.run(`pragma cache_size = -${CACHE_KIB}`)
       } catch (error) {
         throw new SQLiteError(
-          `Base "${key}" is corrupt: ${(error as Error).message}`,
+          `Snapshot "${key}" is corrupt: ${(error as Error).message}`,
           SQLITE_CORRUPT,
           {cause: error}
         )
@@ -1040,96 +1078,277 @@ export class SnapshotStorage {
   }
 
   /**
-   * Have `db` read `base` with `open(file)`, and call `release` once no
-   * database or fork reads it anymore.
+   * Write snapshot `key` from `snapshot` (a fork of `db` taken when the save
+   * was called), or find it written with the same content, and move `db`
+   * onto it, with the later snapshots of `db` that wait for their turn:
+   * they read the same snapshot as `db` until then. Those that read
+   * another one by now (when moving one failed) stay where they are, as
+   * does `db` once it is closed.
+   * @internal
    */
-  private use(
+  async write(
     db: Database,
-    base: Base,
-    release: () => void,
-    open: (file: string) => void
-  ) {
-    const files = filesOf(db.wasm)
-    const file = `snapshots/${nextFile++}/${base.key}`
-    files.add(file, readOnlyFile(base.source), release)
+    snapshot: Database,
+    waiting: Set<Database>,
+    {key, branch, meta}: {key: string; branch: string; meta: SnapshotMeta}
+  ): Promise<SaveResult> {
+    const release = once(await this.hold(key))
+    let registered = false
     try {
-      open(file)
-      db.base = base
-    } finally {
-      // Opening failed before SQLite opened the file.
-      if (files.openHandles(file) === 0) files.remove(file)
+      const written = await this.exclusive(key, () =>
+        this.store.write(newSnapshot(snapshot, key, branch, meta))
+      )
+      let target: Base | undefined
+      if (written) {
+        // Only for its time: the fallback is close enough if reading fails.
+        const stored = await this.store.get(key).catch(() => undefined)
+        target = {
+          ...(stored?.info ?? {
+            key,
+            branch,
+            meta,
+            createdAt: now(),
+            size: sizeOf(written)
+          }),
+          source: written
+        }
+      } else {
+        const found = await this.existing(snapshot, key)
+        if (found.status !== 'move') {
+          release()
+          return {status: found.status, snapshot: found.info} as SaveResult
+        }
+        target = found.base
+      }
+      const from = snapshot.base
+      const files = filesOf(db.wasm)
+      const file = `snapshots/${nextFile++}/${key}`
+      // From here on, the lock is released once nothing reads the file.
+      files.add(file, readOnlyFile(target.source), release)
+      registered = true
+      try {
+        if (!db.isClosed() && db.base === from) {
+          db.rebase(snapshot, file)
+          db.base = target
+        }
+        for (const later of waiting) {
+          if (later === snapshot || later.base !== from) continue
+          try {
+            later.rebase(snapshot, file)
+            later.base = target
+          } catch {
+            // It writes from the snapshot it reads, and db stays on that.
+          }
+        }
+      } finally {
+        if (files.openHandles(file) === 0) files.remove(file)
+      }
+      return {status: written ? 'written' : 'joined', snapshot: infoOf(target)!}
+    } catch (error) {
+      if (!registered) release()
+      throw error
     }
   }
 
   /**
-   * Write the committed state of `db` to a new base `key`, and have `db`
-   * read that from now on: the pages it holds that did not change since are
-   * dropped from memory. The database keeps working meanwhile; changes made
-   * after the checkpoint started stay in memory. Resolves to `false`,
-   * writing nothing, if base `key` exists already: name bases by their
-   * content, so a key always means the same data. If that base holds the
-   * committed state of `db` byte for byte, which takes the same commits on
-   * the same base, `db` reads it from then on as if it had written it, else
-   * `db` stays as it is. The state is taken when `checkpoint` is called;
-   * checkpoints of one database are written one at a time. A database
-   * closed meanwhile is not moved. Fails with `SQLITE_BUSY` during a write
-   * transaction and `SQLITE_MISUSE` for a database stored elsewhere, such
-   * as in IndexedDB storage.
+   * What to do with snapshot `key`, which exists: move onto it if it holds
+   * exactly the committed state of `snapshot`, nothing if `snapshot` reads
+   * it already with nothing changed, else nothing either: a mismatch.
    */
-  checkpoint(
-    db: Database,
-    key: string,
-    options: CheckpointOptions = {}
-  ): Promise<boolean> {
+  private async existing(
+    snapshot: Database,
+    key: string
+  ): Promise<
+    | {status: 'move'; base: Base; info?: undefined}
+    | {status: 'joined' | 'mismatch'; info: SnapshotInfo | undefined}
+  > {
+    const current = snapshot.base as Base | undefined
+    try {
+      // A key names content, but other Workers may have stored the same
+      // rows in other pages, under which the pages a database holds would
+      // not fit.
+      const content = newSnapshot(snapshot, key, '', {})
+      if (current?.key === key) {
+        const unchanged =
+          content.pages.length === 0 && content.size === sizeOf(current.source)
+        return {status: unchanged ? 'joined' : 'mismatch', info: infoOf(current)}
+      }
+      const found = await this.store.get(key)
+      if (!found) return {status: 'mismatch', info: undefined}
+      if (!(await holds(found.source, content)))
+        return {status: 'mismatch', info: found.info}
+      return {status: 'move', base: {...found.info, source: found.source}}
+    } catch {
+      // Deleted while it was read: the database stays where it is.
+      return {status: 'mismatch', info: undefined}
+    }
+  }
+
+  /**
+   * Delete snapshots by `policy`: each branch keeps its newest `perBranch`
+   * (default 1), only the `branches` with the newest heads keep any
+   * (default: all), and `pinned` keys are always kept. With locks (OPFS),
+   * snapshots a database reads are kept too; without, OPFS keeps one more
+   * per branch, as a Worker may still read it, and deletes snapshots of the
+   * branches past `branches` that Workers may still read. IndexedDB, whose
+   * Blobs stay readable, needs neither. Empty snapshots are being written,
+   * or writing them failed: with locks, those nobody writes are deleted,
+   * without, those older than an hour. Resolves to the deleted keys.
+   */
+  async retain(policy: RetainPolicy = {}): Promise<Array<string>> {
+    const {perBranch = 1, branches = Infinity} = policy
+    wholeNumber('perBranch', perBranch, 1)
+    wholeNumber('branches', branches, 0)
+    const pinned = new Set(policy.pinned ?? [])
+    const all = await this.list()
+    const ranked: Array<string> = []
+    for (const snapshot of all) {
+      if (snapshot.size > 0 && !ranked.includes(snapshot.branch))
+        ranked.push(snapshot.branch)
+    }
+    const kept = new Set(ranked.slice(0, branches))
+    const seen = new Map<string, number>()
+    const keep = perBranch + (this.locks || this.store.keepsRemoved ? 0 : 1)
+    const deleted: Array<string> = []
+    for (const snapshot of all) {
+      if (pinned.has(snapshot.key)) continue
+      if (snapshot.size > 0) {
+        const count = (seen.get(snapshot.branch) ?? 0) + 1
+        seen.set(snapshot.branch, count)
+        if (count <= keep && kept.has(snapshot.branch)) continue
+      } else if (!this.locks && now() - snapshot.createdAt < STALE_MS) {
+        // Empty snapshots are being written, which locks them, or writing
+        // them failed. Without locks, only the ones that are old have failed.
+        continue
+      }
+      if (!this.locks) {
+        await this.store.remove(snapshot.key)
+        deleted.push(snapshot.key)
+        continue
+      }
+      await this.locks.request(
+        this.lockName('read', snapshot.key),
+        {mode: 'exclusive', ifAvailable: true},
+        async lock => {
+          if (!lock) return
+          await this.store.remove(snapshot.key)
+          deleted.push(snapshot.key)
+        }
+      )
+    }
+    return deleted
+  }
+}
+
+/**
+ * A database on a snapshot storage: `db` reads `snapshot` and holds what
+ * changed since in memory, until `save()` writes a new snapshot on
+ * `branch`. Close it with `close()`, which also stops automatic saves.
+ */
+export class Session<D extends Database = Database> {
+  #storage: SnapshotStorage
+  #branch: string
+  /** Saves run one after the other */
+  #queue: Promise<unknown> = Promise.resolve()
+  /** Snapshots of the saves that wait for their turn or run */
+  #waiting = new Set<Database>()
+  #stopAutoSave = () => {}
+
+  /** @internal Use `storage.open()` or `storage.session()`. */
+  constructor(
+    storage: SnapshotStorage,
+    readonly db: D,
+    options: SessionOptions = {}
+  ) {
+    this.#storage = storage
+    this.#branch =
+      options.branch ?? (db.base as Base | undefined)?.branch ?? ''
+    if (options.autoSave) this.#stopAutoSave = this.#autoSave(options.autoSave)
+  }
+
+  /** The branch saves go to, unless they name another */
+  get branch(): string {
+    return this.#branch
+  }
+
+  /**
+   * The snapshot the database reads (after a save, the one it wrote or
+   * joined), or `undefined` if it has none.
+   */
+  get snapshot(): SnapshotInfo | undefined {
+    return infoOf(this.db.base as Base | undefined)
+  }
+
+  /** Bytes of changed pages the database holds in memory */
+  get held(): number {
+    const [[pages]] = this.db.exec('pragma overlay_pages')[0].values
+    const [[pageSize]] = this.db.exec('pragma page_size')[0].values
+    return Number(pages) * Number(pageSize)
+  }
+
+  /**
+   * Write the committed state of the database to a new snapshot, and have
+   * it read that from now on: the pages it holds that did not change since
+   * are dropped from memory. The database keeps working meanwhile; changes
+   * made after the save started stay in memory. The state is taken when
+   * `save` is called; saves of a session are written one at a time. See
+   * `SaveResult` for a key that exists. Fails with `SQLITE_BUSY` during a
+   * write transaction.
+   */
+  save(options: SaveOptions = {}): Promise<SaveResult> {
     let snapshot: Database
     try {
-      if (db.file !== undefined || db.persistence)
-        throw new SQLiteError('Database is stored elsewhere', SQLITE_MISUSE)
-      try {
-        snapshot = db.fork()
-      } catch (error) {
-        throw new SQLiteError((error as Error).message, SQLITE_BUSY, {
-          cause: error
-        })
-      }
+      snapshot = this.db.fork()
     } catch (error) {
-      return Promise.reject(error)
+      return Promise.reject(
+        new SQLiteError((error as Error).message, SQLITE_BUSY, {cause: error})
+      )
     }
-    if (options.group !== undefined) groups.set(db, options.group)
-    const group =
-      options.group ??
-      groups.get(db) ??
-      (db.base as Base | undefined)?.group ??
-      ''
-    const meta = options.meta ?? {}
-    let state = checkpoints.get(db)
-    if (!state)
-      checkpoints.set(db, (state = {queue: Promise.resolve(), snapshots: new Set()}))
-    const {snapshots} = state
-    snapshots.add(snapshot)
-    const next = state.queue
+    if (options.branch !== undefined) this.#branch = options.branch
+    const target = {
+      key: options.key ?? uniqueKey(),
+      branch: this.#branch,
+      meta: options.meta ?? {}
+    }
+    const waiting = this.#waiting
+    waiting.add(snapshot)
+    const next = this.#queue
       .catch(() => {})
-      .then(() => this.write(db, snapshot, snapshots, {key, group, meta}))
+      .then(() => this.#storage.write(this.db, snapshot, waiting, target))
       .finally(() => {
-        snapshots.delete(snapshot)
+        waiting.delete(snapshot)
         snapshot.close()
       })
-    state.queue = next
+    this.#queue = next
     return next
   }
 
   /**
-   * Checkpoint `db` by itself from now on: `after` milliseconds after the
-   * last commit (each commit restarts the wait), and/or as soon as it holds
-   * `maxHeld` bytes of changed pages, which bounds the memory a large
-   * import or reindex holds. Off unless one of them is given. A checkpoint
-   * never starts inside a transaction (the commit that ends it counts),
-   * and one runs at a time. `key` names each base, or skips a checkpoint by
-   * returning `undefined`. Stops when the database closes, or when the
-   * returned function is called.
+   * A new session on a fork of the database: it reads the same snapshot,
+   * starts with the same changes and branch, and keeps its own from then on.
    */
-  autoCheckpoint(db: Database, options: AutoCheckpointOptions): () => void {
+  fork(): Session<D> {
+    return new Session(this.#storage, this.db.fork(), {branch: this.#branch})
+  }
+
+  /**
+   * Stop saving automatically and close the database; with `save`, save
+   * first. Changes that were not saved are lost. Resolves once every save
+   * has finished.
+   */
+  async close(options: {save?: SaveOptions} = {}): Promise<void> {
+    this.#stopAutoSave()
+    try {
+      if (options.save && !this.db.isClosed()) await this.save(options.save)
+    } finally {
+      if (!this.db.isClosed()) this.db.close()
+      await this.#queue.catch(() => {})
+    }
+  }
+
+  #autoSave(options: AutoSaveOptions): () => void {
     const {after, maxHeld} = options
+    const db = this.db
     const report =
       options.onError ??
       ((error: unknown) =>
@@ -1155,9 +1374,9 @@ export class SnapshotStorage {
       }
       if (db.inTransaction()) return
       let key: string | undefined
-      let meta: BaseMeta | undefined
+      let meta: SnapshotMeta | undefined
       try {
-        key = options.key ? options.key(db) : autoKey()
+        key = options.key ? options.key(db) : uniqueKey()
         if (key === undefined) return
         meta = options.meta?.(db)
       } catch (error) {
@@ -1165,7 +1384,7 @@ export class SnapshotStorage {
         return
       }
       running = true
-      this.checkpoint(db, key, {group: options.group, meta})
+      this.save({key, meta})
         .catch(report)
         .finally(() => {
           running = false
@@ -1174,11 +1393,6 @@ export class SnapshotStorage {
             run()
           }
         })
-    }
-    const held = () => {
-      const [[pages]] = db.exec('pragma overlay_pages')[0].values
-      const [[pageSize]] = db.exec('pragma page_size')[0].values
-      return Number(pages) * Number(pageSize)
     }
     // Called inside each commit: only schedule.
     const committed = () => {
@@ -1190,7 +1404,7 @@ export class SnapshotStorage {
         checking = true
         setTimeout(() => {
           checking = false
-          if (active() && !db.inTransaction() && held() >= maxHeld) run()
+          if (active() && !db.inTransaction() && this.held >= maxHeld) run()
         }, 0)
       }
     }
@@ -1205,191 +1419,41 @@ export class SnapshotStorage {
     }
     return stop
   }
+}
 
-  /**
-   * Write base `key` from `snapshot`, or find it written with the same
-   * content, and move `db` onto it, with the later snapshots of `db` that
-   * wait for their turn: they read the same base as `db` until then. Those
-   * that read another base by now (when moving one failed) stay where they
-   * are, as does `db` once it is closed. Resolves to whether it wrote it.
-   */
-  private async write(
-    db: Database,
-    snapshot: Database,
-    snapshots: Set<Database>,
-    {key, group, meta}: {key: string; group: string; meta: BaseMeta}
-  ): Promise<boolean> {
-    const release = once(await this.hold(key))
-    let registered = false
-    try {
-      const written = await this.exclusive(key, () =>
-        this.store.write(this.newBase(snapshot, key, group, meta))
-      )
-      let base: Base | undefined
-      if (written) {
-        // Only for its time: the fallback is close enough if reading fails.
-        const stored = await this.store.get(key).catch(() => undefined)
-        const size = sizeOf(written)
-        base = {
-          ...(stored?.info ?? {key, group, meta, createdAt: now(), size}),
-          source: written
-        }
-      } else {
-        base = await this.existing(snapshot, key)
-      }
-      if (!base) {
-        release()
-        return false
-      }
-      const from = snapshot.base
-      const files = filesOf(db.wasm)
-      const file = `snapshots/${nextFile++}/${key}`
-      // From here on, the lock is released once nothing reads the file.
-      files.add(file, readOnlyFile(base.source), release)
-      registered = true
-      try {
-        if (!db.isClosed() && db.base === from) {
-          db.rebase(snapshot, file)
-          db.base = base
-        }
-        for (const later of snapshots) {
-          if (later === snapshot || later.base !== from) continue
-          try {
-            later.rebase(snapshot, file)
-            later.base = base
-          } catch {
-            // It writes from the base it reads, and db stays on that.
-          }
-        }
-      } finally {
-        if (files.openHandles(file) === 0) files.remove(file)
-      }
-      return written !== undefined
-    } catch (error) {
-      if (!registered) release()
-      throw error
-    }
-  }
-
-  /**
-   * Base `key`, if it exists and holds exactly the committed state of
-   * `snapshot`, which can then move onto it as onto a base it wrote.
-   */
-  private async existing(
-    snapshot: Database,
-    key: string
-  ): Promise<Base | undefined> {
-    if ((snapshot.base as Base | undefined)?.key === key) return undefined
-    try {
-      const found = await this.store.get(key)
-      if (!found) return undefined
-      // A key names content, but other Workers may have stored the same
-      // rows in other pages, under which the pages a database holds would
-      // not fit.
-      const content = this.newBase(snapshot, key, '', {})
-      if (!(await holds(found.source, content))) return undefined
-      return {...found.info, source: found.source}
-    } catch {
-      // Deleted while it was read: the database stays where it is.
-      return undefined
-    }
-  }
-
-  private newBase(
-    snapshot: Database,
-    key: string,
-    group: string,
-    meta: BaseMeta
-  ): NewBase {
-    const {chunkSize, size, visible, pages} = snapshot.pages()
-    const base = snapshot.base as Base | undefined
-    if (visible > 0 && !base)
-      throw new SQLiteError(
-        'Database reads a base it was not opened on',
-        SQLITE_MISUSE
-      )
-    // The snapshot is not used meanwhile, so its pages stay where they are,
-    // but the Wasm heap may grow: take HEAPU8 afresh.
-    return {
-      key,
-      group,
-      meta,
-      base: base?.source,
-      visible,
-      size,
-      chunkSize,
-      pages: pages.map(([index]) => index),
-      page(i) {
-        const pointer = pages[i][1]
-        return snapshot.wasm.HEAPU8.subarray(pointer, pointer + chunkSize)
-      }
-    }
-  }
-
-  private exclusive<T>(key: string, write: () => Promise<T>): Promise<T> {
-    if (!this.locks) return write()
-    return this.locks.request(this.lockName('write', key), write)
-  }
-
-  /**
-   * Delete the bases that are not the newest of their group, and with
-   * `keepGroups`, every base of the groups past the newest `keepGroups`
-   * (ranked by their newest base); without locks, OPFS then deletes bases
-   * of those groups that Workers may still read. With locks
-   * (OPFS), bases a database reads are kept; without, OPFS keeps the
-   * newest two of each group, as a Worker may still read the other, and
-   * IndexedDB, whose Blobs stay readable, keeps one. Empty bases are
-   * being written, or writing them failed: with locks, those nobody writes
-   * are deleted, without, those older than an hour. Resolves to the keys
-   * of the deleted bases.
-   */
-  async cleanup(options: CleanupOptions = {}): Promise<Array<string>> {
-    const bases = await this.list()
-    const ranked: Array<string> = []
-    for (const base of bases) {
-      if (base.size > 0 && !ranked.includes(base.group)) ranked.push(base.group)
-    }
-    const {keepGroups = Infinity} = options
-    if (
-      keepGroups !== Infinity &&
-      (!Number.isInteger(keepGroups) || keepGroups < 0)
+function newSnapshot(
+  snapshot: Database,
+  key: string,
+  branch: string,
+  meta: SnapshotMeta
+): NewSnapshot {
+  const {chunkSize, size, visible, pages} = snapshot.pages()
+  const base = snapshot.base as Base | undefined
+  if (visible > 0 && !base)
+    throw new SQLiteError(
+      'Database reads a snapshot it was not opened on',
+      SQLITE_MISUSE
     )
-      throw new RangeError(`keepGroups must be a whole number, not ${keepGroups}`)
-    const kept = new Set(ranked.slice(0, keepGroups))
-    const seen = new Map<string, number>()
-    const keep = this.locks || this.store.keepsRemoved ? 1 : 2
-    const deleted: Array<string> = []
-    for (const base of bases) {
-      if (base.size > 0) {
-        const count = (seen.get(base.group) ?? 0) + 1
-        seen.set(base.group, count)
-        if (count <= keep && kept.has(base.group)) continue
-      } else if (!this.locks && now() - base.createdAt < STALE_MS) {
-        // Empty bases are being written, which locks them, or writing them
-        // failed. Without locks, only the ones that are old have failed.
-        continue
-      }
-      if (!this.locks) {
-        await this.store.remove(base.key)
-        deleted.push(base.key)
-        continue
-      }
-      await this.locks.request(
-        this.lockName('read', base.key),
-        {mode: 'exclusive', ifAvailable: true},
-        async lock => {
-          if (!lock) return
-          await this.store.remove(base.key)
-          deleted.push(base.key)
-        }
-      )
+  // The snapshot is not used meanwhile, so its pages stay where they are,
+  // but the Wasm heap may grow: take HEAPU8 afresh.
+  return {
+    key,
+    branch,
+    meta,
+    base: base?.source,
+    visible,
+    size,
+    chunkSize,
+    pages: pages.map(([index]) => index),
+    page(i) {
+      const pointer = pages[i][1]
+      return snapshot.wasm.HEAPU8.subarray(pointer, pointer + chunkSize)
     }
-    return deleted
   }
 }
 
-/** A key no other checkpoint uses */
-function autoKey() {
+/** A key no other save uses */
+function uniqueKey() {
   return `auto-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
