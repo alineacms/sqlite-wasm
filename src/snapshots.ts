@@ -1284,6 +1284,44 @@ async function holds(source: BaseSource, snapshot: NewSnapshot) {
   return true
 }
 
+/**
+ * For `layer`, a delta over `current` with the pages of `snapshot`, if it
+ * holds the same pages: then nothing else can differ. Undefined if it is
+ * not such a delta, which takes comparing everything.
+ */
+function sameDelta(
+  layer: Layer,
+  current: Base | undefined,
+  snapshot: NewSnapshot
+): Promise<boolean> | undefined {
+  const {delta, source} = layer
+  const {pages, chunkSize, visible, size} = snapshot
+  if (
+    !delta ||
+    !current ||
+    delta.parent !== current.key ||
+    delta.chunkSize !== chunkSize ||
+    delta.visible !== visible ||
+    layer.info.size !== size ||
+    delta.pages.length !== pages.length ||
+    delta.pages.some((page, i) => page !== pages[i])
+  )
+    return undefined
+  return (async () => {
+    const perRead = Math.max(1, Math.floor(WRITE_BYTES / chunkSize))
+    for (let i = 0; i < pages.length; i += perRead) {
+      const end = Math.min(i + perRead, pages.length)
+      const stored = await read(source, i * chunkSize, end * chunkSize)
+      // Pages are views of Wasm memory: take them after the last await.
+      for (let k = i; k < end; k++) {
+        const at = (k - i) * chunkSize
+        if (!equal(stored.subarray(at, at + chunkSize), snapshot.page(k))) return false
+      }
+    }
+    return true
+  })()
+}
+
 const newestFirst = (a: SnapshotInfo, b: SnapshotInfo) =>
   b.createdAt - a.createdAt
 
@@ -1644,7 +1682,10 @@ export class SnapshotStorage {
       const found = await this.resolve(key)
       if (!found) return {status: 'mismatch', info: undefined}
       release = found.release
-      if (!(await holds(found.base.content(), content))) {
+      const same = sameDelta(found.base.layer, current, content)
+      const equal =
+        same === undefined ? await holds(found.base.content(), content) : await same
+      if (!equal) {
         release()
         return {status: 'mismatch', info: infoOf(found.base)}
       }
