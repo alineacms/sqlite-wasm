@@ -321,7 +321,7 @@ export class Database {
    *
    * The fork starts from the last committed state, and cannot be created
    * while this database has an open write transaction. Functions registered
-   * with `create_function` are not carried over.
+   * with `create_function` are not carried over; `PRAGMA cache_size` is.
    */
   fork(): this {
     if (!this.dbPtr) {
@@ -334,12 +334,10 @@ export class Database {
     const fork: this = Object.create(Object.getPrototypeOf(this))
     fork.open(this.wasm, openResult)
     fork.base = this.base
-    // Pages of a base file are read from it again once they leave the page
-    // cache: keep the cache of the source.
-    if (this.base) {
-      const [[cacheSize]] = this.exec('pragma cache_size')[0].values
-      fork.run(`pragma cache_size = ${cacheSize}`)
-    }
+    // Keep the page cache size of the source: pages of a base are read from
+    // it again once they leave the cache.
+    const [[cacheSize]] = this.exec('pragma cache_size')[0].values
+    fork.run(`pragma cache_size = ${cacheSize}`)
     return fork
   }
 

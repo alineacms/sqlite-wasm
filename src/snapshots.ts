@@ -616,6 +616,61 @@ export function indexedDBBaseStore(
 }
 
 // ------------------------------------------------------------------------
+// Memory
+// ------------------------------------------------------------------------
+
+/**
+ * Bases as bytes in memory, for tests and runtimes without OPFS or
+ * `FileReaderSync` (Node, Bun). Storages that share the store share its
+ * bases, as Workers share OPFS or IndexedDB; nothing outlives the store.
+ */
+export function memoryBaseStore(name = 'memory'): BaseStore {
+  const bases = new Map<string, {info: BaseInfo; data: Uint8Array}>()
+  let last = 0
+  return {
+    name,
+    locking: false,
+    keepsRemoved: true,
+    supported: () => true,
+    async list() {
+      return [...bases.values()].map(base => ({...base.info}))
+    },
+    async get(key) {
+      const base = bases.get(key)
+      return base && {info: {...base.info}, source: base.data}
+    },
+    async write(base) {
+      if (bases.has(base.key)) return undefined
+      const data = new Uint8Array(base.size)
+      const keep = Math.min(base.visible, base.size)
+      if (base.base && keep > 0) {
+        const part = slice(base.base, 0, keep)
+        data.set(
+          part instanceof Uint8Array
+            ? part
+            : new Uint8Array(await part.arrayBuffer())
+        )
+      }
+      // Bytes past `visible` that no page covers stay zero.
+      base.pages.forEach((index, i) => {
+        const start = index * base.chunkSize
+        if (start >= base.size) return
+        data.set(base.page(i).subarray(0, base.size - start), start)
+      })
+      if (bases.has(base.key)) return undefined
+      // Times that differ, also within a millisecond
+      const createdAt = (last = Math.max(now(), last + 0.001))
+      const {key, group, meta, size} = base
+      bases.set(key, {info: {key, group, meta, createdAt, size}, data})
+      return data
+    },
+    async remove(key) {
+      bases.delete(key)
+    }
+  }
+}
+
+// ------------------------------------------------------------------------
 // Storage
 // ------------------------------------------------------------------------
 
@@ -657,15 +712,45 @@ export function indexedDBSnapshotStorage(
   return new SnapshotStorage(indexedDBBaseStore(name, implementation), options)
 }
 
+/**
+ * Keeps databases in memory, on bases of a `memoryBaseStore`: for tests,
+ * and for Node and Bun. Pass the same `store` to storages that should
+ * share their bases. See `SnapshotStorage`.
+ */
+export function memorySnapshotStorage(
+  store: BaseStore = memoryBaseStore()
+): SnapshotStorage {
+  return new SnapshotStorage(store)
+}
+
 /** The base a database reads, kept as `db.base`. */
-interface Base {
-  key: string
-  group: string
+interface Base extends BaseInfo {
   source: BaseSource
 }
 
-/** Which base to open: by key, or the newest of a group. */
-export type OpenOptions = string | {key?: string; group?: string}
+/**
+ * The base `db` reads, if a snapshot storage opened it on one or wrote one
+ * from it, or undefined for a database without a base.
+ */
+export function baseOf(db: Database): BaseInfo | undefined {
+  const base = db.base as Base | undefined
+  if (!base) return undefined
+  const {key, group, meta, createdAt, size} = base
+  return {key, group, meta, createdAt, size}
+}
+
+/**
+ * Which base to open: by key, or the newest of a group, or of all. With
+ * `fallback: 'any'`, a group without bases opens the newest base of any.
+ */
+export type OpenOptions =
+  | string
+  | {key?: string; group?: string; fallback?: 'any'}
+
+export interface CleanupOptions {
+  /** How many groups keep a base, the ones with the newest (default: all) */
+  keepGroups?: number
+}
 
 /** The group and meta of a new base. */
 export interface CheckpointOptions {
@@ -795,7 +880,8 @@ export class SnapshotStorage {
 
   /**
    * Open a database on base `key` (or `{key}`), or on the newest base of
-   * `{group}`, or of all. Pages are read from the base as queries need them,
+   * `{group}` (of any group if it has none and `fallback` is `'any'`), or
+   * of all; `baseOf(db)` tells which. Pages are read from the base as queries need them,
    * and every change is kept in memory: `checkpoint` writes them to a new
    * base, and they are lost when the database closes or the Worker ends.
    * SQLite keeps up to 8 MB of the pages it read in its page cache (`PRAGMA
@@ -807,9 +893,12 @@ export class SnapshotStorage {
     Database: new () => T,
     which: OpenOptions = {}
   ): Promise<T> {
-    const {key, group} = typeof which === 'string' ? {key: which} : which
+    const {key, group, fallback} = typeof which === 'string' ? {key: which} : which
+    const newest = async () =>
+      (await this.newest(group)) ??
+      (fallback === 'any' && group !== undefined ? await this.newest() : undefined)
     for (let attempt = 0; ; attempt++) {
-      const base = key ?? (await this.newest(group))?.key
+      const base = key ?? (await newest())?.key
       if (base === undefined) return new Database()
       try {
         return await this.openBase(Database, base)
@@ -836,7 +925,7 @@ export class SnapshotStorage {
       checkHeader(await readHeader(source), sizeOf(source), key)
       db = new Database()
       const opened = db
-      this.use(opened, {key, group: info.group, source}, release, file =>
+      this.use(opened, {...info, key, source}, release, file =>
         opened.openBase(file)
       )
       try {
@@ -952,7 +1041,11 @@ export class SnapshotStorage {
         release()
         return false
       }
-      const base: Base = {key, group, source}
+      const stored = await this.store.get(key)
+      const base: Base = {
+        ...(stored?.info ?? {key, group, meta, createdAt: now(), size: sizeOf(source)}),
+        source
+      }
       const from = snapshot.base
       const files = filesOf(db.wasm)
       const file = `snapshots/${nextFile++}/${key}`
@@ -1020,7 +1113,9 @@ export class SnapshotStorage {
   }
 
   /**
-   * Delete the bases that are not the newest of their group. With locks
+   * Delete the bases that are not the newest of their group, and with
+   * `keepGroups`, every base of the groups past the newest `keepGroups`
+   * (ranked by their newest base). With locks
    * (OPFS), bases a database reads are kept; without, OPFS keeps the
    * newest two of each group, as a Worker may still read the other, and
    * IndexedDB, whose Blobs stay readable, keeps one. Empty bases are
@@ -1028,8 +1123,13 @@ export class SnapshotStorage {
    * are deleted, without, those older than an hour. Resolves to the keys
    * of the deleted bases.
    */
-  async cleanup(): Promise<Array<string>> {
+  async cleanup(options: CleanupOptions = {}): Promise<Array<string>> {
     const bases = await this.list()
+    const groups: Array<string> = []
+    for (const base of bases) {
+      if (base.size > 0 && !groups.includes(base.group)) groups.push(base.group)
+    }
+    const kept = new Set(groups.slice(0, options.keepGroups ?? Infinity))
     const seen = new Map<string, number>()
     const keep = this.locks || this.store.keepsRemoved ? 1 : 2
     const deleted: Array<string> = []
@@ -1037,7 +1137,7 @@ export class SnapshotStorage {
       if (base.size > 0) {
         const count = (seen.get(base.group) ?? 0) + 1
         seen.set(base.group, count)
-        if (count <= keep) continue
+        if (count <= keep && kept.has(base.group)) continue
       } else if (!this.locks && now() - base.createdAt < STALE_MS) {
         // Empty bases are being written, which locks them, or writing them
         // failed. Without locks, only the ones that are old have failed.

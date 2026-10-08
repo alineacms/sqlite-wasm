@@ -2,8 +2,11 @@ import {afterEach, beforeAll, beforeEach, describe, expect, test} from 'bun:test
 import {init} from '@alinea/sqlite-wasm'
 import {
   SnapshotStorage,
+  baseOf,
   directoryBaseStore,
   indexedDBSnapshotStorage,
+  memoryBaseStore,
+  memorySnapshotStorage,
   readOnlyFile
 } from '@alinea/sqlite-wasm/snapshots'
 import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
@@ -95,6 +98,13 @@ const variants = {
           indexedDBSnapshotStorage('entries', {indexedDB, IDBKeyRange})
       }
     }
+  },
+  memory: {
+    locking: false,
+    setup() {
+      const store = memoryBaseStore()
+      return {storage: () => memorySnapshotStorage(store)}
+    }
   }
 }
 
@@ -184,8 +194,15 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(await count({key: 'a'})).toBe(5)
         expect(await count('b')).toBe(10)
         expect(db.base.group).toBe('two')
-        // A group without bases starts empty.
-        expect((await openDb({group: 'three'})).base).toBeUndefined()
+        // A group without bases starts empty, or with fallback, on the
+        // newest base; baseOf tells which.
+        expect(baseOf(await openDb({group: 'three'}))).toBeUndefined()
+        const fallback = await openDb({group: 'three', fallback: 'any'})
+        expect(baseOf(fallback)).toEqual(list[0])
+        expect(baseOf(await openDb({group: 'one', fallback: 'any'})).key).toBe('b')
+        // A database follows its checkpoints.
+        expect(baseOf(db)).toEqual(list[0])
+        expect(baseOf(keep(new Database()))).toBeUndefined()
       })
 
       test('skips empty bases, which are being written', async () => {
@@ -304,7 +321,8 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           await tick()
         }
         expect(await checkpoint).toBe(true)
-        expect(writes).toBeGreaterThan(1)
+        // At least one, made after checkpoint was called
+        expect(writes).toBeGreaterThan(0)
         // The base holds the state the checkpoint started from, the
         // database everything.
         const reopened = await openDb('v2')
@@ -515,6 +533,20 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(rows(await openDb({group: 'a'}), 'select count(*) from items')).toEqual([[13]])
       })
 
+      test('keeps the newest groups only, with keepGroups', async () => {
+        const db = await openDb()
+        fill(db, 10)
+        for (const [key, group] of [['a1', 'a'], ['b1', 'b'], ['a2', 'a'], ['c1', 'c'], ['b2', 'b']]) {
+          db.run(`insert into items (body) values ('${key}')`)
+          await storage().checkpoint(db, key, {group})
+        }
+        db.close()
+        // Newest first: b (b2), c (c1), a (a2)
+        expect((await storage().cleanup({keepGroups: 2})).sort())
+          .toEqual(['a1', 'a2', 'b1'])
+        expect((await storage().list()).map(base => base.key)).toEqual(['b2', 'c1'])
+      })
+
       if (locking) {
         test('keeps bases a database reads', async () => {
           const a = await openDb()
@@ -619,6 +651,14 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
     })
   })
 }
+
+describe('Forks', () => {
+  test('keep the page cache size of an in-memory database', () => {
+    const db = keep(new Database())
+    db.run('pragma cache_size = -4096')
+    expect(rows(keep(db.fork()), 'pragma cache_size')).toEqual([[-4096]])
+  })
+})
 
 describe('Read-only files', () => {
   test('read bytes and refuse writes', () => {

@@ -27,7 +27,8 @@ Databases are stored copy-on-write, so `db.fork()` creates an independent copy
 without duplicating any data. The fork shares every page with its source and
 copies a page only when either side writes to it. It starts from the last
 committed state, cannot be created during a write transaction, and stays valid
-after the source is closed.
+after the source is closed. It has the page cache size (`PRAGMA cache_size`)
+of its source.
 
 ```ts
 const draft = db.fork()
@@ -235,10 +236,14 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   written; nothing is loaded into memory up front.
 - `storage.open(Database)` opens the newest base, `storage.open(Database,
   {group})` the newest of a group, and `storage.open(Database, key)` a
-  given one. Without a base to open, the database starts empty. Opening a
-  missing base fails with `SQLITE_CANTOPEN`, a base that is not a database
-  with `SQLITE_CORRUPT`. `await storage.list()` lists the bases, newest
-  first, with their `key`, `group`, `meta`, `createdAt` and `size`.
+  given one. With `{group, fallback: 'any'}`, a group without bases opens
+  the newest base of any group. Without a base to open, the database
+  starts empty. Opening a missing base fails with `SQLITE_CANTOPEN`, a
+  base that is not a database with `SQLITE_CORRUPT`. `await
+  storage.list()` lists the bases, newest first, with their `key`,
+  `group`, `meta`, `createdAt` and `size`, and `baseOf(db)` returns the
+  one a database reads (after a checkpoint, the one it wrote), or
+  `undefined`.
 - Changes are kept in memory until a checkpoint: commits since the last
   one are lost when the database closes or its Worker ends.
   `PRAGMA overlay_pages` tells how many pages a database holds in memory.
@@ -256,7 +261,8 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
 - `db.fork()` works as usual; a fork keeps reading the base it was forked
   on. `storage.checkpoint(fork, key)` writes a fork too.
 - `await storage.cleanup()` deletes every base that is not the newest of
-  its group, and resolves to their keys.
+  its group, and resolves to their keys. `cleanup({keepGroups: n})` also
+  deletes the bases of all but the `n` groups with the newest bases.
 - SQLite keeps up to 8 MB of the pages it read in its page cache
   (`PRAGMA cache_size` changes it).
 - `checkpoint` fails during a write transaction (`SQLITE_BUSY`), and for a
@@ -285,8 +291,16 @@ shared Web Lock on each base they read (also through forks), and cleanup
 keeps the bases a Worker reads. Checkpoints to one key lock it, so one
 Worker writes it. Without Web Locks (`{locks: null}`) cleanup keeps the
 newest two bases of each group, and bases still being written until they
-are an hour old; every browser with `createWritable()` has Web Locks. `new SnapshotStorage(directoryBaseStore(name, directory))` keeps
-files in any other `SnapshotDirectory`.
+are an hour old; every browser with `createWritable()` has Web Locks. `new
+SnapshotStorage(directoryBaseStore(name, directory))` keeps files in any
+other `SnapshotDirectory`.
+
+### Bases in memory
+
+`memorySnapshotStorage(store)` keeps bases as bytes in a
+`memoryBaseStore()`, for tests and for Node and Bun, which have neither
+OPFS nor `FileReaderSync`. Storages given the same store share its bases,
+as Workers share OPFS or IndexedDB.
 
 Both are tested in Chromium, Firefox and WebKit, in dedicated and shared
 Workers; `storage.supported()` tells if the APIs they need are there.
