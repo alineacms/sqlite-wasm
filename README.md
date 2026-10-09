@@ -119,7 +119,8 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   and saves of a session run one at a time, to its branch. `meta` is any
   data that survives structured cloning.
 - A save writes only the pages that changed, as a delta over the snapshot
-  the database reads (`parent` in its info), while that keeps at most 8
+  the database reads (`parent` in its info), while that snapshot is of the
+  same branch (so a branch never needs another's), and keeps at most 8
   deltas on a full snapshot, the new pages are at most half the database,
   and all those deltas together no more than the database; else it writes
   the whole database. In Chromium, saving 10 changed rows of a 47 MB database

@@ -2107,8 +2107,8 @@ export class Session<D extends Database = Database> {
 
 /**
  * What saving `snapshot` writes: its pages over the snapshot it reads, as
- * a delta while the deltas below it are few and small (see MAX_DEPTH),
- * else in full.
+ * a delta while that is of the same branch and the deltas below it are few
+ * and small (see MAX_DEPTH), else in full.
  */
 function newSnapshot(
   snapshot: Database,
@@ -2127,7 +2127,9 @@ function newSnapshot(
   // Pages past the end were truncated away.
   const pages = all.filter(([index]) => index * chunkSize < size)
   let delta: NewSnapshot['delta']
-  if (base && visible > 0) {
+  // Only over a snapshot of the same branch, so branches never need each
+  // other's snapshots, and retain() can drop a branch whole.
+  if (base && visible > 0 && base.branch === branch) {
     const bytes = pages.length * chunkSize
     const depth = base.depth + 1
     const chainBytes = base.chainBytes + bytes

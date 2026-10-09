@@ -991,6 +991,27 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(await store.remove('v1')).toBe(false)
       })
 
+      test('write in full over a snapshot of another branch', async () => {
+        const first = await storage().open(Database, {branch: 'a'})
+        register(first)
+        fill(first.db, 500)
+        await first.save({key: 'a1'})
+        await first.close()
+        const other = await storage().open(Database, {branch: 'b', choose: s => s[0]})
+        register(other)
+        expect(other.snapshot.branch).toBe('a')
+        other.db.run('delete from items where id = 1')
+        await other.save({key: 'b1'})
+        expect((await stored('b1')).delta).toBeUndefined()
+        // Then deltas within its own branch
+        other.db.run('delete from items where id = 2')
+        await other.save({key: 'b2'})
+        expect((await stored('b2')).info.parent).toBe('b1')
+        // Dropping branch a leaves b whole.
+        expect(await storage().retain({branches: 1})).toEqual(['a1'])
+        expect(rows(await openDb({branch: 'b'}), 'select count(*) from items')).toEqual([[498]])
+      })
+
       test('refuse a maxDepth past the deepest chain that opens', () => {
         expect(() => storage({maxDepth: 65})).toThrow(RangeError)
         expect(() => storage({maxDepth: Infinity})).toThrow(RangeError)
