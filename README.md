@@ -192,9 +192,12 @@ const session = await storage.open(Database, {
 
 `indexedDBSnapshots(name)` keeps each snapshot as a record of IndexedDB
 database `name`, with its key, branch, meta, time and size, and its content
-as a Blob: for a delta, its pages and their layout. A full save composes a
-new Blob from slices of the old snapshot and the changed pages, so the
-browser copies the old one itself; either is added in one transaction. Workers read Blobs synchronously with `FileReaderSync`. A
+as a Blob: for a delta, its pages and their layout. A full save reads the
+old snapshot into memory and adds the changed pages, so it briefly holds
+the whole database in memory (WebKit stores a Blob composed of slices of
+other IndexedDB Blobs wrongly once it is over about 32 MB); either is
+added in one transaction. Workers read Blobs synchronously with
+`FileReaderSync`. A
 Blob stays readable after its record is deleted, so `retain` needs no
 locks: it deletes old snapshots even while Workers read them. Pass
 `{indexedDB, IDBKeyRange}` to use another implementation, such as

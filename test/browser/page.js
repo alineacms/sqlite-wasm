@@ -199,6 +199,50 @@ for (const variant of ['opfs', 'indexeddb']) {
     }
 }
 
+// A full save over deltas keeps the pages it does not change from the
+// snapshots below: a Worker that opens it later reads all of it. (WebKit
+// stored such a Blob of over 32 MB wrongly in IndexedDB.)
+for (const variant of ['opfs', 'indexeddb']) {
+  tests[`a full save over deltas reads the same in another Worker (${variant})`] =
+    async () => {
+      const storage = 'full-over-delta'
+      const a = spawnShared()
+      await a.call('open', {variant, storage, pageSize: 65536})
+      await a.call('fill', {count: 40_000, size: 1000})
+      same((await a.call('checkpoint', {name: 'v0'})).written, true, 'v0 written')
+      // Each changes rows all over: once the deltas add up to the size of
+      // the database, the next is written in full.
+      for (let k = 1; k <= 5; k++) {
+        await a.call('run', {sql: `update items set n = n + 1 where id % 211 = ${k}`})
+        same((await a.call('checkpoint', {name: `v${k}`})).written, true, `v${k} written`)
+      }
+      const parents = new Map(
+        (await a.call('list')).map(({key, parent}) => [key, parent ?? null])
+      )
+      same(parents.get('v1'), 'v0', 'v1 is a delta')
+      const full = [...parents].filter(([key, parent]) => key !== 'v0' && parent === null)
+      assert(full.length > 0, 'a full save over deltas')
+      await a.call('close')
+      const b = spawnShared()
+      same((await b.call('open', {variant, storage})).base, 'v5', 'b opens v5')
+      same(
+        await b.call('rows', {
+          sql: "select count(*), sum(n), sum(length(body)) from items where substr(body, 1, length(id) + 1) = id || ' '"
+        }),
+        [[40_000, 5 * 190, 40_000_000]],
+        'rows'
+      )
+      for (const [key] of full) {
+        const c = spawnShared()
+        await c.call('open', {variant, storage, base: key})
+        const [[count, sum]] = await c.call('rows', {
+          sql: "select count(*), sum(n) from items where substr(body, 1, length(id) + 1) = id || ' '"
+        })
+        same([count, sum], [40_000, Number(key.slice(1)) * 190], key)
+      }
+    }
+}
+
 window.runTests = async () => {
   const results = []
   for (const [name, test] of Object.entries(tests)) {
