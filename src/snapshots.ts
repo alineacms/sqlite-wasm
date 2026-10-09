@@ -57,6 +57,12 @@ export interface ReadOnlyFileOptions {
   blockSize?: number
   /** How many blocks are kept (default: 4) */
   blocks?: number
+  /**
+   * Blocks to share with other files over the same content, which each
+   * keep track of their own reads
+   * @internal
+   */
+  cache?: Map<number, Uint8Array>
 }
 
 /**
@@ -91,7 +97,7 @@ export function readOnlyFile(
     const blockSize = options.blockSize ?? BLOCK_BYTES
     const capacity = options.blocks ?? CACHED_BLOCKS
     // Blocks by index, least recently used first
-    const cached = new Map<number, Uint8Array>()
+    const cached = options.cache ?? new Map<number, Uint8Array>()
     // Where the previous read ended
     let previousEnd = -1
     const readRange = (start: number, end: number) =>
@@ -166,7 +172,14 @@ export function openOverlay<T extends Database>(
 ): T {
   const file =
     base instanceof Uint8Array || base instanceof Blob ? readOnlyFile(base) : base
-  return openOn(Database, file, file.getSize(), 'Database', () => file.close())
+  let size: number
+  try {
+    size = file.getSize()
+  } catch (error) {
+    file.close()
+    throw error
+  }
+  return openOn(Database, file, size, 'Database', () => file.close())
 }
 
 /**
@@ -325,12 +338,18 @@ export interface SnapshotStore {
   /** Snapshot `key` and its content, which stays as it is, if it exists */
   get(key: string): Promise<StoredSnapshot | undefined>
   /**
-   * Write `base`, unless its key exists, and return its content, or
-   * undefined if the key exists. A new base appears in full at once.
+   * Write `snapshot`, unless its key exists, and return its content, or
+   * undefined if the key exists. A new snapshot appears in full at once. A
+   * delta fails with `SQLITE_CANTOPEN` if its parent does not exist: stores
+   * without locks check it in the same step as they add the delta.
    */
-  write(base: NewSnapshot): Promise<BaseSource | undefined>
-  /** Delete base `key`, if it exists. */
-  remove(key: string): Promise<void>
+  write(snapshot: NewSnapshot): Promise<BaseSource | undefined>
+  /**
+   * Delete snapshot `key`, if it exists, unless a snapshot lies over it
+   * (stores without locks check that in the same step as they delete it),
+   * or with `force`. Resolves to whether it deleted it.
+   */
+  remove(key: string, options?: {force?: boolean}): Promise<boolean>
 }
 
 // ------------------------------------------------------------------------
@@ -546,29 +565,15 @@ export function directorySnapshotStore(
       throw error
     }
   }
-  // Write `pages` of `snapshot` in runs of consecutive ones, page `i` at
-  // `position(i)`
+  // Write the pages of `snapshot`, page `i` at `position(i)`, in runs that
+  // are consecutive there
   async function writePages(
     writer: FileWriter,
     snapshot: NewSnapshot,
     position: (i: number) => number
   ) {
-    const {chunkSize, pages} = snapshot
-    const perWrite = Math.max(1, Math.floor(WRITE_BYTES / chunkSize))
-    for (let i = 0; i < pages.length; ) {
-      let end = i + 1
-      while (
-        end < pages.length &&
-        end - i < perWrite &&
-        position(end) === position(end - 1) + chunkSize
-      )
-        end++
-      const run = new Uint8Array((end - i) * chunkSize)
-      for (let k = i; k < end; k++)
-        run.set(snapshot.page(k), (k - i) * chunkSize)
-      await writer.write(run, position(i))
-      i = end
-    }
+    for (const [i, end] of pageRuns(snapshot.pages, snapshot.chunkSize, !snapshot.delta))
+      await writer.write(pageRun(snapshot, i, end), position(i))
   }
   return {
     name,
@@ -622,6 +627,14 @@ export function directorySnapshotStore(
           // A marker, so the file is never empty, then the pages in order
           await writer.write(DELTA_MARKER, 0)
           await writePages(writer, snapshot, i => DELTA_MARKER.length + i * chunkSize)
+          // Readers lock the parent, so this only matters without locks,
+          // where it narrows the window rather than closing it.
+          const parent = await directory.get(encodeKey(delta.parent))
+          if (!parent || sizeOf(parent) === 0)
+            throw new SQLiteError(
+              `Snapshot "${snapshot.key}" would lie over "${delta.parent}", which is missing`,
+              SQLITE_CANTOPEN
+            )
         } else {
           // The old content where no page replaces it, then the pages: the
           // old content is read only where it is needed.
@@ -629,11 +642,6 @@ export function directorySnapshotStore(
           const keep = async (end: number) => {
             const to = Math.min(end, visible, size)
             if (to > at) {
-              if (!snapshot.baseRange) {
-                const base = snapshot.base
-                if (!base || sizeOf(base) < to)
-                  throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
-              }
               await writer.write(baseRange(snapshot, at, to), at)
             }
             at = Math.max(at, end)
@@ -657,9 +665,13 @@ export function directorySnapshotStore(
         ? slice(written, DELTA_MARKER.length, sizeOf(written))
         : written
     },
-    async remove(key) {
+    async remove(key, options) {
+      if (!options?.force && (await this.list()).some(s => s.parent === key))
+        return false
+      const existed = (await directory.get(encodeKey(key))) !== undefined
       await directory.remove(encodeKey(key))
       await directory.remove(encodeKey(key) + META_SUFFIX)
+      return existed
     }
   }
 }
@@ -668,11 +680,13 @@ export function directorySnapshotStore(
 // IndexedDB
 // ------------------------------------------------------------------------
 
-// Version 1 stored groups; its bases are dropped (they are a cache).
-const IDB_VERSION = 2
+// Version 1 stored groups, version 2 had no parent index; their snapshots
+// are dropped (they are a cache).
+const IDB_VERSION = 3
 const BASES = 'bases'
 const BY_BRANCH = 'branch'
 const BY_TIME = 'createdAt'
+const BY_PARENT = 'parent'
 
 /** A snapshot as IndexedDB stores it. */
 interface BaseRecord extends SnapshotInfo {
@@ -810,6 +824,7 @@ export function indexedDBSnapshotStore(
         const store = idb.createObjectStore(BASES, {keyPath: 'key'})
         store.createIndex(BY_BRANCH, ['branch', 'createdAt'])
         store.createIndex(BY_TIME, 'createdAt')
+        store.createIndex(BY_PARENT, 'parent')
       }
       req.onsuccess = () => {
         const idb = req.result
@@ -871,7 +886,7 @@ export function indexedDBSnapshotStore(
     },
     async write(base) {
       if (await request((await store('readonly')).count(base.key))) return
-      const {chunkSize, visible, pages, delta} = base
+      const {key, chunkSize, visible, pages, delta} = base
       const blob = delta
         ? new Blob(
             [...pageRuns(pages, chunkSize, false)].map(
@@ -887,15 +902,44 @@ export function indexedDBSnapshotStore(
         size: base.size,
         blob
       }
-      if (delta) record.delta = {...delta, chunkSize, visible, pages}
+      if (delta) {
+        record.delta = {...delta, chunkSize, visible, pages}
+        record.parent = delta.parent
+      }
+      // In one transaction: add it unless another Worker added the key
+      // meanwhile, and for a delta only while its parent exists, which
+      // remove() checks the other way around.
       const bases = await store('readwrite')
+      const tx = bases.transaction
+      const done = completion(tx)
+      let exists = false
+      let missing = false
+      const add = () => {
+        const count = bases.count(key)
+        count.onsuccess = () => {
+          if (count.result > 0) exists = true
+          else bases.add(record)
+        }
+      }
+      if (delta) {
+        const parent = bases.count(delta.parent)
+        parent.onsuccess = () => {
+          if (parent.result > 0) return add()
+          missing = true
+          tx.abort()
+        }
+      } else add()
       try {
-        // add() fails if another Worker added the key meanwhile.
-        await Promise.all([request(bases.add(record)), completion(bases.transaction)])
+        await done
       } catch (error) {
-        if ((error as DOMException)?.name === 'ConstraintError') return
+        if (missing)
+          throw new SQLiteError(
+            `Snapshot "${key}" would lie over "${delta!.parent}", which is missing`,
+            SQLITE_CANTOPEN
+          )
         throw error
       }
+      if (exists) return undefined
       // Read what was stored, which IndexedDB keeps on disk; the composed
       // Blob holds the same, if the record was deleted already.
       const stored = await request<BaseRecord | undefined>(
@@ -903,9 +947,22 @@ export function indexedDBSnapshotStore(
       )
       return stored?.blob ?? blob
     },
-    async remove(key) {
+    async remove(key, options) {
+      // In one transaction: delete it unless a snapshot lies over it.
       const bases = await store('readwrite')
-      await Promise.all([request(bases.delete(key)), completion(bases.transaction)])
+      const done = completion(bases.transaction)
+      let deleted = false
+      const lying = bases.index(BY_PARENT).count(key)
+      lying.onsuccess = () => {
+        if (lying.result > 0 && !options?.force) return
+        const exists = bases.count(key)
+        exists.onsuccess = () => {
+          deleted = exists.result > 0
+          if (deleted) bases.delete(key)
+        }
+      }
+      await done
+      return deleted
     }
   }
 }
@@ -946,6 +1003,14 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
     async write(snapshot) {
       if (bases.has(snapshot.key)) return undefined
       const {chunkSize, visible, size, pages, delta} = snapshot
+      const missing = () => {
+        if (delta && !bases.has(delta.parent))
+          throw new SQLiteError(
+            `Snapshot "${snapshot.key}" would lie over "${delta.parent}", which is missing`,
+            SQLITE_CANTOPEN
+          )
+      }
+      missing()
       let data: Uint8Array
       if (delta) {
         data = new Uint8Array(pages.length * chunkSize)
@@ -969,6 +1034,7 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
         })
       }
       if (bases.has(snapshot.key)) return undefined
+      missing()
       // Times that differ, also within a millisecond
       const createdAt = (last = Math.max(now(), last + 0.001))
       const {key, branch, meta} = snapshot
@@ -981,8 +1047,10 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
       })
       return data
     },
-    async remove(key) {
-      bases.delete(key)
+    async remove(key, options) {
+      if (!options?.force && [...bases.values()].some(b => b.delta?.parent === key))
+        return false
+      return bases.delete(key)
     }
   }
 }
@@ -1131,18 +1199,17 @@ function* runs(delta: DeltaLayout, start: number, end: number): Generator<Run> {
   }
 }
 
-/** Files of layers, so files over the same ones share their block caches */
-const layerFiles = new WeakMap<Layer, SyncFile>()
+/**
+ * Blocks read from the content of layers: files over the same layer share
+ * them, and each keeps track of its own reads
+ */
+const layerCaches = new WeakMap<Layer, Map<number, Uint8Array>>()
 
 /** A read-only file of the database a layer holds */
 function layerFile(layer: Layer): SyncFile {
-  let file = layerFiles.get(layer)
-  if (!file) layerFiles.set(layer, (file = createLayerFile(layer)))
-  return file
-}
-
-function createLayerFile(layer: Layer): SyncFile {
-  const own = readOnlyFile(layer.source)
+  let cache = layerCaches.get(layer)
+  if (!cache) layerCaches.set(layer, (cache = new Map()))
+  const own = readOnlyFile(layer.source, {cache})
   const {delta, below} = layer
   if (!delta || !below) return own
   const under = layerFile(below)
@@ -1179,11 +1246,13 @@ function layerContent(
   end = layer.info.size
 ): BaseSource {
   if (!layer.delta && start === 0 && end === sizeOf(layer.source)) return layer.source
+  if (end > layer.info.size)
+    throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
   const parts: Array<BaseSource> = []
   const add = (source: BaseSource, start: number, end: number) => {
-    const stored = Math.min(end, sizeOf(source))
-    if (stored > start) parts.push(slice(source, start, stored))
-    if (end > Math.max(start, stored)) parts.push(new Uint8Array(end - Math.max(start, stored)))
+    if (sizeOf(source) < end)
+      throw new SQLiteError('Snapshot is too short', SQLITE_IOERR_READ)
+    if (end > start) parts.push(slice(source, start, end))
   }
   const collect = (layer: Layer, start: number, end: number) => {
     const {delta, below} = layer
@@ -1329,18 +1398,26 @@ function equal(a: Uint8Array, b: Uint8Array) {
   return true
 }
 
-/** If `source` holds exactly what writing `snapshot` would write. */
-async function holds(source: BaseSource, snapshot: NewSnapshot) {
-  const {size, visible, chunkSize, pages} = snapshot
-  if (size === 0 || sizeOf(source) !== size) return false
+/**
+ * If the database of `size` bytes that `range` reads holds exactly what
+ * writing `snapshot` would write.
+ */
+async function holds(
+  range: (start: number, end: number) => BaseSource,
+  size: number,
+  snapshot: NewSnapshot
+) {
+  const {visible, chunkSize, pages} = snapshot
+  if (size === 0 || size !== snapshot.size) return false
+  const hasBase = snapshot.baseRange !== undefined || snapshot.base !== undefined
   const step = Math.max(1, Math.floor(WRITE_BYTES / chunkSize)) * chunkSize
   let i = 0
   for (let at = 0; at < size; at += step) {
     const end = Math.min(at + step, size)
-    const actual = await read(source, at, end)
+    const actual = await bytesOf(range(at, end))
     const expected = new Uint8Array(end - at)
-    if (snapshot.base && at < visible)
-      expected.set(await read(snapshot.base, at, Math.min(end, visible)))
+    if (hasBase && at < visible)
+      expected.set(await bytesOf(baseRange(snapshot, at, Math.min(end, visible))))
     // Pages are views of Wasm memory: take them after the last await.
     for (; i < pages.length && pages[i] * chunkSize < end; i++) {
       const start = pages[i] * chunkSize
@@ -1349,6 +1426,10 @@ async function holds(source: BaseSource, snapshot: NewSnapshot) {
     if (!equal(actual, expected)) return false
   }
   return true
+}
+
+async function bytesOf(source: BaseSource): Promise<Uint8Array> {
+  return source instanceof Uint8Array ? source : new Uint8Array(await source.arrayBuffer())
 }
 
 /**
@@ -1361,12 +1442,16 @@ function sameDelta(
   current: Base | undefined,
   snapshot: NewSnapshot
 ): Promise<boolean> | undefined {
-  const {delta, source} = layer
+  const {delta, source, below} = layer
   const {pages, chunkSize, visible, size} = snapshot
   if (
     !delta ||
     !current ||
+    !below ||
     delta.parent !== current.key ||
+    // The same snapshot, not one stored again under its key
+    below.info.createdAt !== current.createdAt ||
+    below.info.size !== current.size ||
     delta.chunkSize !== chunkSize ||
     delta.visible !== visible ||
     layer.info.size !== size ||
@@ -1527,7 +1612,7 @@ export class SnapshotStorage {
         found.push(stored)
         if (!stored.delta) break
         at = stored.delta.parent
-        if (found.length > MAX_CHAIN + 1)
+        if (found.length > MAX_CHAIN)
           throw new SQLiteError(`Snapshot "${key}" lies over too many`, SQLITE_CORRUPT)
       }
       let layer: Layer | undefined
@@ -1596,9 +1681,9 @@ export class SnapshotStorage {
       choose ??
       ((snapshots: Array<SnapshotInfo>) =>
         branch === undefined ? snapshots[0] : snapshots.find(s => s.branch === branch))
+    const listed = (await this.list()).filter(s => s.size > 0)
     for (;;) {
-      const readable = (await this.list()).filter(s => s.size > 0 && !unreadable.has(s.key))
-      const chosen = pick(readable)
+      const chosen = pick(listed.filter(s => !unreadable.has(s.key)))
       if (!chosen) return session(new Database())
       if (unreadable.has(chosen.key)) return session(new Database())
       const db = await attempt(chosen)
@@ -1650,13 +1735,18 @@ export class SnapshotStorage {
     let registered = false
     try {
       const content = newSnapshot(snapshot, key, branch, meta, this.maxDepth)
-      // Without locks, retain() elsewhere may have deleted the snapshot a
-      // delta would lie over: then write in full.
-      if (content.delta && !this.locks) {
-        const parent = await this.store.get(content.delta.parent).catch(() => undefined)
-        if (!parent || parent.info.size === 0) content.delta = undefined
+      const store = () => this.exclusive(key, () => this.store.write(content))
+      let written: BaseSource | undefined
+      try {
+        written = await store()
+      } catch (error) {
+        // retain() elsewhere deleted the snapshot the delta would lie
+        // over: write in full.
+        if (!content.delta || (error as SQLiteError)?.resultCode !== SQLITE_CANTOPEN)
+          throw error
+        content.delta = undefined
+        written = await store()
       }
-      const written = await this.exclusive(key, () => this.store.write(content))
       let target: Base
       if (written) {
         const from = snapshot.base as Base | undefined
@@ -1751,7 +1841,13 @@ export class SnapshotStorage {
       release = found.release
       const same = sameDelta(found.base.layer, current, content)
       const equal =
-        same === undefined ? await holds(found.base.content(), content) : await same
+        same === undefined
+          ? await holds(
+              (start, end) => found.base.content(start, end),
+              found.base.size,
+              content
+            )
+          : await same
       if (!equal) {
         release()
         return {status: 'mismatch', info: infoOf(found.base)}
@@ -1813,8 +1909,7 @@ export class SnapshotStorage {
     for (const snapshot of all) {
       if (keys.has(snapshot.key)) continue
       if (!this.locks) {
-        await this.store.remove(snapshot.key)
-        deleted.push(snapshot.key)
+        if (await this.store.remove(snapshot.key)) deleted.push(snapshot.key)
         continue
       }
       await this.locks.request(
@@ -1822,8 +1917,7 @@ export class SnapshotStorage {
         {mode: 'exclusive', ifAvailable: true},
         async lock => {
           if (!lock) return
-          await this.store.remove(snapshot.key)
-          deleted.push(snapshot.key)
+          if (await this.store.remove(snapshot.key)) deleted.push(snapshot.key)
         }
       )
     }

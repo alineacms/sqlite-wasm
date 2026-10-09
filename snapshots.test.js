@@ -921,7 +921,8 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         await session.save({key: 'v1'})
         session.db.run('delete from items where id = 1')
         await session.save({key: 'v2'})
-        await storage().store.remove('v1')
+        expect(await storage().store.remove('v1')).toBe(false)
+        expect(await storage().store.remove('v1', {force: true})).toBe(true)
         await expect(storage().open(Database, {key: 'v2'}))
           .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
         // The session read v2 before: it keeps working.
@@ -942,7 +943,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         session.db.run('delete from items where id >= 10')
         await session.save({key: 'v2'})
         expect((await stored('v2')).info.parent).toBe('v1')
-        await storage().store.remove('v1')
+        await storage().store.remove('v1', {force: true})
         // v2 cannot be read, v1 is gone: v0 opens.
         const db = await openDb({branch: 'b'})
         expect(snapshotOf(db).key).toBe('v0')
@@ -961,20 +962,34 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
       })
 
-      if (!locking) {
-        test('write in full when the snapshot below was deleted meanwhile', async () => {
-          const session = await storage().open(Database)
-          register(session)
-          fill(session.db, 500)
-          await session.save({key: 'v1'})
-          session.db.run('delete from items where id = 1')
-          // As retain() in another Worker would, while this one reads v1
-          await storage().store.remove('v1')
-          await session.save({key: 'v2'})
-          expect((await stored('v2')).delta).toBeUndefined()
-          expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[499]])
-        })
-      }
+      test('write in full when the snapshot below was deleted meanwhile', async () => {
+        const session = await storage().open(Database)
+        register(session)
+        fill(session.db, 500)
+        await session.save({key: 'v1'})
+        session.db.run('delete from items where id = 1')
+        // As retain() in another Worker without locks would, while this
+        // one reads v1
+        expect(await storage().store.remove('v1')).toBe(true)
+        await session.save({key: 'v2'})
+        expect((await stored('v2')).delta).toBeUndefined()
+        expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[499]])
+      })
+
+      test('refuse to delete a snapshot another lies over', async () => {
+        const session = await storage().open(Database)
+        register(session)
+        fill(session.db, 500)
+        await session.save({key: 'v1'})
+        session.db.run('delete from items where id = 1')
+        await session.save({key: 'v2'})
+        await session.close()
+        const store = storage().store
+        expect(await store.remove('v1')).toBe(false)
+        expect(await store.remove('v2')).toBe(true)
+        expect(await store.remove('v1')).toBe(true)
+        expect(await store.remove('v1')).toBe(false)
+      })
 
       test('refuse a maxDepth past the deepest chain that opens', () => {
         expect(() => storage({maxDepth: 65})).toThrow(RangeError)
@@ -1423,6 +1438,30 @@ describe('Read-only files', () => {
     for (let at = 0; at < 10_000; at += 256) check(at, 256)
     expect(slices.slice(1).every(length => length === 1024 || length === 784)).toBe(true)
     expect(slices.length).toBeLessThanOrEqual(11)
+  })
+
+  test('share blocks between files, each reading ahead on its own', () => {
+    const slices = []
+    class CountingBlob extends Blob {
+      slice(start, end) {
+        slices.push(end - start)
+        return super.slice(start, end)
+      }
+    }
+    const blob = new CountingBlob([new Uint8Array(10_000)])
+    const cache = new Map()
+    const a = readOnlyFile(blob, {blockSize: 1024, cache})
+    const b = readOnlyFile(blob, {blockSize: 1024, cache})
+    // Interleaved scans: each sees its own reads run forward.
+    for (let at = 0; at < 2048; at += 128) {
+      a.read(new Uint8Array(128), {at})
+      b.read(new Uint8Array(128), {at: at + 4096})
+    }
+    expect(slices.filter(length => length === 1024).length).toBe(4)
+    // b reads the blocks a read from the cache.
+    slices.length = 0
+    b.read(new Uint8Array(128), {at: 512})
+    expect(slices).toEqual([])
   })
 
   test('read only what is asked without cached blocks', () => {

@@ -125,6 +125,22 @@ describe('Overlays of files', () => {
     expect(counts.closed).toBe(1)
   })
 
+  test('close a file whose size cannot be read', () => {
+    let closed = 0
+    const file = {
+      read: () => 0,
+      getSize() {
+        throw new Error('gone')
+      },
+      write() {},
+      truncate() {},
+      flush() {},
+      close: () => closed++
+    }
+    expect(() => openOverlay(Database, file)).toThrow('gone')
+    expect(closed).toBe(1)
+  })
+
   test('open bytes and Blobs too', () => {
     const bytes = readFileSync(databaseFile(50))
     const db = keep(openOverlay(Database, new Uint8Array(bytes)))

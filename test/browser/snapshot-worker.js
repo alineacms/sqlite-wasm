@@ -183,7 +183,7 @@ const actions = {
   // Delete the stored base this database reads (as cleanup would without
   // locks), then read every page of it from a fresh fork.
   async benchDeletedRead() {
-    await storage.store.remove(db.base.key)
+    await storage.store.remove(db.base.key, {force: true})
     const fork = db.fork()
     try {
       const [[count, length]] = fork.exec(QUERIES.full[0])[0].values
