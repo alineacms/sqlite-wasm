@@ -728,10 +728,12 @@ function now() {
 }
 
 /**
- * The content of `base` as one Blob: slices of the old base and copies of
- * the pages, composed by the browser without copying the old base.
+ * The content of `base` as one Blob, of the old base and copies of the
+ * pages. The old base is read into memory: WebKit stores a Blob with parts
+ * of Blobs read from IndexedDB wrongly, as other Workers read some of those
+ * parts from the wrong offsets.
  */
-function composeBlob(base: NewSnapshot): Blob {
+async function composeBlob(base: NewSnapshot): Promise<Blob> {
   const parts: Array<BlobPart> = []
   let at = 0
   // The old base up to `end`, and zeros past what is visible of it.
@@ -753,7 +755,11 @@ function composeBlob(base: NewSnapshot): Blob {
     at = start + length
   }
   fill(size)
-  return new Blob(parts)
+  return new Blob(
+    await Promise.all(
+      parts.map(part => (part instanceof Blob ? part.arrayBuffer() : part))
+    )
+  )
 }
 
 /** Bytes `start` to `end` of the content `snapshot` writes its pages over */
@@ -800,9 +806,9 @@ function pageRun(snapshot: NewSnapshot, i: number, end: number): Uint8Array {
 /**
  * Bases as Blobs in IndexedDB database `name`: one record per base with its
  * key, branch, meta, time and size, indexed by branch and time. Writing one
- * composes a Blob of slices of the old base and the changed pages, and adds
- * it in one transaction. A Blob that was read stays readable after its
- * record is deleted, so this store needs no locks.
+ * adds a Blob of the changed pages (a delta), or of the old base and the
+ * changed pages, in one transaction. A Blob that was read stays readable
+ * after its record is deleted, so this store needs no locks.
  */
 export function indexedDBSnapshotStore(
   name: string,
@@ -893,7 +899,7 @@ export function indexedDBSnapshotStore(
               ([i, end]) => pageRun(base, i, end) as Uint8Array<ArrayBuffer>
             )
           )
-        : composeBlob(base)
+        : await composeBlob(base)
       const record: BaseRecord = {
         key: base.key,
         branch: base.branch,
