@@ -493,6 +493,16 @@ into `dist/native`. `bun run build:native` rebuilds only that, and
 tests the extension on every supported platform, and releases publish all
 of the binaries.
 
+CI also publishes the package of every commit to main and every pull
+request to [pkg.pr.new](https://pkg.pr.new), with all native binaries and
+version `0.0.0-preview-<sha>`, so a fix can be used before it is released:
+
+```sh
+bun add https://pkg.pr.new/@alinea/sqlite-wasm@<sha>
+```
+
+Pull requests get a comment with the URL of their latest commit.
+
 The toolchain is pinned in the devcontainer and package manifest. The build
 stores databases in the copy-on-write overlay VFS (`src/overlay.c`), and
 files only through a small VFS answered by JavaScript (`src/jsvfs.c`), so it

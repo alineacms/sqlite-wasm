@@ -39,3 +39,7 @@ jobs:
       # The same packaging steps as the release, without publishing.
       - name: Collect native binaries
         uses: ./.github/actions/collect-native
+      # Publish the package of every commit to pkg.pr.new (not npm), as
+      # 0.0.0-preview-<sha> so it never stands in for a release.
+      - name: Publish preview package
+        run: bun run pkg-pr-new publish --previewVersion --commentWithSha --packageManager=bun,npm
