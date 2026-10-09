@@ -73,6 +73,8 @@ const actions = {
     return {written: status === 'written', status, ms: performance.now() - start}
   },
   cleanup: () => storage.retain(),
+  // Delete snapshot `key`, as cleanup in a Worker without locks would
+  remove: ({key}) => storage.store.remove(key),
   list: () => storage.list(),
   // Read every row of the base, and change some, `rounds` times with a
   // pause in between, checking each time that what was read adds up.

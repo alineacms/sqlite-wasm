@@ -243,6 +243,38 @@ for (const variant of ['opfs', 'indexeddb']) {
     }
 }
 
+// A delta only lies over the snapshot it was written over: once another
+// Worker wrote the parent's key anew, with the same rows in other pages,
+// the save is written in full.
+tests['a save over a snapshot written anew is written in full (indexeddb)'] =
+  async () => {
+    const storage = 'written-anew'
+    const variant = 'indexeddb'
+    const a = spawnShared()
+    await a.call('open', {variant, storage})
+    await a.call('fill', {count: 2000, size: 1000})
+    same((await a.call('checkpoint', {name: 'k1'})).written, true, 'a k1')
+    same(await a.call('remove', {key: 'k1'}), true, 'k1 removed')
+    const b = spawnShared()
+    same((await b.call('open', {variant, storage})).base, null, 'b starts empty')
+    await b.call('fill', {count: 1000, size: 1000, from: 1000})
+    await b.call('fill', {count: 1000, size: 1000})
+    same((await b.call('checkpoint', {name: 'k1'})).written, true, 'b k1')
+    await a.call('run', {sql: 'update items set n = 1 where id < 5'})
+    same((await a.call('checkpoint', {name: 'k2'})).written, true, 'a k2')
+    const parents = new Map(
+      (await a.call('list')).map(({key, parent}) => [key, parent ?? null])
+    )
+    same(parents.get('k2'), null, 'k2 is full')
+    const c = spawnShared()
+    await c.call('open', {variant, storage, base: 'k2'})
+    same(
+      await c.call('rows', {sql: 'select count(*), sum(n), sum(length(body)) from items'}),
+      [[2000, 5, 2_000_000]],
+      'c reads k2'
+    )
+  }
+
 window.runTests = async () => {
   const results = []
   for (const [name, test] of Object.entries(tests)) {

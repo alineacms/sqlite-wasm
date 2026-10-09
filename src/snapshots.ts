@@ -248,7 +248,10 @@ export interface SnapshotInfo {
   /** A line of snapshots; retain keeps the newest (the head) */
   branch: string
   meta: SnapshotMeta
-  /** When it was written, in milliseconds since 1970 */
+  /**
+   * When it was written, in milliseconds since 1970: with the key, it tells
+   * this snapshot from one written under the same key after it was deleted
+   */
   createdAt: number
   /** Of the database, in bytes; 0 while it is written, or if writing failed */
   size: number
@@ -267,6 +270,11 @@ export interface SnapshotInfo {
  */
 export interface DeltaLayout {
   parent: string
+  /**
+   * The `createdAt` of the parent it was written over: one written under
+   * the key later holds other bytes, and does not count as its parent
+   */
+  parentCreatedAt: number
   chunkSize: number
   visible: number
   /** Ascending */
@@ -338,12 +346,13 @@ export interface SnapshotStore {
   /** Snapshot `key` and its content, which stays as it is, if it exists */
   get(key: string): Promise<StoredSnapshot | undefined>
   /**
-   * Write `snapshot`, unless its key exists, and return its content, or
+   * Write `snapshot`, unless its key exists, and return it as stored, or
    * undefined if the key exists. A new snapshot appears in full at once. A
-   * delta fails with `SQLITE_CANTOPEN` if its parent does not exist: stores
-   * without locks check it in the same step as they add the delta.
+   * delta fails with `SQLITE_CANTOPEN` if its parent does not exist or has
+   * another `createdAt` than `delta.parentCreatedAt`: stores without locks
+   * check it in the same step as they add the delta.
    */
-  write(snapshot: NewSnapshot): Promise<BaseSource | undefined>
+  write(snapshot: NewSnapshot): Promise<StoredSnapshot | undefined>
   /**
    * Delete snapshot `key`, if it exists, unless a snapshot lies over it
    * (stores without locks check that in the same step as they delete it),
@@ -611,12 +620,13 @@ export function directorySnapshotStore(
       // The empty snapshot file appears first, so the metadata is never
       // left without one.
       const writer = await directory.create(file)
+      const createdAt = now()
       try {
         const {chunkSize, pages, visible, size, delta} = snapshot
         const meta = JSON.stringify({
           branch: snapshot.branch,
           meta: snapshot.meta,
-          createdAt: now(),
+          createdAt,
           ...(delta && {
             size,
             delta: {...delta, chunkSize, visible, pages} satisfies DeltaLayout
@@ -629,8 +639,11 @@ export function directorySnapshotStore(
           await writePages(writer, snapshot, i => DELTA_MARKER.length + i * chunkSize)
           // Readers lock the parent, so this only matters without locks,
           // where it narrows the window rather than closing it.
-          const parent = await directory.get(encodeKey(delta.parent))
-          if (!parent || sizeOf(parent) === 0)
+          const parent = await this.get(delta.parent)
+          if (
+            !parent?.info.size ||
+            parent.info.createdAt !== delta.parentCreatedAt
+          )
             throw new SQLiteError(
               `Snapshot "${snapshot.key}" would lie over "${delta.parent}", which is missing`,
               SQLITE_CANTOPEN
@@ -661,9 +674,14 @@ export function directorySnapshotStore(
         throw error
       }
       const written = await directory.get(file)
-      return written && snapshot.delta
-        ? slice(written, DELTA_MARKER.length, sizeOf(written))
-        : written
+      if (!written) return undefined
+      return storedAs(
+        snapshot,
+        createdAt,
+        snapshot.delta
+          ? slice(written, DELTA_MARKER.length, sizeOf(written))
+          : written
+      )
     },
     async remove(key, options) {
       if (!options?.force && (await this.list()).some(s => s.parent === key))
@@ -767,6 +785,19 @@ function baseRange(snapshot: NewSnapshot, start: number, end: number): BaseSourc
   return snapshot.baseRange
     ? snapshot.baseRange(start, end)
     : slice(snapshot.base!, start, end)
+}
+
+/** `snapshot` as a store wrote it at `createdAt`, with content `source` */
+function storedAs(
+  snapshot: NewSnapshot,
+  createdAt: number,
+  source: BaseSource
+): StoredSnapshot {
+  const {key, branch, meta, size, chunkSize, visible, pages, delta} = snapshot
+  const info: SnapshotInfo = {key, branch, meta, createdAt, size}
+  if (!delta) return {info, source}
+  info.parent = delta.parent
+  return {info, source, delta: {...delta, chunkSize, visible, pages}}
 }
 
 /**
@@ -914,7 +945,8 @@ export function indexedDBSnapshotStore(
       }
       // In one transaction: add it unless another Worker added the key
       // meanwhile, and for a delta only while its parent exists, which
-      // remove() checks the other way around.
+      // remove() checks the other way around, and is the one it was
+      // written over, not one written under its key after it was deleted.
       const bases = await store('readwrite')
       const tx = bases.transaction
       const done = completion(tx)
@@ -928,9 +960,10 @@ export function indexedDBSnapshotStore(
         }
       }
       if (delta) {
-        const parent = bases.count(delta.parent)
+        const parent = bases.get(delta.parent)
         parent.onsuccess = () => {
-          if (parent.result > 0) return add()
+          const found = parent.result as BaseRecord | undefined
+          if (found?.createdAt === delta.parentCreatedAt) return add()
           missing = true
           tx.abort()
         }
@@ -947,11 +980,12 @@ export function indexedDBSnapshotStore(
       }
       if (exists) return undefined
       // Read what was stored, which IndexedDB keeps on disk; the composed
-      // Blob holds the same, if the record was deleted already.
+      // Blob holds the same, if the record was deleted (or replaced) already.
       const stored = await request<BaseRecord | undefined>(
         (await store('readonly')).get(base.key)
       )
-      return stored?.blob ?? blob
+      const same = stored?.createdAt === record.createdAt
+      return storedAs(base, record.createdAt, same ? stored.blob : blob)
     },
     async remove(key, options) {
       // In one transaction: delete it unless a snapshot lies over it.
@@ -1010,7 +1044,8 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
       if (bases.has(snapshot.key)) return undefined
       const {chunkSize, visible, size, pages, delta} = snapshot
       const missing = () => {
-        if (delta && !bases.has(delta.parent))
+        if (!delta) return
+        if (bases.get(delta.parent)?.info.createdAt !== delta.parentCreatedAt)
           throw new SQLiteError(
             `Snapshot "${snapshot.key}" would lie over "${delta.parent}", which is missing`,
             SQLITE_CANTOPEN
@@ -1043,15 +1078,9 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
       missing()
       // Times that differ, also within a millisecond
       const createdAt = (last = Math.max(now(), last + 0.001))
-      const {key, branch, meta} = snapshot
-      const info: SnapshotInfo = {key, branch, meta, createdAt, size}
-      if (delta) info.parent = delta.parent
-      bases.set(key, {
-        info: copy(info),
-        data,
-        delta: delta && {...delta, chunkSize, visible, pages}
-      })
-      return data
+      const {info, source, delta: layout} = storedAs(snapshot, createdAt, data)
+      bases.set(snapshot.key, {info: copy(info), data, delta: layout})
+      return {info: copy(info), source, delta: layout}
     },
     async remove(key, options) {
       if (!options?.force && [...bases.values()].some(b => b.delta?.parent === key))
@@ -1292,7 +1321,8 @@ export interface OpenOptions {
    * The snapshot to open, out of the readable ones, newest first, or
    * undefined to start empty. Default: the head (newest) of `branch`, or
    * of all without one. Called again without a snapshot that turns out
-   * unreadable (deleted meanwhile, or lying over a missing one).
+   * unreadable (deleted meanwhile, or lying over a missing one or one
+   * written anew under its key).
    */
   choose?: (snapshots: Array<SnapshotInfo>) => SnapshotInfo | undefined
   /** Open this snapshot, and fail if it cannot be read */
@@ -1591,7 +1621,7 @@ export class SnapshotStorage {
    * Snapshot `key` with the snapshots it lies over, holding them (see
    * `hold`) until the returned function is called; undefined if `key` does
    * not exist or is being written. Fails with `SQLITE_CANTOPEN` if one it
-   * lies over is missing.
+   * lies over is missing, or is not the one it was written over.
    */
   private async resolve(
     key: string
@@ -1605,7 +1635,12 @@ export class SnapshotStorage {
       for (let at = key; ; ) {
         releases.push(await this.hold(at))
         const stored = await this.store.get(at)
-        if (!stored || stored.info.size === 0) {
+        const above = found.at(-1)?.delta
+        if (
+          !stored ||
+          stored.info.size === 0 ||
+          (above && stored.info.createdAt !== above.parentCreatedAt)
+        ) {
           if (at === key) {
             release()
             return undefined
@@ -1742,12 +1777,13 @@ export class SnapshotStorage {
     try {
       const content = newSnapshot(snapshot, key, branch, meta, this.maxDepth)
       const store = () => this.exclusive(key, () => this.store.write(content))
-      let written: BaseSource | undefined
+      let written: StoredSnapshot | undefined
       try {
         written = await store()
       } catch (error) {
         // retain() elsewhere deleted the snapshot the delta would lie
-        // over: write in full.
+        // over (and another Worker may have written its key anew): write
+        // in full.
         if (!content.delta || (error as SQLiteError)?.resultCode !== SQLITE_CANTOPEN)
           throw error
         content.delta = undefined
@@ -1756,20 +1792,8 @@ export class SnapshotStorage {
       let target: Base
       if (written) {
         const from = snapshot.base as Base | undefined
-        const {chunkSize, visible, pages, delta} = content
-        const layout = delta && {...delta, chunkSize, visible, pages}
-        // Only for its time: the fallback is close enough if reading fails.
-        const stored = await this.store.get(key).catch(() => undefined)
-        const info: SnapshotInfo = stored?.info ?? {
-          key,
-          branch,
-          meta,
-          createdAt: now(),
-          size: content.size,
-          ...(delta && {parent: delta.parent})
-        }
-        target = baseOf({info, source: written, delta: layout, below: layout && from?.layer})
-        if (layout && from) {
+        target = baseOf({...written, below: written.delta && from?.layer})
+        if (written.delta && from) {
           // The new snapshot needs the ones it lies over.
           const below = await this.holdAll(from.keys)
           release = once(() => {
@@ -2140,7 +2164,12 @@ function newSnapshot(
     const depth = base.depth + 1
     const chainBytes = base.chainBytes + bytes
     if (depth <= maxDepth && bytes * 2 <= size && chainBytes <= size)
-      delta = {parent: base.key, depth, chainBytes}
+      delta = {
+        parent: base.key,
+        parentCreatedAt: base.createdAt,
+        depth,
+        chainBytes
+      }
   }
   // Composed once, when a store reads it, and only for this save
   let content: BaseSource | undefined

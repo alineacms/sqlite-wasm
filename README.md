@@ -97,10 +97,11 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   ```
 
   A snapshot that turns out unreadable (deleted meanwhile, or lying over a
-  missing one) is left out and `choose` asked again. Without a snapshot to
-  open, the database starts empty. `{key}` opens a given snapshot, and
-  fails with `SQLITE_CANTOPEN` if it cannot be read; a snapshot that is not
-  a database fails with `SQLITE_CORRUPT`.
+  missing one or one written anew under its key) is left out and `choose`
+  asked again. Without a snapshot to open, the database starts empty.
+  `{key}` opens a given snapshot, and fails with `SQLITE_CANTOPEN` if it
+  cannot be read; a snapshot that is not a database fails with
+  `SQLITE_CORRUPT`.
 - The session has the database as `session.db`, the snapshot it reads (after
   a save, the one it wrote or joined) as `session.snapshot`, the branch it
   saves to as `session.branch`, and the bytes of changed pages it holds in
@@ -127,13 +128,17 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   takes 12–27 ms instead of 120–210 ms (see [BENCHMARKS.md](BENCHMARKS.md)). Reads look
   through the deltas to the full snapshot below. `opfsSnapshots(name,
   {maxDepth})` changes how many deltas may lie on one; `0` writes every
-  snapshot in full.
+  snapshot in full. A delta lies over exactly the snapshot it was saved
+  over: should that be deleted and its key written anew meanwhile, the save
+  writes in full, and a delta over a key written anew does not open (nor do
+  deltas saved by 0.8.0, which did not record which snapshot they lie over).
 - Key snapshots by their content, such as a content hash: a key that exists
-  is not written again. The result's `status` tells what happened:
-  `'written'`, a new snapshot; `'joined'`, the key holds the committed state
-  of the database byte for byte, so it reads that snapshot from then on as
-  if it had written it; `'mismatch'`, the key holds other content, and the
-  database stays as it is. Bytes only match when the same commits were made
+  is not written again (once deleted, it can be, with other bytes). The
+  result's `status` tells what happened: `'written'`, a new snapshot;
+  `'joined'`, the key holds the committed state of the database byte for
+  byte, so it reads that snapshot from then on as if it had written it;
+  `'mismatch'`, the key holds other content, and the database stays as it
+  is. Bytes only match when the same commits were made
   on the same snapshot: reaching the same content another way stores it
   differently (the header counts commits, and free pages keep old bytes).
   The newest save wins: new Workers open it, and Workers on older snapshots

@@ -976,6 +976,52 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(rows(await openDb('v2'), 'select count(*) from items')).toEqual([[499]])
       })
 
+      test('write in full when the snapshot below was written anew', async () => {
+        const session = await storage().open(Database, {branch: 'main'})
+        const db = register(session)
+        fill(db, 200, 2000)
+        await session.save({key: 'k1'})
+        // As retain() in another Worker without locks would, while this
+        // one reads k1
+        expect(await storage().store.remove('k1')).toBe(true)
+        // Another Worker reaches the same rows another way, in other pages.
+        const other = storage().session(keep(new Database()), {branch: 'main'})
+        fill(other.db, 100, 2000, 100)
+        fill(other.db, 100, 2000)
+        expect((await other.save({key: 'k1'})).status).toBe('written')
+        db.run("update items set body = 'changed' where id < 5")
+        expect((await session.save({key: 'k2'})).status).toBe('written')
+        expect((await stored('k2')).delta).toBeUndefined()
+        expect(dump(await openDb('k2'))).toEqual(dump(db))
+      })
+
+      test('refuse to open a delta over a snapshot written anew', async () => {
+        const session = await storage().open(Database, {branch: 'main'})
+        register(session)
+        fill(session.db, 200, 2000)
+        await session.save({key: 'k1'})
+        session.db.run("update items set body = 'changed' where id < 5")
+        await session.save({key: 'k2'})
+        await session.close()
+        expect(await storage().store.remove('k1', {force: true})).toBe(true)
+        const other = storage().session(keep(new Database()), {branch: 'main'})
+        fill(other.db, 100, 2000, 100)
+        fill(other.db, 100, 2000)
+        await other.save({key: 'k1'})
+        await expect(storage().open(Database, {key: 'k2'}))
+          .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
+        const offered = []
+        const db = await openDb({
+          choose: snapshots => {
+            offered.push(snapshots.map(s => s.key))
+            return snapshots.find(s => s.key === 'k2') ?? snapshots[0]
+          }
+        })
+        expect(offered).toEqual([['k1', 'k2'], ['k1']])
+        expect(snapshotOf(db).key).toBe('k1')
+        expect(rows(db, 'select count(*) from items')).toEqual([[200]])
+      })
+
       test('refuse to delete a snapshot another lies over', async () => {
         const session = await storage().open(Database)
         register(session)
@@ -1343,28 +1389,29 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
 }
 
 describe('Checkpoints in memory', () => {
-  test('move the database even when reading the new base back fails', async () => {
+  test('refuse to open deltas that do not tell which parent they lie over', async () => {
     const store = memorySnapshotStore()
-    let fail = false
-    const flaky = {
+    // As 0.8.0 stored them
+    const old = {
       ...store,
       async get(key) {
-        if (fail) {
-          fail = false
-          throw new Error('read failed')
-        }
-        return store.get(key)
+        const found = await store.get(key)
+        if (!found?.delta) return found
+        const {parentCreatedAt, ...delta} = found.delta
+        return {...found, delta}
       }
     }
-    const storage = new SnapshotStorage(flaky)
-    const db = register(await storage.open(Database))
-    fill(db, 100)
-    await saveTo(storage, db, 'v1')
-    db.run('delete from items where id >= 10')
-    fail = true
-    expect(await saveTo(storage, db, 'v2')).toBe('written')
-    expect(snapshotOf(db)).toMatchObject({key: 'v2', branch: ''})
-    expect(held(db)).toBe(0)
+    const storage = new SnapshotStorage(old)
+    const session = await storage.open(Database)
+    register(session)
+    fill(session.db, 1000)
+    await session.save({key: 'v1'})
+    session.db.run('delete from items where id = 1')
+    await session.save({key: 'v2'})
+    expect(snapshotOf(session.db).parent).toBe('v1')
+    await expect(storage.open(Database, {key: 'v2'}))
+      .rejects.toMatchObject({code: 'SQLITE_CANTOPEN'})
+    expect(snapshotOf(register(await storage.open(Database))).key).toBe('v1')
   })
 
   test('compose the content a full save writes over deltas once', async () => {
