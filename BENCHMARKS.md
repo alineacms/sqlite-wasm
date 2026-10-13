@@ -245,3 +245,35 @@ With 16 KB pages, a small change holds a quarter of the memory, and 1,000
 changed rows save as a delta 3–4 times faster than the full save they
 take with 64 KB pages; queries are as fast. With 4 KB pages, rows of
 about 2.4 KB leave much of each page empty: the database grows by 80%.
+
+## Full-text search on a snapshot in IndexedDB (0.8.2)
+
+`bun script/test-browser.ts --fts` builds a database of 30,000 rows with an
+FTS5 table (208 MB, 4 KB pages), saves it with `indexedDBSnapshots`, and
+opens it in new dedicated Workers (3 runs, medians below). Each runs two
+rounds of the same queries, counting the `FileReaderSync` reads they make:
+prefix MATCH as one types (`k*`, `ke*`, `kel*`, `m*`, `mo*`, `mor*`, ranked,
+with snippets of the top 50), a broad `a*` joined to the entries table, and
+2,000 lookups by path through an index. Headless Chromium 141, Linux.
+
+| | 0.8.1 | | 0.8.2 | |
+| --- | ---: | ---: | ---: | ---: |
+| | ms | reads | ms | reads |
+| match k* | 1202 | 745 | 912 | 261 |
+| match m* | 583 | 260 | 480 | 78 |
+| match a* join entries | 943 | 649 | 1049 | 539 |
+| 2,000 indexed lookups | 215 | 177 | 243 | 139 |
+| round 1, all queries | 3129 | 1980 | 3082 | 1154 |
+| round 2, all queries | 3139 | 1963 | 871 | 0 |
+
+0.8.1 read every page SQLite asked for (outside its 8 MB page cache) with
+its own `FileReaderSync` read, in both rounds. 0.8.2 makes 42% fewer reads
+the first time (each reads the 256 KiB around a block that is not kept),
+and none the second: the 32 MiB of 16 KiB blocks hold what the queries
+used. In this environment a read costs about 1 ms and grows with its size,
+so the first round takes about as long (times of the first round vary by
+±20% between runs). Where each read costs more, as for IndexedDB Blobs in
+a profile of alinea's dashboard, the fewer reads count for more. Other
+settings (`--read-cache '{...}'`), round 1 / round 2 reads: 64 KiB blocks
+without reading around, 1194 / 1152; 256 KiB blocks, 64 MiB, 833 / 785;
+readAround 16 KiB, 1446 / 0; 64 KiB, 1237 / 0; 128 KiB, 1203 / 0.
