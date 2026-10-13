@@ -1,6 +1,7 @@
 import {afterEach, beforeAll, beforeEach, describe, expect, test} from 'bun:test'
 import {init} from '@alinea/sqlite-wasm'
 import {
+  BlockCache,
   SnapshotStorage,
   directorySnapshotStore,
   indexedDBSnapshots,
@@ -1474,75 +1475,273 @@ describe('Read-only files', () => {
     expect(() => file.truncate(0)).toThrow()
   })
 
-  test('read Blobs in blocks while reads run forward', () => {
-    const bytes = new Uint8Array(10_000).map((_, i) => (i * 31) & 255)
+  // A Blob that records the bytes of every slice read from it
+  function countingBlob(bytes) {
     const slices = []
     class CountingBlob extends Blob {
       slice(start, end) {
-        slices.push(end - start)
+        slices.push([start, end - start])
         return super.slice(start, end)
       }
     }
-    const file = readOnlyFile(new CountingBlob([bytes]), {blockSize: 1024, blocks: 3})
-    const check = (at, length) => {
+    return {blob: new CountingBlob([bytes]), slices}
+  }
+
+  const pattern = size => new Uint8Array(size).map((_, i) => (i * 31 + (i >> 8)) & 255)
+
+  function checker(file, bytes) {
+    return (at, length) => {
       const buffer = new Uint8Array(length)
       const read = file.read(buffer, {at})
       const expected = bytes.subarray(at, at + length)
       expect(read).toBe(expected.length)
       expect(buffer.subarray(0, read)).toEqual(expected)
     }
-    // Reads in random order read what was asked; a read shortly after the
-    // previous one reads its whole block.
-    check(5000, 50)
-    check(100, 50)
-    check(300, 50)
-    check(500, 50)
-    expect(slices).toEqual([50, 50, 1024])
-    // Within, across and past blocks, and past the end
+  }
+
+  test('read Blobs in random order as they are', () => {
+    const bytes = pattern(10_000)
+    const {blob} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {blockSize: 1024, cacheBytes: 4096, readAhead: 2048})
+    const check = checker(file, bytes)
+    // Across block edges, at and past the end
+    check(1000, 100)
+    check(1023, 2)
+    check(9999, 1)
+    check(10_000, 10)
+    check(9990, 100)
+    check(0, 10_000)
     const next = (seed => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff))(5)
-    for (let i = 0; i < 500; i++) check(next() % 10_500, 1 + (next() % 3000))
-    // A scan reads one block at a time, after its first read.
-    slices.length = 0
-    for (let at = 0; at < 10_000; at += 256) check(at, 256)
-    expect(slices.slice(1).every(length => length === 1024 || length === 784)).toBe(true)
-    expect(slices.length).toBeLessThanOrEqual(11)
+    for (let i = 0; i < 2000; i++) check(next() % 10_500, 1 + (next() % 3000))
   })
 
-  test('share blocks between files, each reading ahead on its own', () => {
-    const slices = []
-    class CountingBlob extends Blob {
-      slice(start, end) {
-        slices.push(end - start)
-        return super.slice(start, end)
-      }
+  test('read each block once while it is kept', () => {
+    const size = 8 << 20
+    const bytes = pattern(size)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob)
+    const check = checker(file, bytes)
+    // Pages of 4 KiB in random order: at most one read per span of 256 KiB
+    // they are in (the default readAround), where 0.8.1 read about one per
+    // page
+    const next = (seed => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff))(7)
+    const pages = Array.from({length: 1000}, () => next() % (size / 4096))
+    const spans = new Set()
+    for (const page of pages) {
+      const before = slices.length
+      check(page * 4096, 4096)
+      expect(slices.length).toBeLessThanOrEqual(before + 1)
+      if (spans.has(page >> 6)) expect(slices.length).toBe(before)
+      spans.add(page >> 6)
     }
-    const blob = new CountingBlob([new Uint8Array(10_000)])
-    const cache = new Map()
-    const a = readOnlyFile(blob, {blockSize: 1024, cache})
-    const b = readOnlyFile(blob, {blockSize: 1024, cache})
-    // Interleaved scans: each sees its own reads run forward.
-    for (let at = 0; at < 2048; at += 128) {
-      a.read(new Uint8Array(128), {at})
-      b.read(new Uint8Array(128), {at: at + 4096})
-    }
-    expect(slices.filter(length => length === 1024).length).toBe(4)
-    // b reads the blocks a read from the cache.
+    expect(slices.length).toBeLessThanOrEqual(spans.size)
+    expect(slices.length).toBeLessThan(pages.length / 8)
+    // 8 MiB fit in the cache: none read again.
     slices.length = 0
-    b.read(new Uint8Array(128), {at: 512})
+    for (const page of pages) check(page * 4096, 4096)
     expect(slices).toEqual([])
   })
 
-  test('read only what is asked without cached blocks', () => {
-    const slices = []
-    class CountingBlob extends Blob {
-      slice(start, end) {
-        slices.push(end - start)
-        return super.slice(start, end)
+  test('read the missing blocks of a read, each run at once', () => {
+    const bytes = pattern(10_000)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {
+      blockSize: 1024,
+      cacheBytes: 8192,
+      readAround: 0,
+      readAhead: 0
+    })
+    const check = checker(file, bytes)
+    check(1024 + 10, 10)
+    check(3 * 1024 + 10, 10)
+    slices.length = 0
+    check(100, 6 * 1024 - 200)
+    expect(slices).toEqual([[0, 1024], [2048, 1024], [4096, 2048]])
+    // The last block is shorter.
+    slices.length = 0
+    check(9000, 5000)
+    expect(slices).toEqual([[8192, 1808]])
+  })
+
+  test('read around blocks that are not kept', () => {
+    const bytes = pattern(20_000)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {blockSize: 1024, cacheBytes: 16_384, readAround: 4096})
+    const check = checker(file, bytes)
+    // The aligned span of 4 blocks
+    check(5 * 1024 + 10, 10)
+    expect(slices).toEqual([[4096, 4096]])
+    check(7 * 1024 + 10, 10)
+    check(4 * 1024 + 10, 10)
+    expect(slices.length).toBe(1)
+    // Only blocks that are not kept: 5 is
+    check(2 * 1024 + 10, 4 * 1024)
+    expect(slices.at(-1)).toEqual([0, 4096])
+    check(17 * 1024 + 10, 4 * 1024)
+    expect(slices.at(-1)).toEqual([16_384, 3616])
+    // Blocks read along wait in a quarter of the cache, 4 blocks, the
+    // oldest leaving first: 9, 10 and 11, then 13, 14 and 15 push out 9
+    // and 10.
+    slices.length = 0
+    check(8 * 1024, 10)
+    check(12 * 1024, 10)
+    expect(slices).toEqual([[8192, 4096], [12_288, 4096]])
+    for (const block of [11, 13, 14, 15]) check(block * 1024, 10)
+    expect(slices.length).toBe(2)
+    check(10 * 1024, 10)
+    expect(slices.at(-1)).toEqual([9216, 2048])
+    // Blocks in use stay meanwhile.
+    for (const block of [2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15]) check(block * 1024, 10)
+    expect(slices.length).toBe(3)
+  })
+
+  test('keep the most recently used blocks, within cacheBytes', () => {
+    const bytes = pattern(10_000)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {
+      blockSize: 1024,
+      cacheBytes: 4096,
+      readAround: 0,
+      readAhead: 0
+    })
+    const check = checker(file, bytes)
+    // Backwards
+    for (let block = 9; block >= 0; block--) check(block * 1024, 10)
+    expect(slices.length).toBe(10)
+    // 0, 1, 2 and 3 are kept, of which 3 is used first now.
+    slices.length = 0
+    for (const block of [3, 0, 1, 2]) check(block * 1024 + 20, 10)
+    expect(slices).toEqual([])
+    check(4 * 1024 + 20, 10)
+    expect(slices).toEqual([[4096, 1024]])
+    // 4 went in and 3, the least recently used, out.
+    slices.length = 0
+    check(3 * 1024, 10)
+    expect(slices).toEqual([[3072, 1024]])
+  })
+
+  test('keep within cacheBytes, with files that share the cache', () => {
+    const blocks = new BlockCache({blockSize: 1000, cacheBytes: 7500, readAround: 3000, readAhead: 4000})
+    const sources = [pattern(25_000), pattern(9_999).reverse()]
+    const files = sources.map((bytes, i) => {
+      const file = readOnlyFile(new Blob([bytes]), {cache: {blocks, content: String(i)}})
+      return checker(file, bytes)
+    })
+    const next = (seed => () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff))(11)
+    for (let i = 0; i < 3000; i++) {
+      const which = next() % 2
+      // Forward runs now and then
+      const at = next() % 3 === 0 ? 1000 * (next() % 25) : next() % 26_000
+      files[which](at, 1 + (next() % (next() % 10 === 0 ? 12_000 : 3000)))
+      expect(blocks.bytes).toBeGreaterThanOrEqual(0)
+      expect(blocks.bytes).toBeLessThanOrEqual(7500)
+    }
+  })
+
+  test('read more than cacheBytes at once', () => {
+    const bytes = pattern(10_000)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {
+      blockSize: 1024,
+      cacheBytes: 3072,
+      readAround: 0,
+      readAhead: 0
+    })
+    const check = checker(file, bytes)
+    check(500, 9000)
+    expect(slices).toEqual([[0, 10_000]])
+    // The last three blocks of it are kept, and nothing more.
+    slices.length = 0
+    for (const block of [9, 8, 7]) check(block * 1024, 10)
+    expect(slices).toEqual([])
+    check(6 * 1024, 10)
+    check(9 * 1024, 10)
+    expect(slices).toEqual([[6144, 1024], [9216, 784]])
+    for (let i = 0; i < 3; i++) check(i * 3000, 9000)
+    // Blocks larger than the cache are read, not kept.
+    const small = readOnlyFile(countingBlob(bytes).blob, {blockSize: 4096, cacheBytes: 1024})
+    checker(small, bytes)(4000, 200)
+  })
+
+  test('read ahead while reads run forward', () => {
+    const bytes = pattern(10_000)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {blockSize: 1024, cacheBytes: 16_384, readAhead: 4096})
+    const check = checker(file, bytes)
+    // A scan reads 4096 bytes at a time (the first read runs forward from
+    // the start).
+    for (let at = 0; at < 10_000; at += 256) check(at, 256)
+    expect(slices).toEqual([[0, 4096], [4096, 4096], [8192, 1808]])
+    // Not while reads are in random order
+    slices.length = 0
+    file.read(new Uint8Array(10), {at: 1024})
+    file.read(new Uint8Array(10), {at: 100})
+    expect(slices).toEqual([])
+  })
+
+  test('read only what is asked without a cache', () => {
+    const {blob, slices} = countingBlob(new Uint8Array(10_000))
+    const file = readOnlyFile(blob, {blockSize: 1024, cacheBytes: 0})
+    for (let at = 0; at < 2000; at += 100) file.read(new Uint8Array(100), {at})
+    expect(slices.every(([, length]) => length === 100)).toBe(true)
+    // As with blocks: 0 (deprecated)
+    const old = countingBlob(new Uint8Array(10_000))
+    const other = readOnlyFile(old.blob, {blockSize: 1024, blocks: 0})
+    other.read(new Uint8Array(100), {at: 50})
+    expect(old.slices).toEqual([[50, 100]])
+  })
+
+  test('refuse bad options', () => {
+    const blob = new Blob([new Uint8Array(10)])
+    expect(() => readOnlyFile(blob, {blockSize: 0})).toThrow(RangeError)
+    expect(() => readOnlyFile(blob, {cacheBytes: -1})).toThrow(RangeError)
+    expect(() => readOnlyFile(blob, {readAhead: 1.5})).toThrow(RangeError)
+    expect(() => readOnlyFile(blob, {readAround: -1})).toThrow(RangeError)
+    expect(() => indexedDBSnapshots('x', {readCache: {blockSize: 0}})).toThrow(RangeError)
+  })
+
+  test('share blocks between the databases of a storage', async () => {
+    const indexedDB = new IDBFactory()
+    let reads = 0
+    const Reader = globalThis.FileReaderSync
+    globalThis.FileReaderSync = class extends Reader {
+      readAsArrayBuffer(blob) {
+        reads++
+        return super.readAsArrayBuffer(blob)
       }
     }
-    const file = readOnlyFile(new CountingBlob([new Uint8Array(10_000)]), {blockSize: 1024, blocks: 0})
-    for (let at = 0; at < 2000; at += 100) file.read(new Uint8Array(100), {at})
-    expect(slices.every(length => length === 100)).toBe(true)
+    try {
+      const storage = indexedDBSnapshots('entries', {
+        indexedDB,
+        IDBKeyRange,
+        readCache: {blockSize: 4096, cacheBytes: 4 << 20}
+      })
+      const db = register(await storage.open(Database))
+      fill(db, 2000)
+      await saveTo(storage, db, 'v1')
+      // A delta over v1
+      db.run("update items set body = 'changed' where id = 5")
+      await saveTo(storage, db, 'v2')
+      const sum = db => rows(db, 'select count(*), sum(length(body)) from items')
+      const v1 = register(await storage.open(Database, {key: 'v1'}))
+      expect(sum(v1)).toEqual([[2000, 1_000_000]])
+      // v1 is read once: v2 reads its own pages, and those of v1 it kept.
+      reads = 0
+      const v2 = register(await storage.open(Database, {key: 'v2'}))
+      expect(sum(v2)).toEqual([[2000, 1_000_000 - 500 + 7]])
+      expect(reads).toBeLessThan(5)
+      reads = 0
+      const again = register(await storage.open(Database, {key: 'v1'}))
+      expect(dump(again)).toEqual(dump(v1))
+      expect(reads).toBe(0)
+      // Another storage keeps its own.
+      const other = indexedDBSnapshots('entries', {indexedDB, IDBKeyRange})
+      const v1b = register(await other.open(Database, {key: 'v1'}))
+      expect(dump(v1b)).toEqual(dump(v1))
+      expect(reads).toBeGreaterThan(0)
+    } finally {
+      globalThis.FileReaderSync = Reader
+    }
   })
 
   test('read Blobs', () => {

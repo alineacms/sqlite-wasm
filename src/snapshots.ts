@@ -32,10 +32,14 @@ const WRITE_BYTES = 4 << 20
 // read from the base again once they leave it, which takes about a
 // millisecond for 64 KB.
 const CACHE_KIB = 8192
-// Blob reads of snapshots: bytes read at once, and how many such blocks are
-// kept, see readOnlyFile
-const BLOCK_BYTES = 1 << 20
-const CACHED_BLOCKS = 4
+// Blob reads of snapshots, see readOnlyFile: bytes per block, bytes of
+// blocks kept, bytes read around a block that is not kept (a FileReaderSync
+// read of 256 KiB costs little more than one of 4 KiB), and bytes read at
+// once by scans
+const BLOCK_BYTES = 16 << 10
+const CACHE_BYTES = 32 << 20
+const READ_AROUND_BYTES = 256 << 10
+const READ_AHEAD_BYTES = 1 << 20
 // Saves write the pages that changed over the snapshot they read, as a
 // delta, while at most this many deltas lie on a full snapshot (see
 // maxDepth), its pages take at most half the bytes of the database, and
@@ -51,18 +55,136 @@ const STALE_MS = 60 * 60_000
 /** Content that does not change: a `File` or `Blob`, or bytes. */
 export type BaseSource = Blob | Uint8Array
 
-/** How a read-only file reads a Blob, see `readOnlyFile`. */
-export interface ReadOnlyFileOptions {
-  /** Bytes per block read at once, a power of two (default: 1 MiB) */
+/** How Blobs are read and which of their bytes are kept, see `readOnlyFile`. */
+export interface ReadCacheOptions {
+  /** Bytes per block, the unit Blobs are read and kept in (default: 16 KiB) */
   blockSize?: number
-  /** How many blocks are kept (default: 4) */
+  /**
+   * Bytes of blocks kept, the least recently used leave first (default:
+   * 32 MiB); 0 keeps none, and reads only what is asked
+   */
+  cacheBytes?: number
+  /**
+   * Bytes read at once around a block that is not kept: the aligned span
+   * of this many bytes it lies in (default: 256 KiB)
+   */
+  readAround?: number
+  /**
+   * Bytes read at once by a read that starts where the previous one ended,
+   * or shortly after (default: 1 MiB)
+   */
+  readAhead?: number
+}
+
+/** How a read-only file reads a Blob, see `readOnlyFile`. */
+export interface ReadOnlyFileOptions extends ReadCacheOptions {
+  /** @deprecated How many blocks are kept, use `cacheBytes` */
   blocks?: number
   /**
-   * Blocks to share with other files over the same content, which each
-   * keep track of their own reads
+   * Blocks to share with other files, and the content of this one among
+   * them: files over the same content share it, and each keeps track of
+   * its own reads
    * @internal
    */
-  cache?: Map<number, Uint8Array>
+  cache?: {blocks: BlockCache; content: string}
+}
+
+/**
+ * Blocks read from Blobs, which hold at most `budget` bytes. Blocks that
+ * were read along with others but not asked for wait apart, in at most a
+ * quarter of the budget, until they are asked for: they leave first, so
+ * that they do not push out blocks in use. Either part is kept least
+ * recently used first. Keys are a number for the content (see
+ * `contentId`) times 2^32, plus the index of the block.
+ * @internal
+ */
+export class BlockCache {
+  bytes = 0
+  readonly blockSize: number
+  readonly budget: number
+  readonly readAround: number
+  readonly readAhead: number
+  private used = new Map<number, Uint8Array>()
+  private waiting = new Map<number, Uint8Array>()
+  private waitingBytes = 0
+  private contents = new Map<string, number>()
+
+  constructor(options: ReadCacheOptions = {}) {
+    this.blockSize = options.blockSize ?? BLOCK_BYTES
+    this.budget = options.cacheBytes ?? CACHE_BYTES
+    this.readAround = options.readAround ?? READ_AROUND_BYTES
+    this.readAhead = options.readAhead ?? READ_AHEAD_BYTES
+    wholeNumber('blockSize', this.blockSize, 1)
+    if (this.blockSize === Infinity) throw new RangeError('blockSize must be finite')
+    wholeNumber('cacheBytes', this.budget, 0)
+    wholeNumber('readAround', this.readAround, 0)
+    wholeNumber('readAhead', this.readAhead, 0)
+  }
+
+  /** The key of block 0 of `content` */
+  contentId(content: string) {
+    let id = this.contents.get(content)
+    if (id === undefined) this.contents.set(content, (id = this.contents.size))
+    return id * 2 ** 32
+  }
+
+  /** Block `key`, which is used from now on */
+  get(key: number) {
+    let data = this.used.get(key)
+    if (data) {
+      this.used.delete(key)
+    } else {
+      data = this.waiting.get(key)
+      if (!data) return undefined
+      this.waiting.delete(key)
+      this.waitingBytes -= data.byteLength
+    }
+    this.used.set(key, data)
+    return data
+  }
+
+  has(key: number) {
+    return this.used.has(key) || this.waiting.has(key)
+  }
+
+  /** Keep block `key`, which was asked for, or with `waiting`, not yet */
+  set(key: number, data: Uint8Array, waiting = false) {
+    this.delete(key)
+    const size = data.byteLength
+    const room = waiting ? this.budget / 4 : this.budget
+    // A block larger than the cache is not kept.
+    if (size > room) return
+    if (waiting) this.evict(this.waiting, room - size, true)
+    if (this.bytes + size > this.budget) {
+      this.evict(this.waiting, this.waitingBytes - (this.bytes + size - this.budget), true)
+      this.evict(this.used, this.budget - size - this.waitingBytes, false)
+    }
+    ;(waiting ? this.waiting : this.used).set(key, data)
+    this.bytes += size
+    if (waiting) this.waitingBytes += size
+  }
+
+  private delete(key: number) {
+    for (const [map, waiting] of [[this.used, false], [this.waiting, true]] as const) {
+      const old = map.get(key)
+      if (!old) continue
+      map.delete(key)
+      this.bytes -= old.byteLength
+      if (waiting) this.waitingBytes -= old.byteLength
+    }
+  }
+
+  /** Evict the oldest blocks of `map` until it holds at most `max` bytes */
+  private evict(map: Map<number, Uint8Array>, max: number, waiting: boolean) {
+    let held = waiting ? this.waitingBytes : this.bytes - this.waitingBytes
+    for (const [key, block] of map) {
+      if (held <= max) break
+      map.delete(key)
+      held -= block.byteLength
+      this.bytes -= block.byteLength
+      if (waiting) this.waitingBytes -= block.byteLength
+    }
+  }
 }
 
 /**
@@ -71,11 +193,14 @@ export interface ReadOnlyFileOptions {
  * `FileReaderSync`, which Workers have (not the main thread).
  *
  * Each `FileReaderSync` read costs about a millisecond however little it
- * reads, so a Blob is read in blocks where that pays: a read that starts
- * where the previous one ended, or shortly after, reads the whole block it
- * starts in, which is kept for the reads that follow (the newest `blocks`
- * are). Scans read a block at a time; reads in random order, such as point
- * lookups and lookups through an index, read only what they ask for.
+ * reads, so a Blob is read in blocks of `blockSize`, of which the most
+ * recently used `cacheBytes` are kept: a read takes the blocks it needs
+ * from those, and reads the others, each run of them that lie next to each
+ * other at once. That run takes along the blocks around it that are not
+ * kept either, in the aligned span of `readAround` bytes; a read that
+ * starts where the previous one ended, or shortly after, takes along those
+ * up to `readAhead` bytes from where it starts, for scans. Blocks taken
+ * along are kept apart until they are used, and leave first.
  */
 export function readOnlyFile(
   source: BaseSource,
@@ -94,45 +219,91 @@ export function readOnlyFile(
   } else {
     const reader = new FileReaderSync()
     const size = source.size
-    const blockSize = options.blockSize ?? BLOCK_BYTES
-    const capacity = options.blocks ?? CACHED_BLOCKS
-    // Blocks by index, least recently used first
-    const cached = options.cache ?? new Map<number, Uint8Array>()
+    const cache =
+      options.cache?.blocks ??
+      new BlockCache({
+        ...options,
+        cacheBytes:
+          options.cacheBytes ??
+          (options.blocks !== undefined
+            ? options.blocks * (options.blockSize ?? BLOCK_BYTES)
+            : undefined)
+      })
+    const {blockSize, budget} = cache
+    const content = cache.contentId(options.cache?.content ?? '')
+    // Blocks read around and ahead, at least one, and no more than wait
+    const span = (bytes: number) =>
+      Math.max(1, Math.min(Math.ceil(bytes / blockSize), Math.floor(budget / 4 / blockSize)))
+    const around = span(cache.readAround)
+    const ahead = span(cache.readAhead)
+    const lastBlock = Math.floor((size - 1) / blockSize)
     // Where the previous read ended
     let previousEnd = -1
     const readRange = (start: number, end: number) =>
       new Uint8Array(reader.readAsArrayBuffer(source.slice(start, end)))
-    const block = (index: number) => {
-      let data = cached.get(index)
-      if (data) {
-        cached.delete(index)
-      } else {
-        const start = index * blockSize
-        data = readRange(start, Math.min(start + blockSize, size))
-        if (cached.size >= capacity && capacity > 0)
-          cached.delete(cached.keys().next().value!)
-      }
-      if (capacity > 0) cached.set(index, data)
-      return data
-    }
     read = (buffer, at) => {
       const end = Math.min(at + buffer.length, size)
       if (end <= at) return 0
-      const first = Math.floor(at / blockSize)
-      const last = Math.floor((end - 1) / blockSize)
-      let whole = capacity > 0 && at >= previousEnd && at < previousEnd + blockSize
-      if (!whole) {
-        whole = true
-        for (let i = first; i <= last; i++) if (!cached.has(i)) whole = false
-      }
+      const forward = at >= previousEnd && at < previousEnd + blockSize
       previousEnd = end
-      if (!whole) {
+      if (budget === 0) {
         buffer.set(readRange(at, end))
         return end - at
       }
+      const first = Math.floor(at / blockSize)
+      const last = Math.floor((end - 1) / blockSize)
+      // The blocks of this read: cached ones first, so that those read
+      // below do not push them out
+      const blocks: Array<Uint8Array | undefined> = []
+      let kept = true
       for (let i = first; i <= last; i++) {
-        const start = i * blockSize
-        const data = block(i)
+        const block = cache.get(content + i)
+        if (!block) kept = false
+        blocks.push(block)
+      }
+      if (kept) return copy(buffer, at, end, first, blocks)
+      // Blocks that may be taken along: up to `readAhead` from the start of
+      // reads that run forward, else the aligned span of `readAround`
+      const from = forward ? first : Math.floor(first / around) * around
+      const until = Math.min(
+        lastBlock,
+        Math.max(last, forward ? first + ahead - 1 : Math.ceil((last + 1) / around) * around - 1)
+      )
+      const missing = (i: number) =>
+        i >= first && i <= last ? !blocks[i - first] : !cache.has(content + i)
+      for (let i = first; i <= last; i++) {
+        if (!missing(i)) continue
+        // The run of blocks that are not kept, with those around it
+        let start = i
+        while (start > from && missing(start - 1)) start--
+        let next = i + 1
+        while (next <= until && missing(next)) next++
+        const data = readRange(start * blockSize, Math.min(next * blockSize, size))
+        for (let j = start; j < next; j++) {
+          const offset = (j - start) * blockSize
+          let block = data.subarray(offset, offset + blockSize)
+          // Blocks of one read are kept apart, so that each holds its own
+          // bytes when the others leave the cache.
+          if (next - start > 1) block = block.slice()
+          const asked = j >= first && j <= last
+          if (asked) blocks[j - first] = block
+          cache.set(content + j, block, !asked)
+        }
+        i = next - 1
+      }
+      return copy(buffer, at, end, first, blocks)
+    }
+    // Copy bytes `at` to `end` from `blocks`, from block `first` on
+    const copy = (
+      buffer: Uint8Array,
+      at: number,
+      end: number,
+      first: number,
+      blocks: Array<Uint8Array | undefined>
+    ) => {
+      for (let i = 0; i < blocks.length; i++) {
+        const start = (first + i) * blockSize
+        const data = blocks[i]!
         const from = Math.max(at, start)
         const to = Math.min(end, start + data.length)
         buffer.set(data.subarray(from - start, to - start), from - at)
@@ -1109,6 +1280,12 @@ export interface SnapshotStorageOptions {
    * it writes the whole database. 0 writes every snapshot in full.
    */
   maxDepth?: number
+  /**
+   * How snapshots stored as Blobs (in IndexedDB and OPFS) are read, see
+   * `readOnlyFile`: the storage keeps one cache of blocks, of
+   * `readCache.cacheBytes` (default: 32 MiB), for every database it opens
+   */
+  readCache?: ReadCacheOptions
 }
 
 /**
@@ -1172,7 +1349,7 @@ interface Base extends SnapshotInfo {
   file(): SyncFile
 }
 
-function baseOf(layer: Layer): Base {
+function baseOf(layer: Layer, blocks: BlockCache): Base {
   const keys: Array<string> = []
   for (let at: Layer | undefined = layer; at; at = at.below) keys.push(at.info.key)
   return {
@@ -1184,7 +1361,7 @@ function baseOf(layer: Layer): Base {
     // Only needed to write in full or compare: not kept, as for bytes it
     // copies the database.
     content: (start?: number, end?: number) => layerContent(layer, start, end),
-    file: () => layerFile(layer)
+    file: () => layerFile(layer, blocks)
   }
 }
 
@@ -1235,19 +1412,17 @@ function* runs(delta: DeltaLayout, start: number, end: number): Generator<Run> {
 }
 
 /**
- * Blocks read from the content of layers: files over the same layer share
- * them, and each keeps track of its own reads
+ * A read-only file of the database a layer holds, which keeps the blocks it
+ * reads in `blocks`. Files over the same snapshot share them, also those of
+ * snapshots that lie over it, and each keeps track of its own reads.
  */
-const layerCaches = new WeakMap<Layer, Map<number, Uint8Array>>()
-
-/** A read-only file of the database a layer holds */
-function layerFile(layer: Layer): SyncFile {
-  let cache = layerCaches.get(layer)
-  if (!cache) layerCaches.set(layer, (cache = new Map()))
-  const own = readOnlyFile(layer.source, {cache})
+function layerFile(layer: Layer, blocks: BlockCache): SyncFile {
+  // A key is written anew with another createdAt
+  const content = `${layer.info.createdAt}:${layer.info.key}`
+  const own = readOnlyFile(layer.source, {cache: {blocks, content}})
   const {delta, below} = layer
   if (!delta || !below) return own
-  const under = layerFile(below)
+  const under = layerFile(below, blocks)
   const size = layer.info.size
   // Read `to - from` bytes at `at` of `file` into `buffer` at `offset`,
   // with zeros past its end
@@ -1541,12 +1716,15 @@ function wholeNumber(name: string, value: number, min: number) {
 export class SnapshotStorage {
   private locks: Pick<LockManager, 'request'> | null
   private maxDepth: number
+  /** Blocks read from snapshots, see layerFile */
+  private blocks: BlockCache
 
   constructor(
     public readonly store: SnapshotStore,
     options?: SnapshotStorageOptions
   ) {
     this.maxDepth = options?.maxDepth ?? MAX_DEPTH
+    this.blocks = new BlockCache(options?.readCache)
     wholeNumber('maxDepth', this.maxDepth, 0)
     if (this.maxDepth > MAX_CHAIN)
       throw new RangeError(`maxDepth must be at most ${MAX_CHAIN}, not ${this.maxDepth}`)
@@ -1658,7 +1836,7 @@ export class SnapshotStorage {
       }
       let layer: Layer | undefined
       for (const stored of found.reverse()) layer = {...stored, below: layer}
-      return {base: baseOf(layer!), release}
+      return {base: baseOf(layer!, this.blocks), release}
     } catch (error) {
       release()
       throw error
@@ -1792,7 +1970,7 @@ export class SnapshotStorage {
       let target: Base
       if (written) {
         const from = snapshot.base as Base | undefined
-        target = baseOf({...written, below: written.delta && from?.layer})
+        target = baseOf({...written, below: written.delta && from?.layer}, this.blocks)
         if (written.delta && from) {
           // The new snapshot needs the ones it lies over.
           const below = await this.holdAll(from.keys)
