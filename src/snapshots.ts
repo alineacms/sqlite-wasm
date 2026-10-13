@@ -59,7 +59,7 @@ export type BaseSource = Blob | Uint8Array
 
 /** How Blobs are read and which of their bytes are kept, see `readOnlyFile`. */
 export interface ReadCacheOptions {
-  /** Bytes per block, the unit Blobs are read and kept in, at least 512 (default: 16 KiB) */
+  /** Bytes per block, the unit Blobs are read and kept in (default: 16 KiB) */
   blockSize?: number
   /**
    * Bytes of blocks kept, the least recently used leave first (default:
@@ -68,12 +68,13 @@ export interface ReadCacheOptions {
   cacheBytes?: number
   /**
    * Bytes read at once around a block that is not kept: the aligned span
-   * of this many bytes it lies in (default: 256 KiB)
+   * of this many bytes it lies in, at most a quarter of `cacheBytes`
+   * (default: 256 KiB)
    */
   readAround?: number
   /**
    * Bytes read at once by a read that starts where the previous one ended,
-   * or shortly after (default: 1 MiB)
+   * or shortly after, at most a quarter of `cacheBytes` (default: 1 MiB)
    */
   readAhead?: number
 }
@@ -99,8 +100,8 @@ export interface ReadOnlyFileOptions extends ReadCacheOptions {
  * were read along with others but not asked for wait apart, in at most a
  * quarter of the budget, until they are asked for: they leave first, so
  * that they do not push out blocks in use. Either part is kept least
- * recently used first. Keys are a number for the content (see
- * `contentId`) times 2^32, plus the index of the block.
+ * recently used first. Keys are the content (see `prefix`) and the index
+ * of the block, so they are held only as long as their blocks.
  * @internal
  */
 export class BlockCache {
@@ -109,10 +110,9 @@ export class BlockCache {
   readonly budget: number
   readonly readAround: number
   readonly readAhead: number
-  private used = new Map<number, Uint8Array>()
-  private waiting = new Map<number, Uint8Array>()
+  private used = new Map<string, Uint8Array>()
+  private waiting = new Map<string, Uint8Array>()
   private waitingBytes = 0
-  private contents = new Map<string, number>()
 
   constructor(options: ReadCacheOptions = {}) {
     this.blockSize = options.blockSize ?? BLOCK_BYTES
@@ -121,8 +121,7 @@ export class BlockCache {
     this.readAhead = options.readAhead ?? READ_AHEAD_BYTES
     wholeNumber('cacheBytes', this.budget, 0)
     for (const [name, value, min] of [
-      // Keys hold up to 2^32 blocks: 2 TiB of blocks of 512 bytes
-      ['blockSize', this.blockSize, 512],
+      ['blockSize', this.blockSize, 1],
       ['readAround', this.readAround, 0],
       ['readAhead', this.readAhead, 0]
     ] as const) {
@@ -131,15 +130,15 @@ export class BlockCache {
     }
   }
 
-  /** The key of block 0 of `content` */
-  contentId(content: string) {
-    let id = this.contents.get(content)
-    if (id === undefined) this.contents.set(content, (id = this.contents.size))
-    return id * 2 ** 32
+  /** What keys of blocks of `content` start with, followed by the index */
+  prefix(content: string) {
+    // Ends in a newline, after which only digits follow: no two contents
+    // share a key.
+    return `${content}\n`
   }
 
   /** Block `key`, which is used from now on */
-  get(key: number) {
+  get(key: string) {
     let data = this.used.get(key)
     if (data) {
       this.used.delete(key)
@@ -153,12 +152,12 @@ export class BlockCache {
     return data
   }
 
-  has(key: number) {
+  has(key: string) {
     return this.used.has(key) || this.waiting.has(key)
   }
 
   /** Keep block `key`, which was asked for, or with `waiting`, not yet */
-  set(key: number, data: Uint8Array, waiting = false) {
+  set(key: string, data: Uint8Array, waiting = false) {
     this.delete(key)
     const size = data.byteLength
     const room = waiting ? this.budget / 4 : this.budget
@@ -176,7 +175,7 @@ export class BlockCache {
     if (waiting) this.waitingBytes += size
   }
 
-  private delete(key: number) {
+  private delete(key: string) {
     for (const [map, waiting] of [[this.used, false], [this.waiting, true]] as const) {
       const old = map.get(key)
       if (!old) continue
@@ -187,7 +186,7 @@ export class BlockCache {
   }
 
   /** Evict the oldest blocks of `map` until it holds at most `max` bytes */
-  private evict(map: Map<number, Uint8Array>, max: number, waiting: boolean) {
+  private evict(map: Map<string, Uint8Array>, max: number, waiting: boolean) {
     let held = waiting ? this.waitingBytes : this.bytes - this.waitingBytes
     for (const [key, block] of map) {
       if (held <= max) break
@@ -243,7 +242,7 @@ export function readOnlyFile(
             : undefined)
       })
     const {blockSize, budget} = cache
-    const content = cache.contentId(options.cache?.content ?? '')
+    const content = cache.prefix(options.cache?.content ?? '')
     // Blocks read around and ahead, at least one, and no more than wait
     const span = (bytes: number) =>
       Math.max(1, Math.min(Math.ceil(bytes / blockSize), Math.floor(budget / 4 / blockSize)))
@@ -293,15 +292,19 @@ export function readOnlyFile(
         let next = i + 1
         while (next <= until && missing(next)) next++
         const data = readRange(start * blockSize, Math.min(next * blockSize, size))
+        // Of a run larger than the cache, only the last blocks can stay.
+        const keepFrom = next - Math.floor(budget / blockSize)
         for (let j = start; j < next; j++) {
           const offset = (j - start) * blockSize
           let block = data.subarray(offset, offset + blockSize)
-          // Blocks of one read are kept apart, so that each holds its own
-          // bytes when the others leave the cache.
-          if (next - start > 1) block = block.slice()
           const asked = j >= first && j <= last
+          if (j >= keepFrom) {
+            // Blocks of one read are kept apart, so that each holds its
+            // own bytes when the others leave the cache.
+            if (next - start > 1) block = block.slice()
+            cache.set(content + j, block, !asked)
+          }
           if (asked) blocks[j - first] = block
-          cache.set(content + j, block, !asked)
         }
         i = next - 1
       }

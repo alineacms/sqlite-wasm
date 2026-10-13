@@ -1721,7 +1721,6 @@ describe('Read-only files', () => {
     expect(() => readOnlyFile(blob, {readAhead: 1.5})).toThrow(RangeError)
     expect(() => readOnlyFile(blob, {readAround: -1})).toThrow(RangeError)
     expect(() => readOnlyFile(blob, {readAround: Infinity})).toThrow(RangeError)
-    expect(() => readOnlyFile(blob, {blockSize: 256})).toThrow(RangeError)
     expect(() => readOnlyFile(blob, {blocks: -1})).toThrow(/blocks/)
     expect(() => readOnlyFile(blob, {blocks: 2.5})).toThrow(RangeError)
     expect(() => indexedDBSnapshots('x', {readCache: {blockSize: 0}})).toThrow(RangeError)

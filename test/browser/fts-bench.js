@@ -8,6 +8,8 @@ function call(worker, action, args) {
   return new Promise((resolve, reject) => {
     worker.onmessage = ({data}) =>
       data.error ? reject(new Error(data.error)) : resolve(data.result)
+    worker.onerror = event =>
+      reject(new Error(`Worker failed: ${event.message ?? 'error'}`))
     worker.postMessage({id: 0, action, args})
   })
 }

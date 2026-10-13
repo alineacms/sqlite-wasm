@@ -91,13 +91,15 @@ try {
     if (message.type() === 'error') console.error('console:', message.text())
   })
   if (args.fts) {
-    if (!(Number(args.runs) >= 1)) throw new Error(`--runs must be at least 1, not ${args.runs}`)
+    const runs = Number(args.runs)
+    if (!Number.isInteger(runs) || runs < 1)
+      throw new Error(`--runs must be a whole number of at least 1, not ${args.runs}`)
     await page.goto(`http://127.0.0.1:${server.port}/fts`)
     await page.waitForFunction(() => 'runFtsBenchmark' in window)
     const results = await page.evaluate(
       options => (window as any).runFtsBenchmark(options),
       {
-        runs: Number(args.runs),
+        runs,
         readCache: args['read-cache'] ? JSON.parse(args['read-cache']) : undefined
       }
     )
