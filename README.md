@@ -156,17 +156,7 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   Locks, also ones Workers still read), and `retain({pinned: keys})` never
   deletes those keys.
 - SQLite keeps up to 8 MB of the pages it read in its page cache
-  (`PRAGMA cache_size` changes it). Below that, a storage keeps the Blobs
-  it reads (in IndexedDB and OPFS) in blocks of 16 KiB, up to 32 MiB of
-  them for all the databases it opens, so that SQLite reading a page again
-  does not read the Blob again: `FileReaderSync` reads take about a
-  millisecond however small. A read of a block that is not kept also reads
-  the blocks around it that are not kept, in the 256 KiB it lies in (1 MiB
-  ahead for reads that run forward), which wait apart and leave first
-  until they are used. `indexedDBSnapshots(name, {readCache: {blockSize,
-  cacheBytes, readAround, readAhead}})` changes these (also
-  `opfsSnapshots` and `new SnapshotStorage`); `readOnlyFile(blob,
-  options)` takes the same.
+  (`PRAGMA cache_size` changes it).
 - `save` fails during a write transaction (`SQLITE_BUSY`), and `session`
   for a database stored elsewhere (`SQLITE_MISUSE`).
 
@@ -245,7 +235,7 @@ Snapshots in IndexedDB and in OPFS are tested in Chromium, Firefox and
 WebKit, in dedicated and shared Workers; `storage.supported()` tells if the
 APIs they need are there.
 `readOnlyFile(blobOrBytes)` reads a `File`, `Blob` or `Uint8Array` as a
-read-only `SyncFile` (a Blob through a cache of blocks, as above), and `new SnapshotStorage(store)` takes any other
+read-only `SyncFile`, and `new SnapshotStorage(store)` takes any other
 `SnapshotStore`.
 
 ## Opening a database file without loading it
