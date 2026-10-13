@@ -4,10 +4,13 @@
 //
 //   bun script/test-browser.ts [--browser chromium|firefox|webkit]
 //   bun script/test-browser.ts --bench [--seconds 30] [--out results.json]
+//   bun script/test-browser.ts --fts [--runs 3] [--read-cache '{"blockSize": 65536}']
 //
 // --bench runs the benchmarks of test/browser/bench.js instead of the tests,
 // prints their results and writes them, with the machine and browser, to
-// --out (default bench-results/<browser>.json); see BENCHMARKS.md. The
+// --out (default bench-results/<browser>.json); see BENCHMARKS.md. --fts
+// times full-text searches on a snapshot in IndexedDB (test/browser/
+// fts-bench.js), and prints the results. The
 // browser build matching playwright-core must be installed (bunx
 // playwright-core install chromium), or CHROMIUM_PATH, FIREFOX_PATH or
 // WEBKIT_PATH set to another.
@@ -21,6 +24,9 @@ const {values: args} = parseArgs({
   options: {
     browser: {type: 'string', default: 'chromium'},
     bench: {type: 'boolean', default: false},
+    fts: {type: 'boolean', default: false},
+    runs: {type: 'string', default: '3'},
+    'read-cache': {type: 'string'},
     seconds: {type: 'string', default: '30'},
     out: {type: 'string'}
   }
@@ -35,6 +41,8 @@ const built = await Bun.build({
   entrypoints: [
     'test/browser/page.js',
     'test/browser/bench.js',
+    'test/browser/fts-bench.js',
+    'test/browser/fts-worker.js',
     'test/browser/worker.js',
     'test/browser/snapshot-worker.js'
   ],
@@ -52,8 +60,13 @@ const server = Bun.serve({
   hostname: '127.0.0.1',
   async fetch(request) {
     const {pathname} = new URL(request.url)
-    if (pathname === '/' || pathname === '/bench') {
-      const script = pathname === '/' ? './page.js' : './bench.js'
+    const pages: Record<string, string> = {
+      '/': './page.js',
+      '/bench': './bench.js',
+      '/fts': './fts-bench.js'
+    }
+    if (pathname in pages) {
+      const script = pages[pathname]
       return new Response(`<!doctype html><script type="module" src="${script}"></script>`, {
         headers: {'content-type': 'text/html'}
       })
@@ -77,7 +90,21 @@ try {
   page.on('console', message => {
     if (message.type() === 'error') console.error('console:', message.text())
   })
-  if (args.bench) {
+  if (args.fts) {
+    const runs = Number(args.runs)
+    if (!Number.isInteger(runs) || runs < 1)
+      throw new Error(`--runs must be a whole number of at least 1, not ${args.runs}`)
+    await page.goto(`http://127.0.0.1:${server.port}/fts`)
+    await page.waitForFunction(() => 'runFtsBenchmark' in window)
+    const results = await page.evaluate(
+      options => (window as any).runFtsBenchmark(options),
+      {
+        runs,
+        readCache: args['read-cache'] ? JSON.parse(args['read-cache']) : undefined
+      }
+    )
+    console.log(JSON.stringify(results, null, 2))
+  } else if (args.bench) {
     await page.goto(`http://127.0.0.1:${server.port}/bench`)
     await page.waitForFunction(() => 'runBenchmarks' in window)
     const seconds = Number(args.seconds)
