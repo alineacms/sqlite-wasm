@@ -1595,6 +1595,23 @@ describe('Read-only files', () => {
     expect(slices.length).toBe(3)
   })
 
+  test('keep blocks in use over blocks read along', () => {
+    const bytes = pattern(12_000)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {blockSize: 1024, cacheBytes: 8192, readAround: 2048, readAhead: 0})
+    const check = checker(file, bytes)
+    for (let block = 0; block < 8; block++) check(block * 1024, 10)
+    // The cache is full of blocks in use: 9 pushes out 0, and 8, read along,
+    // is not kept.
+    check(9 * 1024 + 500, 10)
+    expect(slices.at(-1)).toEqual([8192, 2048])
+    slices.length = 0
+    for (let block = 1; block < 8; block++) check(block * 1024 + 20, 10)
+    expect(slices).toEqual([])
+    check(8 * 1024 + 500, 10)
+    expect(slices.length).toBe(1)
+  })
+
   test('keep the most recently used blocks, within cacheBytes', () => {
     const bytes = pattern(10_000)
     const {blob, slices} = countingBlob(bytes)
@@ -1704,6 +1721,9 @@ describe('Read-only files', () => {
     expect(() => readOnlyFile(blob, {readAhead: 1.5})).toThrow(RangeError)
     expect(() => readOnlyFile(blob, {readAround: -1})).toThrow(RangeError)
     expect(() => readOnlyFile(blob, {readAround: Infinity})).toThrow(RangeError)
+    expect(() => readOnlyFile(blob, {blockSize: 256})).toThrow(RangeError)
+    expect(() => readOnlyFile(blob, {blocks: -1})).toThrow(/blocks/)
+    expect(() => readOnlyFile(blob, {blocks: 2.5})).toThrow(RangeError)
     expect(() => indexedDBSnapshots('x', {readCache: {blockSize: 0}})).toThrow(RangeError)
   })
 

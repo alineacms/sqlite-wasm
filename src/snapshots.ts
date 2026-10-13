@@ -59,7 +59,7 @@ export type BaseSource = Blob | Uint8Array
 
 /** How Blobs are read and which of their bytes are kept, see `readOnlyFile`. */
 export interface ReadCacheOptions {
-  /** Bytes per block, the unit Blobs are read and kept in (default: 16 KiB) */
+  /** Bytes per block, the unit Blobs are read and kept in, at least 512 (default: 16 KiB) */
   blockSize?: number
   /**
    * Bytes of blocks kept, the least recently used leave first (default:
@@ -121,7 +121,8 @@ export class BlockCache {
     this.readAhead = options.readAhead ?? READ_AHEAD_BYTES
     wholeNumber('cacheBytes', this.budget, 0)
     for (const [name, value, min] of [
-      ['blockSize', this.blockSize, 1],
+      // Keys hold up to 2^32 blocks: 2 TiB of blocks of 512 bytes
+      ['blockSize', this.blockSize, 512],
       ['readAround', this.readAround, 0],
       ['readAhead', this.readAhead, 0]
     ] as const) {
@@ -166,6 +167,8 @@ export class BlockCache {
     if (waiting) this.evict(this.waiting, room - size, true)
     if (this.bytes + size > this.budget) {
       this.evict(this.waiting, this.waitingBytes - (this.bytes + size - this.budget), true)
+      // Blocks not asked for do not push out blocks in use.
+      if (waiting && this.bytes + size > this.budget) return
       this.evict(this.used, this.budget - size - this.waitingBytes, false)
     }
     ;(waiting ? this.waiting : this.used).set(key, data)
@@ -228,6 +231,7 @@ export function readOnlyFile(
   } else {
     const reader = new FileReaderSync()
     const size = source.size
+    if (options.blocks !== undefined) wholeNumber('blocks', options.blocks, 0)
     const cache =
       options.cache?.blocks ??
       new BlockCache({

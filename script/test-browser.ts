@@ -91,6 +91,7 @@ try {
     if (message.type() === 'error') console.error('console:', message.text())
   })
   if (args.fts) {
+    if (!(Number(args.runs) >= 1)) throw new Error(`--runs must be at least 1, not ${args.runs}`)
     await page.goto(`http://127.0.0.1:${server.port}/fts`)
     await page.waitForFunction(() => 'runFtsBenchmark' in window)
     const results = await page.evaluate(
