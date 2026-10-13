@@ -6,13 +6,16 @@
 //   bun script/test-browser.ts --bench [--seconds 30] [--out results.json]
 //   bun script/test-browser.ts --fts [--runs 3] [--read-cache '{"blockSize": 65536}']
 //   bun script/test-browser.ts --compact [--rounds 60]
+//   bun script/test-browser.ts --storage [--rounds 100] [--runs 3]
 //
 // --bench runs the benchmarks of test/browser/bench.js instead of the tests,
 // prints their results and writes them, with the machine and browser, to
 // --out (default bench-results/<browser>.json); see BENCHMARKS.md. --fts
 // times full-text searches on a snapshot in IndexedDB (test/browser/
-// fts-bench.js), and --compact full saves in place and compacted
-// (test/browser/compact-bench.js), and print the results. The
+// fts-bench.js), --compact full saves in place and compacted
+// (test/browser/compact-bench.js), and --storage the same searches on a
+// snapshot and on an OPFS file (test/browser/storage-bench.js), and print
+// the results. The
 // browser build matching playwright-core must be installed (bunx
 // playwright-core install chromium), or CHROMIUM_PATH, FIREFOX_PATH or
 // WEBKIT_PATH set to another.
@@ -28,7 +31,8 @@ const {values: args} = parseArgs({
     bench: {type: 'boolean', default: false},
     fts: {type: 'boolean', default: false},
     compact: {type: 'boolean', default: false},
-    rounds: {type: 'string', default: '60'},
+    storage: {type: 'boolean', default: false},
+    rounds: {type: 'string'},
     runs: {type: 'string', default: '3'},
     'read-cache': {type: 'string'},
     seconds: {type: 'string', default: '30'},
@@ -49,10 +53,13 @@ const built = await Bun.build({
     'test/browser/fts-worker.js',
     'test/browser/compact-bench.js',
     'test/browser/compact-worker.js',
+    'test/browser/storage-bench.js',
+    'test/browser/storage-worker.js',
     'test/browser/worker.js',
     'test/browser/snapshot-worker.js'
   ],
   outdir: out,
+  root: 'test/browser',
   target: 'browser',
   format: 'esm'
 })
@@ -70,7 +77,8 @@ const server = Bun.serve({
       '/': './page.js',
       '/bench': './bench.js',
       '/fts': './fts-bench.js',
-      '/compact': './compact-bench.js'
+      '/compact': './compact-bench.js',
+      '/storage': './storage-bench.js'
     }
     if (pathname in pages) {
       const script = pages[pathname]
@@ -97,13 +105,21 @@ try {
   page.on('console', message => {
     if (message.type() === 'error') console.error('console:', message.text())
   })
-  if (args.compact) {
+  if (args.storage) {
+    await page.goto(`http://127.0.0.1:${server.port}/storage`)
+    await page.waitForFunction(() => 'runStorageBenchmark' in window)
+    const results = await page.evaluate(
+      options => (window as any).runStorageBenchmark(options),
+      {rounds: Number(args.rounds ?? 100), runs: Number(args.runs)}
+    )
+    console.log(JSON.stringify(results, null, 2))
+  } else if (args.compact) {
     await page.goto(`http://127.0.0.1:${server.port}/compact`)
     await page.waitForFunction(() => 'runCompactBenchmark' in window)
     const results = await page.evaluate(
       options => (window as any).runCompactBenchmark(options),
       {
-        rounds: Number(args.rounds),
+        rounds: Number(args.rounds ?? 60),
         readCache: args['read-cache'] ? JSON.parse(args['read-cache']) : undefined
       }
     )

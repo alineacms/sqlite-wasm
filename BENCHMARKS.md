@@ -308,3 +308,35 @@ place. This benchmark scatters pages less than alinea's syncs did (a real
 site's entry table had 7% of its leaf pages in order): there a search
 through a scattered snapshot read 4,272 Blobs and took 3.3 s, and 198
 reads and 0.4 s once vacuumed.
+
+## Snapshots against an OPFS file, for full-text search
+
+`bun script/test-browser.ts --storage --rounds 100` builds the full-text
+search database of `test/browser/fts-data.js` (30,000 entries, an FTS5 table,
+200 MB of 4 KB pages) in memory, and stores it three times: fresh, after
+100 rounds of 100 entries rewritten all over (scattered), and vacuumed after
+those. Each is stored as a snapshot in IndexedDB (a Blob, read with
+`FileReaderSync` through the block cache) and as an OPFS file
+(`opfsStorage`, read with a sync access handle), and opened in a new
+dedicated Worker, with an 8 MB page cache for both. Then two rounds of the
+same searches: prefix matches as one types, ranked with snippets, a broad
+match joined to the entries, and 2,000 lookups by path. Headless Chromium
+141, Linux, median of 3 runs; `r` is Blob reads.
+
+| | fresh snapshot | fresh file | scattered snapshot | scattered file | vacuumed snapshot | vacuumed file |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| open (counting entries) | 404 ms, 142 r | 28 ms | 277 ms, 142 r | 28 ms | 38 ms, 3 r | 29 ms |
+| match k* | 890 ms, 244 r | 375 ms | 1075 ms, 312 r | 486 ms | 637 ms, 95 r | 467 ms |
+| match a* join entries | 951 ms, 505 r | 129 ms | 1315 ms, 645 r | 159 ms | 227 ms, 27 r | 179 ms |
+| 2,000 indexed lookups | 174 ms, 127 r | 16 ms | 223 ms, 135 r | 20 ms | 25 ms, 0 r | 17 ms |
+| round 1, all searches | 2764 ms, 1087 r | 884 ms | 3791 ms, 1414 r | 1146 ms | 1787 ms, 353 r | 1103 ms |
+| round 2, all searches | 2648 ms, 1049 r | 852 ms | 3346 ms, 1382 r | 1053 ms | 1042 ms, 0 r | 953 ms |
+
+Read from a file, the searches take about what SQLite itself takes (the
+second round of the vacuumed snapshot, read from the cache, is as fast), and
+how the pages lie hardly matters: scattered or vacuumed, 1.1 s. Read from a
+snapshot, every Blob read costs about a millisecond and layout decides:
+3.8 s scattered, 1.8 s vacuumed, 2.8 s fresh (where entries and their
+search index were written interleaved). A shared Web Lock around a query,
+which Workers in several tabs reading one file would take, costs 0.14 ms
+(a lookup by path takes 0.008 ms).
