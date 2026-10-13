@@ -33,13 +33,15 @@ const WRITE_BYTES = 4 << 20
 // millisecond for 64 KB.
 const CACHE_KIB = 8192
 // Blob reads of snapshots, see readOnlyFile: bytes per block, bytes of
-// blocks kept, bytes read around a block that is not kept (a FileReaderSync
-// read of 256 KiB costs little more than one of 4 KiB), and bytes read at
-// once by scans
+// blocks kept, bytes read around a block that is not kept (each
+// FileReaderSync read has a fixed cost, so fewer and larger reads pay), and
+// bytes read at once by scans
 const BLOCK_BYTES = 16 << 10
 const CACHE_BYTES = 32 << 20
 const READ_AROUND_BYTES = 256 << 10
 const READ_AHEAD_BYTES = 1 << 20
+// The block size of 0.8.1, which the deprecated `blocks` option counts in
+const OLD_BLOCK_BYTES = 1 << 20
 // Saves write the pages that changed over the snapshot they read, as a
 // delta, while at most this many deltas lie on a full snapshot (see
 // maxDepth), its pages take at most half the bytes of the database, and
@@ -78,7 +80,10 @@ export interface ReadCacheOptions {
 
 /** How a read-only file reads a Blob, see `readOnlyFile`. */
 export interface ReadOnlyFileOptions extends ReadCacheOptions {
-  /** @deprecated How many blocks are kept, use `cacheBytes` */
+  /**
+   * @deprecated How many blocks are kept, of `blockSize` or else 1 MiB (the
+   * block size of 0.8.1): use `cacheBytes`
+   */
   blocks?: number
   /**
    * Blocks to share with other files, and the content of this one among
@@ -114,11 +119,15 @@ export class BlockCache {
     this.budget = options.cacheBytes ?? CACHE_BYTES
     this.readAround = options.readAround ?? READ_AROUND_BYTES
     this.readAhead = options.readAhead ?? READ_AHEAD_BYTES
-    wholeNumber('blockSize', this.blockSize, 1)
-    if (this.blockSize === Infinity) throw new RangeError('blockSize must be finite')
     wholeNumber('cacheBytes', this.budget, 0)
-    wholeNumber('readAround', this.readAround, 0)
-    wholeNumber('readAhead', this.readAhead, 0)
+    for (const [name, value, min] of [
+      ['blockSize', this.blockSize, 1],
+      ['readAround', this.readAround, 0],
+      ['readAhead', this.readAhead, 0]
+    ] as const) {
+      wholeNumber(name, value, min)
+      if (value === Infinity) throw new RangeError(`${name} must be finite`)
+    }
   }
 
   /** The key of block 0 of `content` */
@@ -226,7 +235,7 @@ export function readOnlyFile(
         cacheBytes:
           options.cacheBytes ??
           (options.blocks !== undefined
-            ? options.blocks * (options.blockSize ?? BLOCK_BYTES)
+            ? options.blocks * (options.blockSize ?? OLD_BLOCK_BYTES)
             : undefined)
       })
     const {blockSize, budget} = cache
@@ -244,7 +253,8 @@ export function readOnlyFile(
     read = (buffer, at) => {
       const end = Math.min(at + buffer.length, size)
       if (end <= at) return 0
-      const forward = at >= previousEnd && at < previousEnd + blockSize
+      // Shortly after: within the span read around
+      const forward = at >= previousEnd && at < previousEnd + around * blockSize
       previousEnd = end
       if (budget === 0) {
         buffer.set(readRange(at, end))
@@ -1417,8 +1427,8 @@ function* runs(delta: DeltaLayout, start: number, end: number): Generator<Run> {
  * snapshots that lie over it, and each keeps track of its own reads.
  */
 function layerFile(layer: Layer, blocks: BlockCache): SyncFile {
-  // A key is written anew with another createdAt
-  const content = `${layer.info.createdAt}:${layer.info.key}`
+  // A key is written anew with another createdAt (and likely size)
+  const content = `${layer.info.createdAt}:${sizeOf(layer.source)}:${layer.info.key}`
   const own = readOnlyFile(layer.source, {cache: {blocks, content}})
   const {delta, below} = layer
   if (!delta || !below) return own

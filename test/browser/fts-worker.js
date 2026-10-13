@@ -1,5 +1,5 @@
 // The Worker of fts-bench.js: builds a database with an FTS5 table of
-// about 130 MB and saves it as a snapshot in IndexedDB, or opens that
+// about 200 MB and saves it as a snapshot in IndexedDB, or opens that
 // snapshot and times full-text searches and indexed lookups on it, as
 // alinea's dashboard searches its cache. Counts the Blob reads
 // (FileReaderSync) each query makes.

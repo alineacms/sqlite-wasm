@@ -18,5 +18,5 @@
 - New option `readCache: {blockSize, cacheBytes, readAround, readAhead}` for
   `indexedDBSnapshots`, `opfsSnapshots` and `SnapshotStorage`. `readOnlyFile`
   takes the same options. Its `blocks` option is deprecated in favour of
-  `cacheBytes`.
+  `cacheBytes`, and still counts blocks of 1 MiB unless `blockSize` is given.
 - Snapshots, their format and the data stored are unchanged.

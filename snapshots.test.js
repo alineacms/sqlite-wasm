@@ -1689,6 +1689,12 @@ describe('Read-only files', () => {
     const other = readOnlyFile(old.blob, {blockSize: 1024, blocks: 0})
     other.read(new Uint8Array(100), {at: 50})
     expect(old.slices).toEqual([[50, 100]])
+    // blocks counts blocks of 1 MiB, as in 0.8.1, without a blockSize
+    const four = countingBlob(pattern(8 << 20))
+    const kept = readOnlyFile(four.blob, {blocks: 4, readAround: 0, readAhead: 0})
+    for (let i = 0; i < 2; i++)
+      for (let at = 0; at < 4 << 20; at += 64 << 10) kept.read(new Uint8Array(10), {at: at + 100})
+    expect(four.slices.length).toBe(64)
   })
 
   test('refuse bad options', () => {
@@ -1697,6 +1703,7 @@ describe('Read-only files', () => {
     expect(() => readOnlyFile(blob, {cacheBytes: -1})).toThrow(RangeError)
     expect(() => readOnlyFile(blob, {readAhead: 1.5})).toThrow(RangeError)
     expect(() => readOnlyFile(blob, {readAround: -1})).toThrow(RangeError)
+    expect(() => readOnlyFile(blob, {readAround: Infinity})).toThrow(RangeError)
     expect(() => indexedDBSnapshots('x', {readCache: {blockSize: 0}})).toThrow(RangeError)
   })
 
