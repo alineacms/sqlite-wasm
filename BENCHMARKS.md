@@ -277,3 +277,34 @@ a profile of alinea's dashboard, the fewer reads count for more. Other
 settings (`--read-cache '{...}'`), round 1 / round 2 reads: 64 KiB blocks
 without reading around, 1194 / 1152; 256 KiB blocks, 64 MiB, 833 / 785;
 readAround 16 KiB, 1446 / 0; 64 KiB, 1237 / 0; 128 KiB, 1203 / 0.
+
+## Compacted full saves (0.8.3)
+
+`bun script/test-browser.ts --compact --rounds 200` builds a database of
+100,000 rows of 1 KB with an index on a path column (4 KB pages), saves it,
+then makes 200 rounds of 100 changes all over the table (updates that grow
+or shrink rows, inserts, deletes), each saved as a delta, in place, with a
+full save in place every few (as 0.8.2 saved). From there it saves in full,
+in place and compacted, timing each and the longest the Worker went
+without a timer firing; then opens each in a new Worker and reads it: the
+whole table in key order, and rows by a range of the index. Headless
+Chromium 141, Linux, one run.
+
+| | save | longest busy | size | table scan | index range |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| IndexedDB, in place | 2.6 s | 0.28 s | 141 MB | 1.62 s, 412 reads | 1.21 s, 407 reads |
+| IndexedDB, compacted | 2.4 s | 0.67 s | 130 MB | 0.87 s, 226 reads | 0.83 s, 228 reads |
+| OPFS, in place | 1.1 s | 0.12 s | 141 MB | 1.55 s, 412 reads | 1.34 s, 407 reads |
+| OPFS, compacted | 3.5 s | 1.5 s | 130 MB | 1.05 s, 226 reads | 0.94 s, 228 reads |
+
+A compacted save reads the database into memory at once (0.7–1.6 s,
+asynchronously), then copies it with `VACUUM INTO` while the Worker waits
+(0.6–0.7 s in a run with timers inside: the longest stretch above for
+OPFS was a single slower run), and moves the database onto the copy
+(10 ms). Copying from the stored snapshot instead, page by page through
+the block cache, took 1.6–2 s more than from memory, as the scattered
+pages are read in key order. Writing it is the same as a full save in
+place. This benchmark scatters pages less than alinea's syncs did (a real
+site's entry table had 7% of its leaf pages in order): there a search
+through a scattered snapshot read 4,272 Blobs and took 3.3 s, and 198
+reads and 0.4 s once vacuumed.

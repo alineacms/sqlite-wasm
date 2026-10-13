@@ -2048,6 +2048,87 @@ int sqlite3_overlay_rebase(
 }
 
 /*
+** Move the overlay behind zSchema onto a new read-only base file, zPath of
+** VFS zVfs, which holds the same database as pSnapshot in another layout,
+** such as a copy VACUUM INTO wrote: no page is where it was. That only
+** works while the overlay holds exactly what pSnapshot (a snapshot of it on
+** the same base file) holds, so it drops every page and reads the new base
+** whole; else SQLITE_BUSY, as also while a connection reads or writes it.
+** SQLITE_CORRUPT if the new base has another page size. The caller drops
+** what the connection's page cache holds (sqlite3_db_release_memory):
+** pages it cached are not where they were. On failure the overlay reads
+** its old base, as before. With zPath NULL, only tells if it could move:
+** SQLITE_OK or SQLITE_BUSY.
+*/
+int sqlite3_overlay_replace(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3 *pSnapshot,
+  const char *zSnapshotSchema,
+  const char *zVfs,
+  const char *zPath
+){
+  Overlay *ov = ovOf(db, zSchema);
+  Overlay *snap = pSnapshot ? ovOf(pSnapshot, zSnapshotSchema) : 0;
+  sqlite3_vfs *pVfs = zVfs ? sqlite3_vfs_find(zVfs) : 0;
+  Overlay base;
+  i64 i, n, szBase = 0;
+  int rc;
+  if( ov==0 || snap==0 || ov==snap ) return SQLITE_MISUSE;
+  if( ov->pBaseVfs || ov->bBorrowed || ov->xCommit || ov->szMmap>0 ){
+    return SQLITE_MISUSE;
+  }
+  if( snap->szChunk!=ov->szChunk || (ov->zPath==0)!=(snap->zPath==0)
+   || (ov->zPath && strcmp(ov->zPath, snap->zPath)!=0) ){
+    return SQLITE_MISUSE;
+  }
+  if( ov->nShared>0 || ov->pWriter ) return SQLITE_BUSY;
+
+  /* Nothing changed since the snapshot: the same pages, by reference. */
+  if( ov->szFile!=snap->szFile || ov->szVisible!=snap->szVisible ){
+    return SQLITE_BUSY;
+  }
+  n = ov->nPage>snap->nPage ? ov->nPage : snap->nPage;
+  for(i=0; i<n; i++){
+    OvPage *a = i<ov->nPage ? ov->apPage[i] : 0;
+    OvPage *b = i<snap->nPage ? snap->apPage[i] : 0;
+    if( a!=b ) return SQLITE_BUSY;
+  }
+  if( zPath==0 ) return SQLITE_OK;
+  if( pVfs==0 || strcmp(zVfs, OVERLAY_VFS_NAME)==0 ) return SQLITE_CANTOPEN;
+
+  memset(&base, 0, sizeof(base));
+  base.szChunk = ov->szChunk;
+  rc = ovOpenBase(&base, pVfs, zPath, 0, &szBase);
+  if( rc==SQLITE_OK ){
+    base.szChunk = 0;
+    rc = szBase>0 ? ovReadHead(&base, szBase) : SQLITE_CORRUPT;
+  }
+  if( rc==SQLITE_OK && base.szChunk!=ov->szChunk ) rc = SQLITE_CORRUPT;
+  if( rc!=SQLITE_OK ){
+    if( base.pHead ) sqlite3_free(base.pHead);
+    ovCloseBase(&base);
+    return rc;
+  }
+
+  ovEnter();
+  ovDropPagesLocked(ov, 0);
+  if( ov->pHead && --ov->pHead->nRef==0 ) sqlite3_free(ov->pHead);
+  ovLeave();
+  ovCloseBase(ov);
+  ov->pBase = base.pBase;
+  ov->zPath = base.zPath;
+  ov->szMmap = base.szMmap;
+  ov->pHead = base.pHead;
+  ov->nHead = base.nHead;
+  ov->pRoVfs = pVfs;
+  ov->szFile = szBase;
+  ov->szVisible = szBase;
+  ov->szStored = szBase;
+  return SQLITE_OK;
+}
+
+/*
 ** Register the "overlay" VFS on top of the current default VFS. Safe to call
 ** more than once. Used directly when this file is compiled into SQLite.
 */

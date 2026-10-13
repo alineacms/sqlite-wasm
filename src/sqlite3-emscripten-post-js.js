@@ -25,6 +25,7 @@ Module['tempInt32'] = stackAlloc(4);
   Module['alinea_open_base'] = cwrap('alinea_open_base', 'number', ['string', 'number']);
   Module['alinea_pages'] = cwrap('alinea_pages', 'number', ['number', 'number', 'number']);
   Module['alinea_rebase'] = cwrap('alinea_rebase', 'number', ['number', 'number', 'string']);
+  Module['alinea_replace'] = cwrap('alinea_replace', 'number', ['number', 'number', 'string']);
   Module['alinea_flush'] = cwrap('alinea_flush', 'number', ['number']);
   Module['alinea_attach_file'] = cwrap('alinea_attach_file', 'number', ['number', 'string']);
   Module['alinea_detach_file'] = cwrap('alinea_detach_file', 'number', ['number', 'number']);

@@ -58,5 +58,13 @@ int sqlite3_overlay_rebase(
   const char *zVfs,
   const char *zPath
 );
+int sqlite3_overlay_replace(
+  sqlite3 *db,
+  const char *zSchema,
+  sqlite3 *pSnapshot,
+  const char *zSnapshotSchema,
+  const char *zVfs,
+  const char *zPath
+);
 
 #endif

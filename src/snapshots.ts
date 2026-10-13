@@ -23,6 +23,7 @@ import {SQLiteError} from './SQLiteError.js'
 const SQLITE_BUSY = 5
 const SQLITE_READONLY = 8
 const SQLITE_IOERR_READ = 266
+const SQLITE_IOERR_WRITE = 778
 const SQLITE_CORRUPT = 11
 const SQLITE_CANTOPEN = 14
 const SQLITE_MISUSE = 21
@@ -98,9 +99,8 @@ export interface ReadOnlyFileOptions extends ReadCacheOptions {
 /**
  * Blocks read from Blobs, which hold at most `budget` bytes. Blocks that
  * were read along with others but not asked for wait apart, in at most a
- * quarter of the budget, until they are asked for: they leave first, so
- * that they do not push out blocks in use. Either part is kept least
- * recently used first. Keys are the content (see `prefix`) and the index
+ * quarter of the budget, until they are asked for: blocks in use keep the
+ * rest. Either part is kept least recently used first. Keys are the content (see `prefix`) and the index
  * of the block, so they are held only as long as their blocks.
  * @internal
  */
@@ -163,13 +163,14 @@ export class BlockCache {
     const room = waiting ? this.budget / 4 : this.budget
     // A block larger than the cache is not kept.
     if (size > room) return
+    // Blocks read along keep to their quarter, so they never push out more
+    // than a quarter of the blocks in use; within it, they do, or scans
+    // that fill the cache would drop what they read ahead.
     if (waiting) this.evict(this.waiting, room - size, true)
-    if (this.bytes + size > this.budget) {
-      this.evict(this.waiting, this.waitingBytes - (this.bytes + size - this.budget), true)
-      // Blocks not asked for do not push out blocks in use.
-      if (waiting && this.bytes + size > this.budget) return
+    if (this.bytes + size > this.budget)
       this.evict(this.used, this.budget - size - this.waitingBytes, false)
-    }
+    if (this.bytes + size > this.budget)
+      this.evict(this.waiting, this.budget - size - (this.bytes - this.waitingBytes), true)
     ;(waiting ? this.waiting : this.used).set(key, data)
     this.bytes += size
     if (waiting) this.waitingBytes += size
@@ -512,6 +513,12 @@ export interface NewSnapshot {
    * (see `DeltaLayout`, whose `pages` are `pages`)
    */
   delta?: Omit<DeltaLayout, 'pages' | 'chunkSize' | 'visible'>
+  /**
+   * The whole new snapshot, if it is put together already, such as a
+   * compacted copy of the database: then `base` is this too, `visible` its
+   * size, and there are no pages. Stores keep it as it is.
+   */
+  readonly content?: BaseSource
 }
 
 /** Where a `SnapshotStorage` keeps its bases. */
@@ -836,6 +843,8 @@ export function directorySnapshotStore(
               `Snapshot "${snapshot.key}" would lie over "${delta.parent}", which is missing`,
               SQLITE_CANTOPEN
             )
+        } else if (snapshot.content) {
+          await writer.copy(snapshot.content)
         } else {
           // The old content where no page replaces it, then the pages: the
           // old content is read only where it is needed.
@@ -1118,7 +1127,11 @@ export function indexedDBSnapshotStore(
               ([i, end]) => pageRun(base, i, end) as Uint8Array<ArrayBuffer>
             )
           )
-        : await composeBlob(base)
+        : base.content
+          ? base.content instanceof Blob
+            ? base.content
+            : new Blob([base.content as Uint8Array<ArrayBuffer>])
+          : await composeBlob(base)
       const record: BaseRecord = {
         key: base.key,
         branch: base.branch,
@@ -1244,6 +1257,8 @@ export function memorySnapshotStore(name = 'memory'): SnapshotStore {
       if (delta) {
         data = new Uint8Array(pages.length * chunkSize)
         pages.forEach((_, i) => data.set(snapshot.page(i), i * chunkSize))
+      } else if (snapshot.content) {
+        data = await bytesOf(snapshot.content)
       } else {
         data = new Uint8Array(size)
         const keep = Math.min(visible, size)
@@ -1347,6 +1362,261 @@ export function memorySnapshots(
   return new SnapshotStorage(store, options)
 }
 
+/**
+ * The file VACUUM INTO writes a compacted copy of a database to, in pages
+ * (SQLite writes whole pages, mostly one after the other). Pages that
+ * follow each other are gathered into runs of up to WRITE_BYTES, kept as
+ * Blobs where they can be read back synchronously (`FileReaderSync`), so
+ * the copy stays out of the JavaScript heap, else as bytes. A page written
+ * again once its run is out is kept apart. `content()` puts it together.
+ */
+class CompactFile implements SyncFile {
+  private unit = 0
+  private size = 0
+  private blobs = typeof FileReaderSync === 'function'
+  /** Where each page is, other than those of the run being gathered */
+  private where = new Map<number, {run: BaseSource; index: number} | Uint8Array>()
+  private pending = new Uint8Array(0)
+  private first = 0
+  private count = 0
+  private reader?: FileReaderSync
+
+  write(buffer: Uint8Array, {at}: {at: number}) {
+    if (!this.unit) {
+      this.unit = buffer.length
+      this.pending = new Uint8Array(
+        Math.max(1, Math.floor(WRITE_BYTES / this.unit)) * this.unit
+      )
+    }
+    const {unit} = this
+    if (buffer.length !== unit || at % unit !== 0)
+      throw new SQLiteError('Compacted copies are written in pages', SQLITE_IOERR_WRITE)
+    const page = at / unit
+    if (page >= this.first && page < this.first + this.count) {
+      this.pending.set(buffer, (page - this.first) * unit)
+    } else if (this.where.has(page)) {
+      this.where.set(page, buffer.slice())
+    } else {
+      if (page !== this.first + this.count || this.count * unit === this.pending.length) {
+        this.putAway()
+        this.first = page
+      }
+      this.pending.set(buffer, this.count * unit)
+      this.count++
+    }
+    this.size = Math.max(this.size, at + unit)
+    return unit
+  }
+
+  read(buffer: Uint8Array, {at}: {at: number}) {
+    const end = Math.min(at + buffer.length, this.size)
+    buffer.fill(0)
+    for (let pos = at; pos < end; ) {
+      const page = Math.floor(pos / this.unit)
+      const start = page * this.unit
+      const to = Math.min(end, start + this.unit)
+      const data = this.page(page)
+      if (data) buffer.set(data.subarray(pos - start, to - start), pos - at)
+      pos = to
+    }
+    return Math.max(0, end - at)
+  }
+
+  truncate(size: number) {
+    this.size = Math.min(this.size, size)
+  }
+
+  getSize() {
+    return this.size
+  }
+
+  flush() {}
+  close() {}
+
+  /** Page `page`, or undefined if it was never written */
+  private page(page: number): Uint8Array | undefined {
+    const {unit} = this
+    if (page >= this.first && page < this.first + this.count) {
+      const at = (page - this.first) * unit
+      return this.pending.subarray(at, at + unit)
+    }
+    const at = this.where.get(page)
+    if (!at || at instanceof Uint8Array) return at
+    const {run, index} = at
+    if (run instanceof Uint8Array) return run.subarray(index * unit, (index + 1) * unit)
+    this.reader ??= new FileReaderSync()
+    return new Uint8Array(
+      this.reader.readAsArrayBuffer(run.slice(index * unit, (index + 1) * unit))
+    )
+  }
+
+  /** Put away the run being gathered */
+  private putAway() {
+    if (this.count === 0) return
+    const bytes = this.pending.slice(0, this.count * this.unit)
+    const run: BaseSource = this.blobs ? new Blob([bytes]) : bytes
+    for (let k = 0; k < this.count; k++) this.where.set(this.first + k, {run, index: k})
+    this.count = 0
+  }
+
+  /** The whole file, once it is written: a Blob, or bytes */
+  content(): BaseSource {
+    this.putAway()
+    const {unit, size} = this
+    const parts: Array<BaseSource> = []
+    const pages = unit ? Math.ceil(size / unit) : 0
+    for (let page = 0; page < pages; ) {
+      const at = this.where.get(page)
+      let next = page + 1
+      if (!at) {
+        while (next < pages && !this.where.has(next)) next++
+        parts.push(new Uint8Array((next - page) * unit))
+      } else if (at instanceof Uint8Array) {
+        parts.push(at)
+      } else {
+        // The pages of one run that follow each other there
+        for (;;) {
+          const after = this.where.get(next)
+          if (!after || after instanceof Uint8Array || after.run !== at.run) break
+          if (after.index !== at.index + next - page) break
+          next++
+        }
+        parts.push(slice(at.run, at.index * unit, (at.index + next - page) * unit))
+      }
+      page = next
+    }
+    this.where.clear()
+    this.pending = new Uint8Array(0)
+    if (this.blobs) {
+      const blob = new Blob(parts as Array<BlobPart>)
+      return blob.size > size ? blob.slice(0, size) : blob
+    }
+    const bytes = new Uint8Array(size)
+    let at = 0
+    for (const part of parts as Array<Uint8Array>) {
+      if (at >= size) break
+      bytes.set(part.subarray(0, size - at), at)
+      at += part.byteLength
+    }
+    return bytes
+  }
+}
+
+/** A file that keeps nothing: the journal of a new compacted copy */
+class DiscardFile implements SyncFile {
+  read() {
+    return 0
+  }
+  write(buffer: Uint8Array) {
+    return buffer.length
+  }
+  truncate() {}
+  getSize() {
+    return 0
+  }
+  flush() {}
+  close() {}
+}
+
+/** A compacted copy written for a save, see SnapshotStorage.compact */
+interface Compacted {
+  /** What the databases that moved onto it read until it is stored */
+  base: Base
+  moved: Array<Database>
+  /** A fork that reads the copy, without pages of its own */
+  anchor: Database | undefined
+  /** The snapshot to write, for the one the save would write */
+  snapshot(full: NewSnapshot): NewSnapshot
+}
+
+/**
+ * The compacted copy `image`, which is not stored (yet): saves over it
+ * write in full, and it is no snapshot of the session.
+ */
+function compactedBase(image: BaseSource, blocks: BlockCache, content: string): Base {
+  const size = sizeOf(image)
+  const info: SnapshotInfo = {key: '', branch: '', meta: {}, createdAt: 0, size}
+  return {
+    ...info,
+    layer: {info, source: image},
+    keys: [],
+    depth: 0,
+    chainBytes: 0,
+    pending: true,
+    content: (start = 0, end = size) =>
+      start === 0 && end === size ? image : slice(image, start, end),
+    file: () => readOnlyFile(image, {cache: {blocks, content}})
+  }
+}
+
+/**
+ * A compacted copy of `db`, written with VACUUM INTO: every table and index
+ * in order, without free pages. Kept as Blobs where Workers can read them
+ * back, see CompactFile.
+ */
+function vacuum(db: Database): BaseSource {
+  const files = filesOf(db.wasm)
+  const name = `vacuum/${nextFile++}`
+  const out = new CompactFile()
+  files.add(name, out)
+  // VACUUM INTO opens a journal, which a new file never needs.
+  files.add(`${name}-journal`, new DiscardFile())
+  try {
+    db.run('vacuum into ?', [`file:${name}?vfs=js`])
+  } finally {
+    files.remove(name)
+    files.remove(`${name}-journal`)
+  }
+  return out.content()
+}
+
+/**
+ * A database that holds what `full` (a full save of `snapshot`) writes, in
+ * memory, read at once: VACUUM INTO reads every table in key order, which
+ * over a stored snapshot whose pages saves scattered takes a read for every
+ * few pages, and many times as long.
+ */
+async function inMemory(full: NewSnapshot, snapshot: Database): Promise<Database> {
+  const {size, visible, chunkSize, pages} = full
+  const keep = Math.min(visible, size)
+  const base = keep > 0 ? baseRange(full, 0, keep) : undefined
+  let bytes: Uint8Array
+  if (base instanceof Blob && keep === size) {
+    bytes = new Uint8Array(await base.arrayBuffer())
+  } else {
+    // Stored bytes are shared: pages go over a copy.
+    bytes = new Uint8Array(size)
+    if (base) bytes.set(await bytesOf(base))
+  }
+  // Pages are views of Wasm memory: take them after the last await.
+  pages.forEach((index, i) => {
+    const start = index * chunkSize
+    bytes.set(full.page(i).subarray(0, size - start), start)
+  })
+  const Database = snapshot.constructor as new () => Database
+  return openOn(Database, readOnlyFile(bytes), size, 'The database to compact', () => {})
+}
+
+/** The snapshot to write for `full`, a full save, as compacted `image` */
+function compactedSnapshot(full: NewSnapshot, image: BaseSource): NewSnapshot {
+  const {key, branch, meta, chunkSize} = full
+  const size = sizeOf(image)
+  return {
+    key,
+    branch,
+    meta,
+    base: image,
+    content: image,
+    visible: size,
+    size,
+    chunkSize,
+    pages: [],
+    page() {
+      throw new RangeError('A compacted snapshot has no pages')
+    }
+  }
+}
+
 /** A stored snapshot and, for a delta, the one it lies over. */
 interface Layer extends StoredSnapshot {
   below?: Layer
@@ -1364,6 +1634,8 @@ interface Base extends SnapshotInfo {
   content(start?: number, end?: number): BaseSource
   /** A file that reads it */
   file(): SyncFile
+  /** A compacted copy that is not stored (yet), see `compactedBase` */
+  pending?: true
 }
 
 function baseOf(layer: Layer, blocks: BlockCache): Base {
@@ -1383,7 +1655,7 @@ function baseOf(layer: Layer, blocks: BlockCache): Base {
 }
 
 function infoOf(base: Base | undefined): SnapshotInfo | undefined {
-  if (!base) return undefined
+  if (!base || base.pending) return undefined
   const {key, branch, meta, createdAt, size, parent} = base
   const info: SnapshotInfo = {key, branch, meta, createdAt, size}
   if (parent !== undefined) info.parent = parent
@@ -1553,6 +1825,8 @@ export interface AutoSaveOptions {
   meta?: (db: Database) => SnapshotMeta
   /** Called with the errors of saves (default: `reportError`) */
   onError?: (error: unknown) => void
+  /** See `SaveOptions.compact` */
+  compact?: boolean
 }
 
 export interface SaveOptions {
@@ -1562,6 +1836,15 @@ export interface SaveOptions {
    */
   key?: string
   meta?: SnapshotMeta
+  /**
+   * A save that writes the whole database (not a delta) writes a compacted
+   * copy, as VACUUM INTO does: every table and index in order, without
+   * free pages, which reads faster from a stored snapshot. `true` writes
+   * one now, also where the save would write a delta, such as after a
+   * large change; `false` never compacts, and writes the pages where they
+   * are. Default: compact what is written in full.
+   */
+  compact?: boolean
 }
 
 /**
@@ -1958,19 +2241,47 @@ export class SnapshotStorage {
    * they read the same snapshot as `db` until then. Those that read
    * another one by now (when moving one failed) stay where they are, as
    * does `db` once it is closed.
+   *
+   * A snapshot written in full is a compacted copy (see `compact`), unless
+   * `compact` is false: those that hold just what `snapshot` holds move onto
+   * it before it is stored, and onto the stored snapshot after.
    * @internal
    */
   async write(
     db: Database,
     snapshot: Database,
     waiting: Set<Database>,
-    {key, branch, meta}: {key: string; branch: string; meta: SnapshotMeta}
+    {
+      key,
+      branch,
+      meta,
+      compact
+    }: {key: string; branch: string; meta: SnapshotMeta; compact?: boolean}
   ): Promise<SaveResult> {
     const lock = once(await this.hold(key))
     let release = lock
     let registered = false
+    let compacted: Compacted | undefined
+    // The key holds a compacted copy of the database, not stored by this save
+    let replace = false
     try {
-      const content = newSnapshot(snapshot, key, branch, meta, this.maxDepth)
+      let content = newSnapshot(snapshot, key, branch, meta, compact ? 0 : this.maxDepth)
+      // A full snapshot is written compacted, unless its key exists: that
+      // is compared with the database as it is.
+      const compactFull = async () => {
+        if (content.delta || compact === false || content.size === 0) return
+        if ((snapshot.base as Base | undefined)?.key === key) return
+        const movable = () => compact === true || db.isClosed() || db.canReplace(snapshot)
+        if (!movable() || (await this.store.get(key))) return
+        const source = await inMemory(content, snapshot)
+        try {
+          compacted = this.compact(db, snapshot, waiting, compact === true, source)
+        } finally {
+          source.close()
+        }
+        if (compacted) content = compacted.snapshot(content)
+      }
+      await compactFull()
       const store = () => this.exclusive(key, () => this.store.write(content))
       let written: StoredSnapshot | undefined
       try {
@@ -1982,6 +2293,7 @@ export class SnapshotStorage {
         if (!content.delta || (error as SQLiteError)?.resultCode !== SQLITE_CANTOPEN)
           throw error
         content.delta = undefined
+        await compactFull()
         written = await store()
       }
       let target: Base
@@ -1997,12 +2309,18 @@ export class SnapshotStorage {
           })
         }
       } else {
-        const found = await this.existing(snapshot, key)
+        const found = await this.existing(
+          snapshot,
+          key,
+          compacted && content,
+          compact !== false && (db.isClosed() || db.canReplace(snapshot))
+        )
         if (found.status !== 'move') {
           lock()
           return {status: found.status, snapshot: found.info} as SaveResult
         }
         target = found.base
+        replace = found.replace
         // Resolving it holds the key too.
         lock()
         release = found.release
@@ -2014,17 +2332,44 @@ export class SnapshotStorage {
       files.add(file, target.file(), release)
       registered = true
       try {
-        if (!db.isClosed() && db.base === from) {
-          db.rebase(snapshot, file)
-          db.base = target
-        }
-        for (const later of waiting) {
-          if (later === snapshot || later.base !== from) continue
-          try {
-            later.rebase(snapshot, file)
-            later.base = target
-          } catch {
-            // It writes from the snapshot it reads, and db stays on that.
+        if (compacted) {
+          // From the compacted copy onto the same bytes, stored
+          const {anchor, base, moved} = compacted
+          for (const later of moved) {
+            if (later.isClosed() || later.base !== base) continue
+            try {
+              later.rebase(anchor!, file)
+              later.base = target
+            } catch {
+              // It keeps reading the copy.
+            }
+          }
+        } else if (replace) {
+          // In another layout: only those that did not change move.
+          for (const later of [db, ...waiting]) {
+            if (later === snapshot || later.isClosed() || later.base !== from) continue
+            try {
+              later.replace(snapshot, file)
+              later.base = target
+            } catch {
+              // Changed or reading meanwhile: it stays where it is.
+            }
+          }
+          if (!db.isClosed() && db.base !== target)
+            return {status: 'mismatch', snapshot: infoOf(target)}
+        } else {
+          if (!db.isClosed() && db.base === from) {
+            db.rebase(snapshot, file)
+            db.base = target
+          }
+          for (const later of waiting) {
+            if (later === snapshot || later.base !== from) continue
+            try {
+              later.rebase(snapshot, file)
+              later.base = target
+            } catch {
+              // It writes from the snapshot it reads, and db stays on that.
+            }
           }
         }
       } finally {
@@ -2034,7 +2379,59 @@ export class SnapshotStorage {
     } catch (error) {
       if (!registered) release()
       throw error
+    } finally {
+      compacted?.anchor?.close()
     }
+  }
+
+  /**
+   * Write a compacted copy of `snapshot` with VACUUM INTO: every table and
+   * index in order, without free pages. The copy is kept as Blobs where
+   * Workers can read them back, and `db` and the snapshots of later saves
+   * that hold just what `snapshot` holds read it from then on: no page is
+   * where it was, so a database that changed since cannot move onto it.
+   * Unless `force`, only when `db` can (or is closed).
+   */
+  private compact(
+    db: Database,
+    snapshot: Database,
+    waiting: Set<Database>,
+    force: boolean,
+    source: Database
+  ): Compacted | undefined {
+    const movers = [db, ...waiting].filter(
+      later =>
+        later !== snapshot &&
+        !later.isClosed() &&
+        later.base === snapshot.base &&
+        later.canReplace(snapshot)
+    )
+    if (!force && !db.isClosed() && !movers.includes(db)) return undefined
+    const files = filesOf(snapshot.wasm)
+    const image = vacuum(source)
+    const id = nextFile++
+    const base = compactedBase(image, this.blocks, `compact:${id}`)
+    const file = `compact/${id}`
+    files.add(file, base.file(), () => {})
+    const moved: Array<Database> = []
+    let anchor: Database | undefined
+    try {
+      for (const later of movers) {
+        try {
+          later.replace(snapshot, file)
+          later.base = base
+          moved.push(later)
+        } catch {
+          // In a transaction, or reading: it stays where it is.
+        }
+      }
+      // Reads the copy as they do, without pages: moving them onto the
+      // stored snapshot keeps every page they write from now on.
+      anchor = moved[0]?.fork()
+    } finally {
+      if (files.openHandles(file) === 0) files.remove(file)
+    }
+    return {base, moved, anchor, snapshot: full => compactedSnapshot(full, image)}
   }
 
   /**
@@ -2044,9 +2441,11 @@ export class SnapshotStorage {
    */
   private async existing(
     snapshot: Database,
-    key: string
+    key: string,
+    compacted?: NewSnapshot,
+    compactable = false
   ): Promise<
-    | {status: 'move'; base: Base; release: () => void; info?: undefined}
+    | {status: 'move'; base: Base; release: () => void; replace: boolean; info?: undefined}
     | {status: 'joined' | 'mismatch'; info: SnapshotInfo | undefined}
   > {
     const current = snapshot.base as Base | undefined
@@ -2054,9 +2453,11 @@ export class SnapshotStorage {
     try {
       // A key names content, but other Workers may have stored the same
       // rows in other pages, under which the pages a database holds would
-      // not fit.
-      const content = newSnapshot(snapshot, key, '', {}, 0)
-      if (current?.key === key) {
+      // not fit. A compacted copy (compacted, or one made to compare, if
+      // compactable) holds the same bytes when the same commits were
+      // compacted.
+      const content = compacted ?? newSnapshot(snapshot, key, '', {}, 0)
+      if (!compacted && current?.key === key) {
         const unchanged =
           content.pages.length === 0 && content.size === current.size
         return {status: unchanged ? 'joined' : 'mismatch', info: infoOf(current)}
@@ -2064,20 +2465,27 @@ export class SnapshotStorage {
       const found = await this.resolve(key)
       if (!found) return {status: 'mismatch', info: undefined}
       release = found.release
-      const same = sameDelta(found.base.layer, current, content)
-      const equal =
-        same === undefined
-          ? await holds(
-              (start, end) => found.base.content(start, end),
-              found.base.size,
-              content
-            )
-          : await same
+      const range = (start: number, end: number) => found.base.content(start, end)
+      const same = compacted ? undefined : sameDelta(found.base.layer, current, content)
+      let equal =
+        same === undefined ? await holds(range, found.base.size, content) : await same
+      let replace = Boolean(compacted)
+      if (!equal && !compacted && compactable && !found.base.layer.delta) {
+        const source = await inMemory(content, snapshot)
+        let image: BaseSource
+        try {
+          image = vacuum(source)
+        } finally {
+          source.close()
+        }
+        equal = await holds(range, found.base.size, compactedSnapshot(content, image))
+        replace = true
+      }
       if (!equal) {
         release()
         return {status: 'mismatch', info: infoOf(found.base)}
       }
-      return {status: 'move', base: found.base, release}
+      return {status: 'move', base: found.base, release, replace}
     } catch {
       // Deleted while it was read: the database stays where it is.
       release()
@@ -2217,7 +2625,8 @@ export class Session<D extends Database = Database> {
     const target = {
       key: options.key ?? uniqueKey(),
       branch: this.#branch,
-      meta: options.meta ?? {}
+      meta: options.meta ?? {},
+      compact: options.compact
     }
     const waiting = this.#waiting
     waiting.add(snapshot)
@@ -2293,7 +2702,7 @@ export class Session<D extends Database = Database> {
         return
       }
       running = true
-      this.save({key, meta})
+      this.save({key, meta, compact: options.compact})
         .catch(report)
         .finally(() => {
           running = false
@@ -2354,7 +2763,7 @@ function newSnapshot(
   let delta: NewSnapshot['delta']
   // Only over a snapshot of the same branch, so branches never need each
   // other's snapshots, and retain() can drop a branch whole.
-  if (base && visible > 0 && base.branch === branch) {
+  if (base && !base.pending && visible > 0 && base.branch === branch) {
     const bytes = pages.length * chunkSize
     const depth = base.depth + 1
     const chainBytes = base.chainBytes + bytes

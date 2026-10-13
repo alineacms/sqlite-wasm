@@ -265,6 +265,19 @@ int alinea_rebase(sqlite3 *db, sqlite3 *snapshot, const char *file) {
   return sqlite3_overlay_rebase(db, "main", snapshot, "main", "js", file);
 }
 
+// Moves db onto file of the "js" VFS (not URI-escaped), which holds the
+// same database as snapshot, a fork of db that holds the same pages, in
+// another layout (see sqlite3_overlay_replace). What the page cache holds
+// is dropped, as no page is where it was. Without file, only tells if db
+// could move: SQLITE_OK, or SQLITE_BUSY.
+int alinea_replace(sqlite3 *db, sqlite3 *snapshot, const char *file) {
+  int result = sqlite3_overlay_replace(db, "main", snapshot, "main", "js", file);
+  if (result == SQLITE_OK && file) {
+    sqlite3_db_release_memory(db);
+  }
+  return result;
+}
+
 // Stores db, an in-memory database, in file of the "js" VFS from now on, as
 // if it had been opened with alinea_open_file: its committed state replaces
 // what the file held.

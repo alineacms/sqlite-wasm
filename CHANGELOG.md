@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.8.3
+
+- Saves that write the whole database write a compacted copy, as `VACUUM
+  INTO` would: every table and index in order, without free pages. Full
+  saves used to keep every page where it was, so syncs that change rows all
+  over scattered tables further with every save (alinea measured 95% of an
+  entry table's leaf pages in order after a sync from scratch, 24% after
+  200 syncs), and reads from a stored snapshot, which read ahead in blocks,
+  read nearly a block per page. The database moves onto the copy at once,
+  and its next deltas lie over it. A database that changed since the save
+  was called, or is in a transaction or reading then, cannot move onto
+  another layout: that save writes in place, as before. Compacting reads
+  the database into memory at once, then copies it while the Worker waits
+  (0.6 s for 140 MB in Chromium); the copy is kept as Blobs.
+- New save option `compact`: `true` writes a compacted copy now, also where
+  a delta would do (after a large sync, say); `false` never compacts.
+  `autoSave` takes it too.
+- Fix the block cache of 0.8.2, which was never published: once the blocks
+  in use filled it, blocks read ahead were dropped as soon as they were
+  read, so a scan read 1 MiB for every 16 KiB it used (8 GB for a 136 MB
+  table in a benchmark). Blocks read along now keep a quarter of the
+  cache, and push out the oldest blocks in use to get it.
+- Snapshots, their format and the data stored are unchanged: compacted
+  snapshots are ordinary full snapshots, and older versions read them.
+
 ## 0.8.2
 
 - Faster random reads of snapshots stored as Blobs (`indexedDBSnapshots`,

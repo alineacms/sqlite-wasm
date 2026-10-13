@@ -129,7 +129,11 @@ export class MemorySnapshotDirectory {
       action()
     }
     return {
-      copy: source => write(() => file.write(source, {at: 0})),
+      copy: async source => {
+        const bytes =
+          source instanceof Uint8Array ? source : new Uint8Array(await source.arrayBuffer())
+        return write(() => file.write(bytes, {at: 0}))
+      },
       write: async (data, position) => {
         const bytes = data instanceof Uint8Array ? data : new Uint8Array(await data.arrayBuffer())
         return write(() => file.write(bytes, {at: position}))

@@ -5,12 +5,14 @@
 //   bun script/test-browser.ts [--browser chromium|firefox|webkit]
 //   bun script/test-browser.ts --bench [--seconds 30] [--out results.json]
 //   bun script/test-browser.ts --fts [--runs 3] [--read-cache '{"blockSize": 65536}']
+//   bun script/test-browser.ts --compact [--rounds 60]
 //
 // --bench runs the benchmarks of test/browser/bench.js instead of the tests,
 // prints their results and writes them, with the machine and browser, to
 // --out (default bench-results/<browser>.json); see BENCHMARKS.md. --fts
 // times full-text searches on a snapshot in IndexedDB (test/browser/
-// fts-bench.js), and prints the results. The
+// fts-bench.js), and --compact full saves in place and compacted
+// (test/browser/compact-bench.js), and print the results. The
 // browser build matching playwright-core must be installed (bunx
 // playwright-core install chromium), or CHROMIUM_PATH, FIREFOX_PATH or
 // WEBKIT_PATH set to another.
@@ -25,6 +27,8 @@ const {values: args} = parseArgs({
     browser: {type: 'string', default: 'chromium'},
     bench: {type: 'boolean', default: false},
     fts: {type: 'boolean', default: false},
+    compact: {type: 'boolean', default: false},
+    rounds: {type: 'string', default: '60'},
     runs: {type: 'string', default: '3'},
     'read-cache': {type: 'string'},
     seconds: {type: 'string', default: '30'},
@@ -43,6 +47,8 @@ const built = await Bun.build({
     'test/browser/bench.js',
     'test/browser/fts-bench.js',
     'test/browser/fts-worker.js',
+    'test/browser/compact-bench.js',
+    'test/browser/compact-worker.js',
     'test/browser/worker.js',
     'test/browser/snapshot-worker.js'
   ],
@@ -63,7 +69,8 @@ const server = Bun.serve({
     const pages: Record<string, string> = {
       '/': './page.js',
       '/bench': './bench.js',
-      '/fts': './fts-bench.js'
+      '/fts': './fts-bench.js',
+      '/compact': './compact-bench.js'
     }
     if (pathname in pages) {
       const script = pages[pathname]
@@ -90,7 +97,18 @@ try {
   page.on('console', message => {
     if (message.type() === 'error') console.error('console:', message.text())
   })
-  if (args.fts) {
+  if (args.compact) {
+    await page.goto(`http://127.0.0.1:${server.port}/compact`)
+    await page.waitForFunction(() => 'runCompactBenchmark' in window)
+    const results = await page.evaluate(
+      options => (window as any).runCompactBenchmark(options),
+      {
+        rounds: Number(args.rounds),
+        readCache: args['read-cache'] ? JSON.parse(args['read-cache']) : undefined
+      }
+    )
+    console.log(JSON.stringify(results, null, 2))
+  } else if (args.fts) {
     const runs = Number(args.runs)
     if (!Number.isInteger(runs) || runs < 1)
       throw new Error(`--runs must be a whole number of at least 1, not ${args.runs}`)

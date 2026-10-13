@@ -233,6 +233,31 @@ export class Database {
   }
 
   /**
+   * Read `file` of the "js" VFS from now on, which holds the same database
+   * as `snapshot` in another layout (such as a copy VACUUM INTO wrote).
+   * Only while this database holds exactly what `snapshot`, a fork of it,
+   * holds, and is not in a transaction: else fails with `SQLITE_BUSY`, and
+   * it reads what it did before. Its page cache is emptied.
+   * @internal
+   */
+  replace(snapshot: Database, file: string) {
+    if (!this.dbPtr || !snapshot.dbPtr) throw new Error('Database closed')
+    const result = this.wasm.alinea_replace(this.dbPtr, snapshot.dbPtr, file)
+    if (result !== ReturnCode.OK)
+      throw new SQLiteError(this.wasm.sqlite3_errstr(result), result)
+  }
+
+  /**
+   * If `replace(snapshot, file)` would move this database: it holds just
+   * what `snapshot` holds, and no statement reads or writes it.
+   * @internal
+   */
+  canReplace(snapshot: Database): boolean {
+    if (!this.dbPtr || !snapshot.dbPtr) return false
+    return this.wasm.alinea_replace(this.dbPtr, snapshot.dbPtr, null) === ReturnCode.OK
+  }
+
+  /**
    * Store this database in `file` of the "js" VFS from now on, replacing
    * what it held, as if it had been opened with `openFile`.
    * @internal

@@ -112,7 +112,7 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
 - Changes are kept in memory until a save: commits since the last one are
   lost when the session closes or its Worker ends. `await session.close()`
   closes it, and `close({save: {key}})` saves first.
-- `await session.save({key, meta})` writes snapshot `key` (by
+- `await session.save({key, meta, compact})` writes snapshot `key` (by
   default a key of its own): the snapshot the database reads with the pages
   it holds written over it. Then the database reads the new snapshot and
   drops those pages from memory; changes made meanwhile stay. The database
@@ -132,6 +132,23 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   over: should that be deleted and its key written anew meanwhile, the save
   writes in full, and a delta over a key written anew does not open (nor do
   deltas saved by 0.8.0, which did not record which snapshot they lie over).
+- A save that writes the whole database writes a compacted copy, as
+  `VACUUM INTO` would: every table and index in order, without free pages.
+  Saves keep every page where it is, so changes all over scatter a table's
+  pages further with every save, and a stored snapshot is read in blocks,
+  which only pays when the pages read next lie next to each other. The
+  database moves onto the copy right away (its page cache starts over), and
+  later deltas lie over it. That works only while it holds just the state
+  the save captured: a database that changed since the save was called, or
+  is in a transaction or reading then, stays as it is, and that save writes
+  in place instead. `save({key, compact: true})` writes a compacted copy now,
+  also where a delta would do (such as after a large sync), and also when
+  the database cannot move onto it (it then stays on the snapshot it read);
+  `compact: false` keeps pages where they are (`autoSave` takes the same). Compacting
+  reads the database into memory at once, and `VACUUM INTO` copies it while
+  the Worker waits: 0.6 s for 140 MB in Chromium, where writing it took
+  1–2.5 s and the copy reads in half as many Blob reads (see
+  [BENCHMARKS.md](BENCHMARKS.md)).
 - Key snapshots by their content, such as a content hash: a key that exists
   is not written again (once deleted, it can be, with other bytes). The
   result's `status` tells what happened: `'written'`, a new snapshot;
@@ -162,8 +179,8 @@ with one Worker that owns it, or [IndexedDB storage](#indexeddb-storage).
   does not read the Blob again: `FileReaderSync` reads take about a
   millisecond however small. A read of a block that is not kept also reads
   the blocks around it that are not kept, in the 256 KiB it lies in (1 MiB
-  ahead for reads that run forward), which wait apart and leave first
-  until they are used. `indexedDBSnapshots(name, {readCache: {blockSize,
+  ahead for reads that run forward), which wait apart, in a quarter of
+  the cache, until they are used. `indexedDBSnapshots(name, {readCache: {blockSize,
   cacheBytes, readAround, readAhead}})` changes these (also
   `opfsSnapshots` and `new SnapshotStorage`); `readOnlyFile(blob,
   options)` takes the same.

@@ -9,6 +9,7 @@ import {
   memorySnapshots,
   readOnlyFile
 } from '@alinea/sqlite-wasm/snapshots'
+import {Database as SQLite} from 'bun:sqlite'
 import {IDBFactory, IDBKeyRange} from 'fake-indexeddb'
 import {
   MemoryFileReaderSync,
@@ -69,6 +70,10 @@ function saveTo(storage, db, key, {branch, ...options} = {}) {
     sessions.set(db, (session = storage.session(db, {branch})))
   return session.save({key, ...options}).then(result => result.status)
 }
+
+// Saves that write in full keep pages where they are, as tests of the
+// pages a database holds compare bytes
+const inPlace = {compact: false}
 
 function rows(db, sql) {
   return db.exec(sql)[0]?.values ?? []
@@ -303,7 +308,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 3000))
-        expect(await save(db, 'v1')).toBe('written')
+        expect(await save(db, 'v1', inPlace)).toBe('written')
         // Every page is in the base now.
         expect(held(db)).toBe(0)
         expect(db.export()).toEqual(reference.export())
@@ -316,7 +321,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         expect(held(db)).toBeGreaterThan(0)
         const fork = keep(db.fork())
         const atFork = dump(fork)
-        expect(await save(db, 'v2')).toBe('written')
+        expect(await save(db, 'v2', inPlace)).toBe('written')
         expect(held(db)).toBe(0)
         expect(db.export()).toEqual(reference.export())
         // The fork still reads the first base, unchanged.
@@ -335,13 +340,13 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 3000))
-        await save(db, 'v1')
+        await save(db, 'v1', inPlace)
         both(db, reference, db => {
           db.run('delete from items where id >= 200')
           db.run('vacuum')
         })
         expect(dump(db)).toEqual(dump(reference))
-        await save(db, 'v2')
+        await save(db, 'v2', inPlace)
         expect((await content('v2')).byteLength)
           .toBeLessThan((await content('v1')).byteLength / 5)
         // Shrink below the new base and grow past it before the next one.
@@ -351,7 +356,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
           fill(db, 1000, 700, 10_000)
         })
         expect(db.export()).toEqual(reference.export())
-        await save(db, 'v3')
+        await save(db, 'v3', inPlace)
         expect(db.export()).toEqual(reference.export())
         const reopened = await openDb('v3')
         expect(reopened.export()).toEqual(reference.export())
@@ -361,11 +366,11 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 3000))
-        await save(db, 'v1')
+        await save(db, 'v1', inPlace)
         both(db, reference, db => db.run("update items set body = 'before' where id < 1000"))
         const atCheckpoint = keep(reference.fork())
         let done = false
-        const checkpoint = save(db, 'v2').finally(() => (done = true))
+        const checkpoint = save(db, 'v2', inPlace).finally(() => (done = true))
         let writes = 0
         while (!done) {
           both(db, reference, db =>
@@ -577,9 +582,9 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 1000))
-        await save(db, 'v1')
+        await save(db, 'v1', inPlace)
         both(db, reference, db => db.run("update items set body = 'one' where id < 100"))
-        const checkpoint = save(db, 'v2')
+        const checkpoint = save(db, 'v2', inPlace)
         // A small page cache makes the transaction write its pages.
         db.run('pragma cache_size = 2')
         both(db, reference, db => {
@@ -616,7 +621,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const db = await openDb()
         const reference = keep(new Database())
         both(db, reference, db => fill(db, 1000))
-        await save(db, 'v0')
+        await save(db, 'v0', inPlace)
         const proto = Object.getPrototypeOf(db)
         const rebase = proto.rebase
         let calls = 0
@@ -627,10 +632,10 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         }
         try {
           both(db, reference, db => db.run("update items set body = 'one' where id < 300"))
-          const first = save(db, 'v1')
+          const first = save(db, 'v1', inPlace)
           both(db, reference, db => db.run("update items set body = 'two' where id >= 700"))
           atSecond = keep(reference.fork())
-          const second = save(db, 'v2')
+          const second = save(db, 'v2', inPlace)
           expect(await Promise.all([first, second])).toEqual(['written', 'written'])
         } finally {
           proto.rebase = rebase
@@ -644,7 +649,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         )
         expect(db.export()).toEqual(reference.export())
         both(db, reference, db => db.run('delete from items where id % 3 = 0'))
-        await save(db, 'v3')
+        await save(db, 'v3', inPlace)
         expect(db.base.key).toBe('v3')
         expect((await openDb('v3')).export()).toEqual(reference.export())
       })
@@ -753,7 +758,7 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
 
       test('bound the pages held, with maxHeld', async () => {
         const reference = keep(new Database())
-        const db = await openDb({autoSave: {maxHeld: 256 << 10}})
+        const db = await openDb({autoSave: {maxHeld: 256 << 10, compact: false}})
         for (let i = 0; i < 20; i++) {
           both(db, reference, db => fill(db, 100, 500, i * 100))
           await tick()
@@ -935,14 +940,14 @@ for (const [variant, {locking, setup}] of Object.entries(variants)) {
         const first = await full.open(Database, {branch: 'b'})
         register(first)
         fill(first.db, 100)
-        await first.save({key: 'v0'})
+        await first.save({key: 'v0', compact: false})
         first.db.run('delete from items where id >= 50')
-        await first.save({key: 'v1'})
+        await first.save({key: 'v1', compact: false})
         await first.close()
         const session = await storage().open(Database, {branch: 'b'})
         register(session)
         session.db.run('delete from items where id >= 10')
-        await session.save({key: 'v2'})
+        await session.save({key: 'v2', compact: false})
         expect((await stored('v2')).info.parent).toBe('v1')
         await storage().store.remove('v1', {force: true})
         // v2 cannot be read, v1 is gone: v0 opens.
@@ -1421,7 +1426,7 @@ describe('Checkpoints in memory', () => {
     const checking = {
       ...store,
       async write(snapshot) {
-        if (!snapshot.delta && snapshot.visible > 0) {
+        if (!snapshot.delta && !snapshot.content && snapshot.visible > 0) {
           const first = snapshot.base
           // Stores read it once per run of unchanged pages.
           for (let i = 0; i < 100; i++) expect(snapshot.base).toBe(first)
@@ -1439,7 +1444,7 @@ describe('Checkpoints in memory', () => {
     await session.save({key: 'v2'})
     session.db.run("update items set body = 'b' where id = 2")
     // Past maxDepth: in full, over the delta v2
-    await session.save({key: 'v3'})
+    await session.save({key: 'v3', compact: false})
     expect(composed).toBe(1)
     expect(rows(await storage.open(Database, {key: 'v3'}).then(register), 'select body from items where id < 3'))
       .toEqual([['0 '.padEnd(500, 'x')], ['a'], ['b']])
@@ -1453,6 +1458,222 @@ describe('Checkpoints in memory', () => {
     await saveTo(storage, db, 'v1', {meta})
     meta.tree = 'changed'
     expect((await storage.list())[0].meta).toEqual({tree: 'a'})
+  })
+})
+
+// Full saves write a compacted copy, as VACUUM INTO does. Its layout is
+// read with dbstat, in Bun's own SQLite.
+describe('Compacted saves', () => {
+  // Leaf pages of each b-tree of `bytes`, a database, in key order
+  function leaves(bytes) {
+    const db = SQLite.deserialize(bytes)
+    try {
+      const pages = new Map()
+      for (const {name, pageno} of db
+        .query("select name, pageno from dbstat where pagetype = 'leaf' order by name, path")
+        .all()) {
+        if (!pages.has(name)) pages.set(name, [])
+        pages.get(name).push(pageno)
+      }
+      return pages
+    } finally {
+      db.close()
+    }
+  }
+
+  // How many leaves follow the one before at most `gap` pages on: the rest
+  // lie elsewhere, so reading them in order skips around.
+  function inOrder(pages, gap = 4) {
+    let near = 0
+    for (let i = 1; i < pages.length; i++) {
+      const step = pages[i] - pages[i - 1]
+      if (step > 0 && step <= gap) near++
+    }
+    return near / (pages.length - 1)
+  }
+
+  const entries = db => rows(db, 'select * from entries order by id')
+
+  // Changes spread over the table, as syncs make them
+  function change(db, round) {
+    db.run('begin')
+    for (let i = 0; i < 30; i++) {
+      const id = (round * 7919 + i * 104_729) % 12_000
+      if (i % 3 === 0) db.run('delete from entries where id = ?', [id])
+      else
+        db.run('insert or replace into entries (id, path, body) values (?, ?, ?)', [
+          id,
+          `/entries/${id}`,
+          `${round} `.padEnd(100 + ((id * 31 + round) % 500), 'x')
+        ])
+    }
+    db.run('commit')
+  }
+
+  async function synced(options) {
+    const store = memorySnapshotStore()
+    const storage = memorySnapshots(store)
+    const session = await storage.open(Database)
+    register(session)
+    const {db} = session
+    db.run('create table entries (id integer primary key, path text, body text)')
+    db.run('create index entries_path on entries (path)')
+    db.run('begin')
+    for (let id = 0; id < 12_000; id += 2)
+      db.run('insert into entries values (?, ?, ?)', [id, `/entries/${id}`, 'a'.repeat(300)])
+    db.run('commit')
+    await session.save({key: 'v0', ...options})
+    // Deltas, until the chain is too long and a save writes in full
+    let round = 0
+    for (;;) {
+      change(db, ++round)
+      const key = `v${round}`
+      await session.save({key, ...options})
+      if (round > 1 && session.snapshot.parent === undefined)
+        return {store, storage, session, key, round}
+    }
+  }
+
+  test('write tables and indexes in order, without free pages', async () => {
+    const {store, session, key, round} = await synced({})
+    expect(round).toBeGreaterThan(3)
+    const {source} = await store.get(key)
+    const trees = leaves(source)
+    expect(trees.get('entries').length).toBeGreaterThan(100)
+    expect(trees.get('entries_path').length).toBeGreaterThan(10)
+    for (const [name, pages] of trees) {
+      if (pages.length > 1) expect([name, inOrder(pages)]).toEqual([name, 1])
+    }
+    const copy = SQLite.deserialize(source)
+    expect(copy.query('pragma freelist_count').get()).toEqual({freelist_count: 0})
+    copy.close()
+    // The database reads it, with the same rows.
+    expect(session.snapshot.key).toBe(key)
+    expect(held(session.db)).toBe(0)
+    const reopened = register(await memorySnapshots(store).open(Database, {key}))
+    expect(entries(reopened)).toEqual(entries(session.db))
+    expect(rows(reopened, 'select count(*), sum(length(body)) from entries')).toEqual(
+      rows(session.db, 'select count(*), sum(length(body)) from entries')
+    )
+  })
+
+  test('scatter tables when written in place', async () => {
+    const {store, key} = await synced({compact: false})
+    const {source} = await store.get(key)
+    const order = inOrder(leaves(source).get('entries'))
+    expect(order).toBeLessThan(0.9)
+  })
+
+  test('write deltas over a compacted snapshot, while Workers read the one below', async () => {
+    const {storage, session, key} = await synced({})
+    const below = register(await storage.open(Database, {key: 'v1'}))
+    const before = entries(below)
+    change(session.db, 100)
+    await session.save({key: 'after'})
+    expect(session.snapshot.parent).toBe(key)
+    const reopened = register(await storage.open(Database, {key: 'after'}))
+    expect(entries(reopened)).toEqual(entries(session.db))
+    expect(entries(below)).toEqual(before)
+  })
+
+  test('compact when asked, also where a delta would do', async () => {
+    const storage = memorySnapshots()
+    const session = await storage.open(Database)
+    register(session)
+    fill(session.db, 1000)
+    await session.save({key: 'v1', compact: false})
+    session.db.run('delete from items where id % 2 = 0')
+    session.db.run("update items set body = 'short' where id % 3 = 0")
+    const pages = rows(session.db, 'pragma page_count')[0][0]
+    await session.save({key: 'v2', compact: true})
+    expect(session.snapshot.parent).toBeUndefined()
+    expect(rows(session.db, 'pragma page_count')[0][0]).toBeLessThan(pages / 2)
+    expect(rows(session.db, 'select count(*) from items')).toEqual([[500]])
+    session.db.run('delete from items where id < 100')
+    await session.save({key: 'v3'})
+    expect(session.snapshot.parent).toBe('v2')
+    const reopened = register(await storage.open(Database, {key: 'v3'}))
+    expect(dump(reopened)).toEqual(dump(session.db))
+  })
+
+  test('keep what changes while the compacted snapshot is stored', async () => {
+    const storage = memorySnapshots(memorySnapshotStore(), {maxDepth: 0})
+    const session = await storage.open(Database)
+    register(session)
+    const {db} = session
+    const reference = keep(new Database())
+    both(db, reference, db => fill(db, 2000))
+    await session.save({key: 'v1'})
+    both(db, reference, db => db.run("update items set body = 'before' where id < 1000"))
+    const at = dump(reference)
+    let done = false
+    const saving = session.save({key: 'v2'}).finally(() => (done = true))
+    let writes = 0
+    while (!done) {
+      both(db, reference, db =>
+        db.run(`update items set body = 'during ${writes}' where id = ${writes * 7}`)
+      )
+      writes++
+      await tick()
+    }
+    expect((await saving).status).toBe('written')
+    expect(writes).toBeGreaterThan(0)
+    expect(session.snapshot.key).toBe('v2')
+    expect(dump(register(await storage.open(Database, {key: 'v2'})))).toEqual(at)
+    expect(dump(db)).toEqual(dump(reference))
+    expect(held(db)).toBeGreaterThan(0)
+    expect(held(db)).toBeLessThan(writes * 3 * 4096)
+  })
+
+  test('write in place when the database changed since the save was called', async () => {
+    const storage = memorySnapshots(memorySnapshotStore(), {maxDepth: 0})
+    const session = await storage.open(Database)
+    register(session)
+    const {db} = session
+    fill(db, 1000)
+    await session.save({key: 'v1', compact: false})
+    db.run('delete from items where id % 2 = 0')
+    const pages = rows(db, 'pragma page_count')
+    const saving = session.save({key: 'v2'})
+    db.run("insert into items (body) values ('later')")
+    expect((await saving).status).toBe('written')
+    // It moved onto v2, which is not compacted: the pages fit.
+    expect(session.snapshot.key).toBe('v2')
+    expect(rows(register(await storage.open(Database, {key: 'v2'})), 'pragma page_count'))
+      .toEqual(pages)
+    expect(rows(db, "select count(*) from items where body = 'later'")).toEqual([[1]])
+  })
+
+  test('keep reading the compacted copy when storing it fails', async () => {
+    const store = memorySnapshotStore()
+    let fail = false
+    const failing = {
+      ...store,
+      async write(snapshot) {
+        if (fail) throw new Error('store failed')
+        return store.write(snapshot)
+      }
+    }
+    const storage = new SnapshotStorage(failing, {maxDepth: 0})
+    const session = await storage.open(Database)
+    register(session)
+    const {db} = session
+    fill(db, 500)
+    await session.save({key: 'v1'})
+    db.run('delete from items where id % 2 = 0')
+    const before = dump(db)
+    fail = true
+    await expect(session.save({key: 'v2'})).rejects.toThrow('store failed')
+    expect(dump(db)).toEqual(before)
+    // It reads a copy that is not stored: no snapshot, and the next save
+    // writes in full.
+    expect(session.snapshot).toBeUndefined()
+    db.run("insert into items (body) values ('more')")
+    fail = false
+    expect((await session.save({key: 'v3'})).status).toBe('written')
+    expect(session.snapshot.key).toBe('v3')
+    expect(session.snapshot.parent).toBeUndefined()
+    expect(dump(register(await storage.open(Database, {key: 'v3'})))).toEqual(dump(db))
   })
 })
 
@@ -1590,26 +1811,37 @@ describe('Read-only files', () => {
     expect(slices.length).toBe(2)
     check(10 * 1024, 10)
     expect(slices.at(-1)).toEqual([9216, 2048])
-    // Blocks in use stay meanwhile.
+    // Blocks in use keep three quarters of the cache: at most one of these
+    // left for blocks read along.
     for (const block of [2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15]) check(block * 1024, 10)
-    expect(slices.length).toBe(3)
+    expect(slices.length).toBeLessThanOrEqual(4)
   })
 
-  test('keep blocks in use over blocks read along', () => {
+  test('keep blocks read along in a quarter of the cache', () => {
     const bytes = pattern(12_000)
     const {blob, slices} = countingBlob(bytes)
     const file = readOnlyFile(blob, {blockSize: 1024, cacheBytes: 8192, readAround: 2048, readAhead: 0})
     const check = checker(file, bytes)
     for (let block = 0; block < 8; block++) check(block * 1024, 10)
-    // The cache is full of blocks in use: 9 pushes out 0, and 8, read along,
-    // is not kept.
+    // The cache is full of blocks in use: 9 pushes out 0, and 8, read
+    // along, 1.
     check(9 * 1024 + 500, 10)
     expect(slices.at(-1)).toEqual([8192, 2048])
     slices.length = 0
-    for (let block = 1; block < 8; block++) check(block * 1024 + 20, 10)
+    for (let block = 2; block < 10; block++) check(block * 1024 + 20, 10)
     expect(slices).toEqual([])
-    check(8 * 1024 + 500, 10)
+    check(1024 + 500, 10)
     expect(slices.length).toBe(1)
+  })
+
+  test('keep reading ahead in scans longer than the cache', () => {
+    const bytes = pattern(1 << 20)
+    const {blob, slices} = countingBlob(bytes)
+    const file = readOnlyFile(blob, {blockSize: 1024, cacheBytes: 64 << 10, readAhead: 8 << 10})
+    const check = checker(file, bytes)
+    for (let at = 0; at < bytes.length; at += 512) check(at, 512)
+    // 8 KiB at a time, the whole way
+    expect(slices.length).toBeLessThanOrEqual(bytes.length / (8 << 10) + 1)
   })
 
   test('keep the most recently used blocks, within cacheBytes', () => {
@@ -1791,14 +2023,18 @@ describe('Random checkpoints', () => {
     }
   }
 
-  const state = db =>
+  // Compacted saves leave other pages, and no free ones: then only the rows
+  // compare.
+  const stateOf = compact => db =>
     JSON.stringify([
       db.exec('select id, hex(b) from t order by id'),
-      db.exec('pragma page_count'),
-      db.exec('pragma freelist_count')
+      ...(compact
+        ? []
+        : [db.exec('pragma page_count'), db.exec('pragma freelist_count')])
     ])
 
-  async function run(seed, storage, autoVacuum) {
+  async function run(seed, storage, autoVacuum, compact) {
+    const state = stateOf(compact)
     const next = random(seed)
     const pick = n => Math.floor(next() * n)
     const db = register(await storage.open(Database))
@@ -1850,7 +2086,11 @@ describe('Random checkpoints', () => {
         run(`pragma incremental_vacuum(${pick(50)})`)
       } else if (x < 0.82 && !inTransaction) {
         const key = `k${pending.length}`
-        pending.push({key, at: keep(reference.fork()), written: saveTo(storage, db, key)})
+        pending.push({
+          key,
+          at: keep(reference.fork()),
+          written: saveTo(storage, db, key, compact ? {} : inPlace)
+        })
       } else {
         for (let i = pick(4); i > 0; i--) await tick()
       }
@@ -1865,13 +2105,16 @@ describe('Random checkpoints', () => {
   }
 
   for (const [variant, {setup}] of Object.entries(variants)) {
-    test(`match a plain database in ${variant}`, async () => {
-      for (const autoVacuum of [0, 1, 2]) {
-        for (let seed = 1; seed <= 4; seed++) {
-          await run(seed * 7 + autoVacuum, setup().storage(), autoVacuum)
+    for (const compact of [false, true]) {
+      const how = compact ? 'compacted' : 'in place'
+      test(`match a plain database in ${variant}, saved ${how}`, async () => {
+        for (const autoVacuum of [0, 1, 2]) {
+          for (let seed = 1; seed <= 4; seed++) {
+            await run(seed * 7 + autoVacuum, setup().storage(), autoVacuum, compact)
+          }
         }
-      }
-    }, 120_000)
+      }, 120_000)
+    }
   }
 
   test('keep a statement stepping while its database moves', async () => {
